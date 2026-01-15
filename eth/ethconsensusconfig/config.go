@@ -41,7 +41,7 @@ import (
 	"github.com/erigontech/erigon/polygon/bridge"
 	"github.com/erigontech/erigon/polygon/heimdall"
 	"github.com/erigontech/erigon/turbo/services"
-	"github.com/erigontech/nitro-erigon/arbos"
+	"github.com/offchainlabs/nitro/arbos"
 )
 
 func CreateConsensusEngine(ctx context.Context, nodeConfig *nodecfg.Config, chainConfig *chain.Config, config interface{}, notify []string, noVerify bool,

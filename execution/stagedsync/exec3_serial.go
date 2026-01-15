@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/erigontech/erigon-lib/log/v3"
@@ -26,6 +28,62 @@ type serialExecutor struct {
 	blobGasUsed uint64
 }
 
+var (
+	mdbxMigrateDebug                                = os.Getenv("MDBX_MIGRATE_DEBUG") != ""
+	mdbxMigrateDebugBlock, mdbxMigrateDebugBlockSet = parseEnvUint("MDBX_MIGRATE_DEBUG_BLOCK")
+	mdbxMigrateDebugTxIndex, mdbxMigrateDebugTxSet  = parseEnvInt("MDBX_MIGRATE_DEBUG_TX_INDEX")
+)
+
+func parseEnvUint(name string) (uint64, bool) {
+	value := os.Getenv(name)
+	if value == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		log.Warn("mdbx-migrate debug: invalid uint env", "name", name, "value", value, "err", err)
+		return 0, false
+	}
+	return parsed, true
+}
+
+func parseEnvInt(name string) (int, bool) {
+	value := os.Getenv(name)
+	if value == "" {
+		return 0, false
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		log.Warn("mdbx-migrate debug: invalid int env", "name", name, "value", value, "err", err)
+		return 0, false
+	}
+	return parsed, true
+}
+
+func mdbxMigrateShouldLog(blockNum uint64, txIndex int) bool {
+	if !mdbxMigrateDebug {
+		return false
+	}
+	if mdbxMigrateDebugBlockSet && blockNum != mdbxMigrateDebugBlock {
+		return false
+	}
+	if mdbxMigrateDebugTxSet && txIndex != mdbxMigrateDebugTxIndex {
+		return false
+	}
+	return true
+}
+
+func kvListCounts(lists map[string]*dbstate.KvList) (domains int, entries int) {
+	for _, list := range lists {
+		if list == nil {
+			continue
+		}
+		domains++
+		entries += list.Len()
+	}
+	return domains, entries
+}
+
 func (se *serialExecutor) wait() error {
 	return nil
 }
@@ -43,7 +101,92 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 			se.applyWorker.SetGaspool(gp)
 		}
 		se.applyWorker.SetArbitrumWasmDB(se.cfg.arbitrumWasmDB)
+		shouldLog := mdbxMigrateShouldLog(txTask.BlockNum, txTask.TxIndex)
+		if shouldLog {
+			log.Info("mdbx-migrate tx task",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"final", txTask.Final,
+				"tx_nil", txTask.Tx == nil,
+			)
+		}
 		se.applyWorker.RunTxTaskNoLock(txTask, se.isMining, se.skipPostEvaluation)
+		if shouldLog {
+			if txTask.Tx == nil {
+				log.Info("mdbx-migrate tx",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"gas_used", txTask.GasUsed,
+					"failed", txTask.Failed,
+					"tx_nil", true,
+				)
+			} else {
+			from := "<unknown>"
+			if sender := txTask.Sender(); sender != nil {
+				from = sender.Hex()
+			}
+			to := "<nil>"
+			if toAddr := txTask.Tx.GetTo(); toAddr != nil {
+				to = toAddr.Hex()
+			}
+			value := "<nil>"
+			if txValue := txTask.Tx.GetValue(); txValue != nil {
+				value = txValue.ToBig().String()
+			}
+			data := txTask.Tx.GetData()
+			dataSig := ""
+			if len(data) >= 4 {
+				dataSig = fmt.Sprintf("0x%x", data[:4])
+			} else if len(data) > 0 {
+				dataSig = fmt.Sprintf("0x%x", data)
+			}
+			writeDomains, writeEntries := kvListCounts(txTask.WriteLists)
+			readDomains, readEntries := kvListCounts(txTask.ReadLists)
+			log.Info("mdbx-migrate tx",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"hash", txTask.Tx.Hash(),
+				"type", txTask.Tx.Type(),
+				"from", from,
+				"to", to,
+				"nonce", txTask.Tx.GetNonce(),
+				"gas_limit", txTask.Tx.GetGasLimit(),
+				"gas_used", txTask.GasUsed,
+				"failed", txTask.Failed,
+				"value", value,
+				"data_len", len(data),
+				"data_sig", dataSig,
+				"write_domains", writeDomains,
+				"write_entries", writeEntries,
+				"read_domains", readDomains,
+				"read_entries", readEntries,
+			)
+			}
+			if txTask.Error == nil && se.doms != nil {
+				if sdc := se.doms.GetCommitmentContext(); sdc != nil {
+					root, rootErr := sdc.DebugRootHash(ctx, se.execStage.LogPrefix())
+					if rootErr != nil {
+						log.Warn("mdbx-migrate tx root failed",
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"tx_num", txTask.TxNum,
+							"err", rootErr,
+						)
+					} else {
+						log.Info("mdbx-migrate tx root",
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"tx_num", txTask.TxNum,
+							"updates", sdc.KeysCount(),
+							"root", fmt.Sprintf("0x%x", root),
+						)
+					}
+				}
+			}
+		}
 		if err := func() error {
 			if errors.Is(txTask.Error, context.Canceled) {
 				return txTask.Error
@@ -61,13 +204,15 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 				se.blobGasUsed += txTask.Tx.GetBlobGas()
 			}
 
-			if txTask.Final {
-				if !se.isMining && !se.skipPostEvaluation && !se.execStage.CurrentSyncCycle.IsInitialCycle {
-					// note this assumes the bloach reciepts is a fixed array shared by
-					// all tasks - if that changes this will need to change - robably need to
-					// add this to the executor
-					se.cfg.notifications.RecentLogs.Add(txTask.BlockReceipts)
-				}
+				if txTask.Final {
+					if !se.isMining && !se.skipPostEvaluation && !se.execStage.CurrentSyncCycle.IsInitialCycle {
+						// note this assumes the bloach reciepts is a fixed array shared by
+						// all tasks - if that changes this will need to change - robably need to
+						// add this to the executor
+						if se.cfg.notifications != nil && se.cfg.notifications.RecentLogs != nil {
+							se.cfg.notifications.RecentLogs.Add(txTask.BlockReceipts)
+						}
+					}
 				// TODO arbitrum enable receipt checking
 				checkReceipts := false //!se.cfg.vmConfig.StatelessExec && se.cfg.chainConfig.IsByzantium(txTask.BlockNum) && !se.cfg.vmConfig.NoReceipts && !se.isMining
 

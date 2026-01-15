@@ -91,8 +91,11 @@ func NewEVM(blockCtx evmtypes.BlockContext, txCtx evmtypes.TxContext, ibs *state
 	if vmConfig.NoBaseFee {
 		if txCtx.GasPrice != nil && txCtx.GasPrice.IsZero() {
 			if chainConfig.IsArbitrum() {
-				blockCtx.BaseFeeInBlock = new(uint256.Int)
-				if blockCtx.BaseFee != nil && !blockCtx.BaseFee.IsZero() {
+				if (blockCtx.BaseFeeInBlock == nil || blockCtx.BaseFeeInBlock.IsZero()) &&
+					blockCtx.BaseFee != nil && !blockCtx.BaseFee.IsZero() {
+					if blockCtx.BaseFeeInBlock == nil {
+						blockCtx.BaseFeeInBlock = new(uint256.Int)
+					}
 					blockCtx.BaseFeeInBlock.Set(blockCtx.BaseFee)
 				}
 			}
@@ -133,7 +136,19 @@ func (evm *EVM) Reset(txCtx evmtypes.TxContext, ibs *state.IntraBlockState) {
 func (evm *EVM) ResetBetweenBlocks(blockCtx evmtypes.BlockContext, txCtx evmtypes.TxContext, ibs *state.IntraBlockState, vmConfig Config, chainRules *chain.Rules) {
 	if vmConfig.NoBaseFee {
 		if txCtx.GasPrice.IsZero() {
+			if evm.chainConfig != nil && evm.chainConfig.IsArbitrum() {
+				if (blockCtx.BaseFeeInBlock == nil || blockCtx.BaseFeeInBlock.IsZero()) &&
+					blockCtx.BaseFee != nil && !blockCtx.BaseFee.IsZero() {
+					if blockCtx.BaseFeeInBlock == nil {
+						blockCtx.BaseFeeInBlock = new(uint256.Int)
+					}
+					blockCtx.BaseFeeInBlock.Set(blockCtx.BaseFee)
+				}
+			}
 			blockCtx.BaseFee = new(uint256.Int)
+		}
+		if evm.chainConfig != nil && evm.chainConfig.IsArbitrum() && txCtx.BlobFee != nil && txCtx.BlobFee.IsZero() {
+			blockCtx.BlobBaseFee = new(uint256.Int)
 		}
 	}
 	evm.Context = blockCtx

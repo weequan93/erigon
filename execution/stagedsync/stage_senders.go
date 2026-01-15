@@ -244,6 +244,9 @@ Loop:
 			blockHash:   blockHash,
 			index:       int(blockNumber) - int(s.BlockNumber) - 1,
 		}
+		if cfg.chainConfig.IsArbitrum() {
+			j.arbosVersion = types.GetArbOSVersion(header, cfg.chainConfig)
+		}
 		if j.index < 0 {
 			panic(j.index) //uint-underflow
 		}
@@ -326,6 +329,7 @@ type senderRecoveryJob struct {
 	blockHash   common.Hash
 	blockNumber uint64
 	blockTime   uint64
+	arbosVersion uint64
 	index       int
 	err         error
 }
@@ -351,12 +355,21 @@ func recoverSenders(ctx context.Context, logPrefix string, cryptoContext *secp25
 		body := job.body
 		job.body = nil // reduce ram usage and help GC
 		signer := types.MakeSigner(config, job.blockNumber, job.blockTime)
+		if config.IsArbitrum() {
+			signer = types.MakeSignerArb(config, job.blockNumber, job.blockTime, job.arbosVersion)
+		}
+		arbSigner := types.NewArbitrumSigner(*signer)
 		job.senders = make([]byte, len(body.Transactions)*length.Addr)
 		for i, txn := range body.Transactions {
-			from, err := signer.SenderWithContext(cryptoContext, txn)
+			baseTxn := txn
+			if unwrapped := txn.Unwrap(); unwrapped != nil {
+				baseTxn = unwrapped
+			}
+			from, err := arbSigner.SenderWithContext(cryptoContext, baseTxn)
 			if err != nil {
-				job.err = fmt.Errorf("%w: error recovering sender for tx=%x, %v",
-					consensus.ErrInvalidBlock, txn.Hash(), err)
+				unwrapType := baseTxn.Type()
+				job.err = fmt.Errorf("%w: error recovering sender for tx=%x (type=%T, txType=0x%x, unwrapType=0x%x), %v",
+					consensus.ErrInvalidBlock, txn.Hash(), txn, txn.Type(), unwrapType, err)
 				break
 			}
 			copy(job.senders[i*length.Addr:], from[:])

@@ -26,6 +26,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -1247,28 +1249,93 @@ func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, 
 	return res, true, nil
 }
 
+var (
+	mdbxMigrateReceiptsDebug                                = os.Getenv("MDBX_MIGRATE_DEBUG") != ""
+	mdbxMigrateReceiptsDebugBlock, mdbxMigrateReceiptsDebugBlockSet = parseEnvUintRawdb("MDBX_MIGRATE_DEBUG_BLOCK")
+)
+
+func parseEnvUintRawdb(name string) (uint64, bool) {
+	value := os.Getenv(name)
+	if value == "" {
+		return 0, false
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		log.Warn("mdbx-migrate receipts debug: invalid uint env", "name", name, "value", value, "err", err)
+		return 0, false
+	}
+	return parsed, true
+}
+
+func mdbxMigrateShouldLogReceipts(blockNum uint64) bool {
+	if !mdbxMigrateReceiptsDebug {
+		return false
+	}
+	if mdbxMigrateReceiptsDebugBlockSet && blockNum != mdbxMigrateReceiptsDebugBlock {
+		return false
+	}
+	return true
+}
+
 func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdbv3.TxNumsReader) (res types.Receipts, err error) {
 	blockHash := block.Hash()
 	blockNum := block.NumberU64()
+	shouldLog := mdbxMigrateShouldLogReceipts(blockNum)
 
 	_min, err := txNumReader.Min(tx, blockNum)
 	if err != nil {
+		if shouldLog {
+			log.Info("mdbx-migrate receipts scan start failed", "block", blockNum, "err", err)
+		}
 		return
 	}
 	_max, err := txNumReader.Max(tx, blockNum)
 	if err != nil {
+		if shouldLog {
+			log.Info("mdbx-migrate receipts scan end failed", "block", blockNum, "err", err)
+		}
 		return
 	}
 
+	txNumCount := uint64(0)
+	if _max >= _min {
+		txNumCount = _max - _min + 1
+	}
+	if shouldLog {
+		log.Info("mdbx-migrate receipts scan start",
+			"block", blockNum,
+			"block_hash", blockHash,
+			"txs", len(block.Transactions()),
+			"txnum_min", _min,
+			"txnum_max", _max,
+			"txnum_count", txNumCount,
+		)
+	}
+
+	found := 0
+	missing := 0
+	empty := 0
+	var firstMissing, lastMissing uint64
+	var firstEmpty, lastEmpty uint64
 	for txnID := _min; txnID < _max+1; txnID++ {
 		v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, txnID+1)
 		if err != nil {
 			return nil, err
 		}
 		if !ok {
+			missing++
+			if missing == 1 {
+				firstMissing = txnID
+			}
+			lastMissing = txnID
 			continue
 		}
 		if len(v) == 0 {
+			empty++
+			if empty == 1 {
+				firstEmpty = txnID
+			}
+			lastEmpty = txnID
 			continue
 		}
 
@@ -1283,6 +1350,25 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 			x.DeriveFieldsV4ForCachedReceipt(blockHash, blockNum, txn.Hash(), true)
 		}
 		res = append(res, x)
+		found++
+	}
+	if shouldLog {
+		fields := []interface{}{
+			"block", blockNum,
+			"block_hash", blockHash,
+			"txs", len(block.Transactions()),
+			"receipts_found", found,
+			"receipts_total", len(res),
+			"missing", missing,
+			"empty", empty,
+		}
+		if missing > 0 {
+			fields = append(fields, "missing_first", firstMissing, "missing_last", lastMissing)
+		}
+		if empty > 0 {
+			fields = append(fields, "empty_first", firstEmpty, "empty_last", lastEmpty)
+		}
+		log.Info("mdbx-migrate receipts scan done", fields...)
 	}
 	return res, nil
 }

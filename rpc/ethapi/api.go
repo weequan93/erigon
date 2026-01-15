@@ -188,6 +188,9 @@ func (args *CallArgs) ToMessage(globalGasCap uint64, baseFee *uint256.Int) (*typ
 		}
 		msg.SetAuthorizations(authorizations)
 	}
+	if args.SkipL1Charging != nil {
+		msg.SkipL1Charging = *args.SkipL1Charging
+	}
 
 	return msg, nil
 }

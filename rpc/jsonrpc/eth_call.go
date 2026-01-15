@@ -24,9 +24,10 @@ import (
 	"math/big"
 	"unsafe"
 
-	"github.com/erigontech/nitro-erigon/arbos"
-	"github.com/erigontech/nitro-erigon/arbos/arbosState"
-	"github.com/erigontech/nitro-erigon/arbos/l1pricing"
+	"github.com/offchainlabs/nitro/arbos"
+	"github.com/offchainlabs/nitro/arbos/arbosState"
+	"github.com/offchainlabs/nitro/arbos/l1pricing"
+	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/holiman/uint256"
 	"google.golang.org/grpc"
 
@@ -62,6 +63,23 @@ var latestNumOrHash = rpc.BlockNumberOrHashWithNumber(rpc.LatestBlockNumber)
 // estimateGasErrorRatio is the amount of overestimation eth_estimateGas is
 // allowed to produce in order to speed up calculations.
 const estimateGasErrorRatio = 0.015
+const gasEstimationL1PricePadding arbmath.Bips = 11000
+
+func estimatePosterGas(state *arbosState.ArbosState, baseFee *big.Int, posterCost *big.Int) uint64 {
+	if state == nil || baseFee == nil || baseFee.Sign() == 0 {
+		return 0
+	}
+
+	adjustedPrice := arbmath.BigMulByFrac(baseFee, 7, 8)
+	if minGasPrice, err := state.L2PricingState().MinBaseFeeWei(); err == nil && minGasPrice != nil {
+		if arbmath.BigLessThan(adjustedPrice, minGasPrice) {
+			adjustedPrice = minGasPrice
+		}
+	}
+
+	posterCost = arbmath.BigMulByBips(posterCost, gasEstimationL1PricePadding)
+	return arbmath.BigToUintSaturating(arbmath.BigDiv(posterCost, adjustedPrice))
+}
 
 // Call implements eth_call. Executes a new message call immediately without creating a transaction on the block chain.
 func (api *APIImpl) Call(ctx context.Context, args ethapi2.CallArgs, requestedBlock *rpc.BlockNumberOrHash, overrides *ethapi2.StateOverrides) (hexutil.Bytes, error) {
@@ -200,40 +218,42 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		args.From = new(common.Address)
 	}
 	stateDb := state.New(stateReader)
+	gasCap := api.GasCap
 
-	if chainConfig.IsArbitrum() {
+	if chainConfig.IsArbitrum() && gasCap > 0 && (args.SkipL1Charging == nil || !*args.SkipL1Charging) {
 		arbState := state.NewArbitrum(stateDb)
-		arbosVersion := arbosState.ArbOSVersion(arbState)
-		if arbosVersion == 0 {
-			// ArbOS hasn't been installed, so use the vanilla gas cap
-			return 0, nil
-		}
-		state, err := arbosState.OpenSystemArbosState(arbState, nil, true)
-		if err != nil {
-			return 0, err
-		}
-		if header.BaseFee.Sign() == 0 {
-			// if gas is free or there's no reimbursable poster, the user won't pay for L1 data costs
-			return 0, nil
-		}
+		stateAdapter := arbos.NewStateDBAdapter(arbState, nil)
+		if arbosState.ArbOSVersion(stateAdapter) != 0 && header.BaseFee != nil && header.BaseFee.Sign() > 0 {
+			arbosSysState, err := arbosState.OpenSystemArbosState(stateAdapter, nil, true)
+			if err != nil {
+				return 0, err
+			}
+			brotliCompressionLevel, err := arbosSysState.BrotliCompressionLevel()
+			if err != nil {
+				return 0, err
+			}
 
-		brotliCompressionLevel, err := state.BrotliCompressionLevel()
-		if err != nil {
-			return 0, err
+			var baseFee *uint256.Int
+			if header.BaseFee != nil {
+				baseFee, _ = uint256.FromBig(header.BaseFee)
+			}
+			msg, err := args.ToMessage(gasCap, baseFee)
+			if err != nil {
+				return 0, err
+			}
+			msg.TxRunMode = types.MessageGasEstimationMode
+			if args.SkipL1Charging != nil {
+				msg.SkipL1Charging = *args.SkipL1Charging
+			}
+			gethMsg, err := arbos.ToGethMessage(msg)
+			if err != nil {
+				return 0, err
+			}
+			posterCost, _ := arbosSysState.L1PricingState().PosterDataCost(gethMsg, l1pricing.BatchPosterAddress, brotliCompressionLevel)
+			// Use estimate mode because this is used to raise the gas cap, so we don't want to underestimate.
+			postingGas := estimatePosterGas(arbosSysState, header.BaseFee, posterCost)
+			gasCap += postingGas
 		}
-
-		var baseFee *uint256.Int = nil
-		if header.BaseFee != nil {
-			baseFee, _ = uint256.FromBig(header.BaseFee)
-		}
-		msg, err := args.ToMessage(api.GasCap, baseFee)
-		if err != nil {
-			return 0, err
-		}
-		posterCost, _ := state.L1PricingState().PosterDataCost(msg, l1pricing.BatchPosterAddress, brotliCompressionLevel)
-		// Use estimate mode because this is used to raise the gas cap, so we don't want to underestimate.
-		postingGas := arbos.GetPosterGas(state, header.BaseFee, types.MessageGasEstimationMode, posterCost)
-		api.GasCap += postingGas
 	}
 
 	// Determine the highest gas limit can be used during the estimation.
@@ -248,9 +268,9 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		hi = params.MaxTxnGasLimit
 	}
 	// Recap the highest gas allowance with specified gascap.
-	if hi > api.GasCap {
-		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", api.GasCap)
-		hi = api.GasCap
+	if hi > gasCap {
+		log.Warn("Caller gas above allowance, capping", "requested", hi, "cap", gasCap)
+		hi = gasCap
 	}
 
 	var feeCap *big.Int
@@ -294,7 +314,7 @@ func (api *APIImpl) EstimateGas(ctx context.Context, argsOrNil *ethapi2.CallArgs
 		}
 	}
 
-	caller, err := transactions.NewReusableCaller(engine, stateReader, overrides, header, args, api.GasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
+	caller, err := transactions.NewReusableCaller(engine, stateReader, overrides, header, args, gasCap, *blockNrOrHash, dbtx, api._blockReader, chainConfig, api.evmCallTimeout)
 	if err != nil {
 		return 0, err
 	}

@@ -18,7 +18,7 @@ import (
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/types"
 
-	"github.com/erigontech/nitro-erigon/util/arbmath"
+	"github.com/offchainlabs/nitro/util/arbmath"
 )
 
 var (

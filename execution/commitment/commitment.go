@@ -1161,6 +1161,31 @@ func (t *Updates) HashSort(ctx context.Context, fn func(hk, pk []byte, update *U
 	return nil
 }
 
+// DebugSnapshot creates a best-effort copy of the current updates without mutating the source.
+// It is intended for debug-only code paths, so it favors simplicity over performance.
+func (t *Updates) DebugSnapshot() *Updates {
+	if t == nil {
+		return nil
+	}
+	switch t.mode {
+	case ModeDirect:
+		snap := NewUpdates(ModeDirect, t.tmpdir, t.hasher)
+		for key := range t.keys {
+			snap.TouchPlainKey(key, nil, nil)
+		}
+		return snap
+	case ModeUpdate:
+		snap := NewUpdates(ModeDirect, t.tmpdir, t.hasher)
+		t.tree.Ascend(func(item *KeyUpdate) bool {
+			snap.TouchPlainKey(item.plainKey, nil, nil)
+			return true
+		})
+		return snap
+	default:
+		return nil
+	}
+}
+
 // Reset clears all updates
 func (t *Updates) Reset() {
 	switch t.mode {

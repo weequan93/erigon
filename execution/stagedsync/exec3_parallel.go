@@ -384,6 +384,16 @@ func (pe *parallelExecutor) processResultQueue(ctx context.Context, inputTxNum u
 	outputTxNum = inputTxNum
 	for rwsIt.HasNext(outputTxNum) {
 		txTask := rwsIt.PopNext()
+		shouldLog := mdbxMigrateShouldLog(txTask.BlockNum, txTask.TxIndex)
+		if shouldLog {
+			log.Info("mdbx-migrate tx task",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"final", txTask.Final,
+				"tx_nil", txTask.Tx == nil,
+			)
+		}
 		//fmt.Println("PRQ", txTask.BlockNum, txTask.TxIndex, txTask.TxNum)
 		if txTask.Error != nil || !pe.rs.ReadsValid(txTask.ReadLists) {
 			conflicts++
@@ -441,6 +451,86 @@ func (pe *parallelExecutor) processResultQueue(ctx context.Context, inputTxNum u
 		}
 		if err := pe.rs.ApplyLogsAndTraces(txTask, pe.rs.Domains()); err != nil {
 			return outputTxNum, conflicts, triggers, processedBlockNum, false, fmt.Errorf("ParallelExecutionState.Apply: %w", err)
+		}
+		if shouldLog {
+			if txTask.Tx == nil {
+				log.Info("mdbx-migrate tx",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"tx_nil", true,
+				)
+				processedBlockNum = txTask.BlockNum
+				if !stopedAtBlockEnd {
+					stopedAtBlockEnd = txTask.Final
+				}
+				if forceStopAtBlockEnd && txTask.Final {
+					break
+				}
+				continue
+			}
+			from := "<unknown>"
+			if sender := txTask.Sender(); sender != nil {
+				from = sender.Hex()
+			}
+			to := "<nil>"
+			if toAddr := txTask.Tx.GetTo(); toAddr != nil {
+				to = toAddr.Hex()
+			}
+			value := "<nil>"
+			if txValue := txTask.Tx.GetValue(); txValue != nil {
+				value = txValue.ToBig().String()
+			}
+			data := txTask.Tx.GetData()
+			dataSig := ""
+			if len(data) >= 4 {
+				dataSig = fmt.Sprintf("0x%x", data[:4])
+			} else if len(data) > 0 {
+				dataSig = fmt.Sprintf("0x%x", data)
+			}
+			writeDomains, writeEntries := kvListCounts(txTask.WriteLists)
+			readDomains, readEntries := kvListCounts(txTask.ReadLists)
+			log.Info("mdbx-migrate tx",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"hash", txTask.Tx.Hash(),
+				"type", txTask.Tx.Type(),
+				"from", from,
+				"to", to,
+				"nonce", txTask.Tx.GetNonce(),
+				"gas_limit", txTask.Tx.GetGasLimit(),
+				"gas_used", txTask.GasUsed,
+				"failed", txTask.Failed,
+				"value", value,
+				"data_len", len(data),
+				"data_sig", dataSig,
+				"write_domains", writeDomains,
+				"write_entries", writeEntries,
+				"read_domains", readDomains,
+				"read_entries", readEntries,
+			)
+			if txTask.Error == nil && pe.doms != nil {
+				if sdc := pe.doms.GetCommitmentContext(); sdc != nil {
+					root, rootErr := sdc.DebugRootHash(ctx, pe.execStage.LogPrefix())
+					if rootErr != nil {
+						log.Warn("mdbx-migrate tx root failed",
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"tx_num", txTask.TxNum,
+							"err", rootErr,
+						)
+					} else {
+						log.Info("mdbx-migrate tx root",
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"tx_num", txTask.TxNum,
+							"updates", sdc.KeysCount(),
+							"root", fmt.Sprintf("0x%x", root),
+						)
+					}
+				}
+			}
 		}
 		processedBlockNum = txTask.BlockNum
 		if !stopedAtBlockEnd {

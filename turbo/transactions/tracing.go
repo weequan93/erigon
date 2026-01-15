@@ -40,7 +40,7 @@ import (
 	"github.com/erigontech/erigon/rpc/jsonstream"
 	"github.com/erigontech/erigon/rpc/rpchelper"
 	"github.com/erigontech/erigon/turbo/services"
-	"github.com/erigontech/nitro-erigon/arbos"
+	"github.com/offchainlabs/nitro/arbos"
 )
 
 type BlockGetter interface {

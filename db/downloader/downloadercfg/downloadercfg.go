@@ -161,7 +161,8 @@ func New(
 	if opts.UploadRateLimit.Ok {
 		torrentConfig.UploadRateLimiter = rate.NewLimiter(opts.UploadRateLimit.Value, 0)
 	}
-	for value := range opts.DownloadRateLimit.Iter() {
+	if opts.DownloadRateLimit.Ok {
+		value := opts.DownloadRateLimit.Value
 		switch value {
 		case rate.Inf:
 			torrentConfig.DownloadRateLimiter = nil
@@ -176,8 +177,8 @@ func New(
 	}
 
 	// Override value set by download rate-limit.
-	for value := range opts.DisableTrackers.Iter() {
-		torrentConfig.DisableTrackers = value
+	if opts.DisableTrackers.Ok {
+		torrentConfig.DisableTrackers = opts.DisableTrackers.Value
 	}
 
 	var analogLevel analog.Level
@@ -290,8 +291,8 @@ func New(
 		cfg.WebSeedUrls = append(cfg.WebSeedUrls, s.String()+"/")
 	}
 
-	for value := range opts.WebseedDownloadRateLimit.Iter() {
-		cfg.SeparateWebseedDownloadRateLimit.Set(value)
+	if opts.WebseedDownloadRateLimit.Ok {
+		cfg.SeparateWebseedDownloadRateLimit.Set(opts.WebseedDownloadRateLimit.Value)
 	}
 
 	return &cfg, nil

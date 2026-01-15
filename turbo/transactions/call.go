@@ -23,7 +23,7 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/erigontech/nitro-erigon/arbos"
+	"github.com/offchainlabs/nitro/arbos"
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -162,6 +162,7 @@ func DoCall(
 	if err != nil {
 		return nil, err
 	}
+	msg.TxRunMode = types.MessageEthcallMode
 	blockCtx := NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, headerReader, chainConfig)
 	txCtx := core.NewEVMTxContext(msg)
 
@@ -169,6 +170,8 @@ func DoCall(
 
 	if chainConfig.IsArbitrum() {
 		message := types.NewMessage(msg.From(), msg.To(), msg.Nonce(), msg.Value(), msg.Gas(), msg.GasPrice(), msg.FeeCap(), msg.TipCap(), msg.Data(), msg.AccessList(), false, false, true, msg.MaxFeePerBlobGas())
+		message.TxRunMode = msg.TxRunMode
+		message.SkipL1Charging = msg.SkipL1Charging
 		message.Tx, _ = args.ToTransaction(gasCap, baseFee)
 		evm.ProcessingHook = arbos.NewTxProcessorIBS(evm, state.NewArbitrum(ibs), message)
 	}
@@ -331,6 +334,7 @@ func NewReusableCaller(
 	if err != nil {
 		return nil, err
 	}
+	msg.TxRunMode = types.MessageGasEstimationMode
 
 	blockCtx := NewEVMBlockContext(engine, header, blockNrOrHash.RequireCanonical, tx, headerReader, chainConfig)
 	txCtx := core.NewEVMTxContext(msg)

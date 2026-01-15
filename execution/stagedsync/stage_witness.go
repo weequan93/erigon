@@ -95,7 +95,7 @@ func PrepareForWitness(tx kv.TemporalTx, block *types.Block, prevRoot common.Has
 func RewindStagesForWitness(batch *membatchwithdb.MemoryMutation, blockNr, latestBlockNr uint64, cfg *WitnessCfg, regenerateHash bool, ctx context.Context, logger log.Logger) error {
 	// Rewind the Execution stage to previous block
 	unwindState := &UnwindState{ID: stages.Execution, UnwindPoint: blockNr - 1, CurrentBlockNumber: latestBlockNr}
-	stageState := &StageState{ID: stages.Execution, BlockNumber: blockNr}
+	stageState := &StageState{ID: stages.Execution, BlockNumber: latestBlockNr}
 
 	txc := wrap.NewTxContainer(batch, nil)
 	batchSizeStr := "512M"

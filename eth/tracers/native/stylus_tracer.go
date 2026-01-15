@@ -1,5 +1,5 @@
 // Copyright 2024, Offchain Labs, Inc.
-// For license information, see https://github.com/erigontech/nitro-erigon/blob/master/LICENSE
+// For license information, see https://github.com/offchainlabs/nitro/blob/master/LICENSE
 
 package native
 
@@ -19,7 +19,7 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/core/vm"
 	"github.com/erigontech/erigon/eth/tracers"
-	"github.com/erigontech/nitro-erigon/util/containers"
+	"github.com/offchainlabs/nitro/util/containers"
 
 	libcommon "github.com/erigontech/erigon-lib/common"
 )

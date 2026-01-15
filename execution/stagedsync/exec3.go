@@ -53,6 +53,8 @@ import (
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/turbo/services"
 	"github.com/erigontech/erigon/turbo/shards"
+	"github.com/offchainlabs/nitro/arbos"
+	arbosutil "github.com/offchainlabs/nitro/arbos/util"
 )
 
 var (
@@ -854,6 +856,8 @@ Loop:
 }
 
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
+var ERIGON_BAD_ROOT_DEBUG = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var ERIGON_BAD_ROOT_DUMP_STATE = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_STATE", false)
 
 // nolint
 func dumpPlainStateDebug(tx kv.TemporalRwTx, doms *dbstate.SharedDomains) {
@@ -903,6 +907,239 @@ func dumpPlainStateDebug(tx kv.TemporalRwTx, doms *dbstate.SharedDomains) {
 				fmt.Printf("state: t=%d b=%d\n", binary.BigEndian.Uint64(v[:8]), binary.BigEndian.Uint64(v[8:]))
 			}
 		}
+	}
+}
+
+func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHash []byte, applyTx kv.Tx, doms *dbstate.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, logger log.Logger) {
+	if header == nil {
+		logger.Warn("Bad state root details: missing header")
+		return
+	}
+	if header.Number == nil {
+		logger.Warn("Bad state root details: missing header number", "hash", header.Hash())
+		return
+	}
+
+	chainID := "<nil>"
+	if cfg.chainConfig != nil && cfg.chainConfig.ChainID != nil {
+		chainID = cfg.chainConfig.ChainID.String()
+	}
+
+	logger.Warn("Bad state root details",
+		"block", header.Number.Uint64(),
+		"hash", header.Hash(),
+		"parent_hash", header.ParentHash,
+		"expected_root", header.Root,
+		"computed_root", common.BytesToHash(computedRootHash),
+		"chain_id", chainID,
+		"tx_root", header.TxHash,
+		"receipt_root", header.ReceiptHash,
+		"withdrawals_root", header.WithdrawalsHash,
+		"gas_used", header.GasUsed,
+		"gas_limit", header.GasLimit,
+		"time", header.Time,
+		"base_fee", header.BaseFee,
+		"difficulty", header.Difficulty,
+		"coinbase", header.Coinbase,
+		"extra_len", len(header.Extra),
+		"aura_step", header.AuRaStep,
+		"aura_seal_len", len(header.AuRaSeal),
+		"blob_gas_used", header.BlobGasUsed,
+		"excess_blob_gas", header.ExcessBlobGas,
+		"parent_beacon_root", header.ParentBeaconBlockRoot,
+		"requests_hash", header.RequestsHash,
+	)
+
+	if doms != nil {
+		logger.Warn("Bad state root progress",
+			"domains_block", doms.BlockNum(),
+			"domains_txnum", doms.TxNum(),
+			"stage_block", e.BlockNumber,
+			"target_block", maxBlockNum,
+		)
+	} else {
+		logger.Warn("Bad state root progress", "stage_block", e.BlockNumber, "target_block", maxBlockNum)
+	}
+
+	if ERIGON_BAD_ROOT_DEBUG {
+		logBlockDetails := func(source string, b *types.Block) {
+			txs := b.Transactions()
+			computedTxRoot := types.DeriveSha(txs)
+			logger.Warn("Bad state root block info",
+				"source", source,
+				"txs", len(txs),
+				"uncles", len(b.Uncles()),
+				"withdrawals", len(b.Withdrawals()),
+				"size", b.Size(),
+				"tx_root_header", header.TxHash,
+				"tx_root_computed", computedTxRoot,
+				"tx_root_match", computedTxRoot == header.TxHash,
+			)
+			if len(txs) > 0 {
+				logger.Warn("Bad state root tx sample",
+					"source", source,
+					"first", txs[0].Hash(),
+					"last", txs[len(txs)-1].Hash(),
+				)
+				if itx, ok := txs[0].Unwrap().(*types.ArbitrumInternalTx); ok {
+					selector := "<short>"
+					if len(itx.Data) >= 4 {
+						selector = fmt.Sprintf("%x", itx.Data[:4])
+					}
+					if len(itx.Data) >= 4 && *(*[4]byte)(itx.Data[:4]) == arbos.InternalTxStartBlockMethodID {
+						inputs, err := arbosutil.UnpackInternalTxDataStartBlock(itx.Data)
+						if err != nil {
+							logger.Warn("Bad state root internal tx decode failed",
+								"source", source,
+								"block", b.NumberU64(),
+								"tx_hash", txs[0].Hash(),
+								"selector", selector,
+								"err", err,
+							)
+						} else {
+							l1BlockNumber, _ := inputs["l1BlockNumber"].(uint64)
+							l2BlockNumber, _ := inputs["l2BlockNumber"].(uint64)
+							timePassed, _ := inputs["timePassed"].(uint64)
+							l1BaseFee := inputs["l1BaseFee"]
+							headerInfo := types.DeserializeHeaderExtraInformation(header)
+							logger.Warn("Bad state root internal tx startblock",
+								"source", source,
+								"block", b.NumberU64(),
+								"header_number", header.Number.Uint64(),
+								"header_time", header.Time,
+								"header_base_fee", header.BaseFee,
+								"header_l1_block_number", headerInfo.L1BlockNumber,
+								"header_send_count", headerInfo.SendCount,
+								"header_arbos_format_version", headerInfo.ArbOSFormatVersion,
+								"l1_base_fee", l1BaseFee,
+								"tx_hash", txs[0].Hash(),
+								"data_len", len(itx.Data),
+								"selector", selector,
+								"l1_block_number", l1BlockNumber,
+								"l2_block_number", l2BlockNumber,
+								"time_passed", timePassed,
+							)
+						}
+					} else {
+						logger.Warn("Bad state root internal tx unknown selector",
+							"source", source,
+							"block", b.NumberU64(),
+							"tx_hash", txs[0].Hash(),
+							"data_len", len(itx.Data),
+							"selector", selector,
+						)
+					}
+				}
+			}
+			if wd := b.Withdrawals(); wd != nil {
+				computedWithdrawalsRoot := types.DeriveSha(types.Withdrawals(wd))
+				logger.Warn("Bad state root withdrawals",
+					"source", source,
+					"withdrawals_root_header", header.WithdrawalsHash,
+					"withdrawals_root_computed", computedWithdrawalsRoot,
+				)
+			}
+			if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
+				receipts, err := rawdb.ReadReceiptsCacheV2(temporalTx, b, rawdbv3.TxNums)
+				if err != nil {
+					logger.Warn("Bad state root receipts read failed", "source", source, "err", err)
+				} else {
+					computedReceiptRoot := types.DeriveSha(receipts)
+					logger.Warn("Bad state root receipts",
+						"source", source,
+						"receipts", len(receipts),
+						"receipt_root_header", header.ReceiptHash,
+						"receipt_root_computed", computedReceiptRoot,
+						"receipt_root_match", computedReceiptRoot == header.ReceiptHash,
+					)
+				}
+			} else {
+				logger.Warn("Bad state root receipts skipped", "source", source, "reason", "non-temporal tx")
+			}
+			for i, tx := range txs {
+				from := "<unknown>"
+				if sender, ok := tx.GetSender(); ok {
+					from = sender.Hex()
+				}
+				to := "<contract>"
+				if tx.GetTo() != nil {
+					to = tx.GetTo().Hex()
+				}
+				logger.Warn("Bad state root tx",
+					"source", source,
+					"idx", i,
+					"hash", tx.Hash(),
+					"type", tx.Type(),
+					"from", from,
+					"to", to,
+					"nonce", tx.GetNonce(),
+					"gas_limit", tx.GetGasLimit(),
+					"blob_gas", tx.GetBlobGas(),
+					"value", tx.GetValue(),
+					"tip_cap", tx.GetTipCap(),
+					"fee_cap", tx.GetFeeCap(),
+					"chain_id", tx.GetChainID(),
+					"data_len", len(tx.GetData()),
+					"access_list_len", len(tx.GetAccessList()),
+					"auth_len", len(tx.GetAuthorizations()),
+					"timeboosted", tx.IsTimeBoosted(),
+				)
+			}
+		}
+
+		if header.Number.Uint64() > 0 && applyTx != nil {
+			parent := rawdb.ReadHeader(applyTx, header.ParentHash, header.Number.Uint64()-1)
+			if parent != nil {
+				logger.Warn("Bad state root parent",
+					"number", parent.Number.Uint64(),
+					"hash", parent.Hash(),
+					"state_root", parent.Root,
+					"tx_root", parent.TxHash,
+					"receipt_root", parent.ReceiptHash,
+				)
+			}
+		}
+
+		if applyTx == nil {
+			logger.Warn("Bad state root: missing tx for block inspection")
+		} else {
+			loggedBlock := false
+			if cfg.blockReader == nil {
+				logger.Warn("Bad state root: block reader is nil")
+			} else {
+				b, err := blockWithSenders(ctx, cfg.db, applyTx, cfg.blockReader, header.Number.Uint64())
+				if err != nil {
+					logger.Warn("Bad state root block read failed", "source", "block_reader", "err", err)
+				} else if b == nil {
+					logger.Warn("Bad state root block read returned nil", "source", "block_reader")
+				} else {
+					logBlockDetails("block_reader", b)
+					loggedBlock = true
+				}
+			}
+			if !loggedBlock {
+				b, senders, err := rawdb.ReadBlockWithSenders(applyTx, header.Hash(), header.Number.Uint64())
+				if err != nil {
+					logger.Warn("Bad state root block read failed", "source", "db", "err", err)
+				} else if b == nil {
+					logger.Warn("Bad state root block read returned nil", "source", "db")
+				} else {
+					if len(senders) > 0 && len(senders) != b.Transactions().Len() {
+						logger.Warn("Bad state root senders mismatch", "source", "db", "senders", len(senders), "txs", len(b.Transactions()))
+					}
+					logBlockDetails("db", b)
+				}
+			}
+		}
+	}
+
+	if ERIGON_BAD_ROOT_DUMP_STATE {
+		temporalTx, ok := applyTx.(kv.TemporalRwTx)
+		if !ok {
+			logger.Warn("Bad state root: cannot dump state, tx is not temporal")
+			return
+		}
+		dumpPlainStateDebug(temporalTx, doms)
 	}
 }
 
@@ -987,6 +1224,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	}
 	if !bytes.Equal(computedRootHash, header.Root.Bytes()) {
 		logger.Warn(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", e.LogPrefix(), header.Number.Uint64(), computedRootHash, header.Root.Bytes(), header.Hash()))
+		logBadRootDetails(ctx, header, computedRootHash, applyTx, doms, cfg, e, maxBlockNum, logger)
 		ok, err = handleIncorrectRootHashError(header, applyTx.(kv.TemporalRwTx), cfg, e, maxBlockNum, logger, u)
 		return ok, times, err
 	}

@@ -32,6 +32,7 @@ import (
 	"golang.org/x/crypto/sha3"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/common/math"
 	"github.com/erigontech/erigon-lib/common/u256"
@@ -88,6 +89,10 @@ var (
 	// Specification EIP-649: https://eips.ethereum.org/EIPS/eip-649
 	calcDifficultyByzantium = makeDifficultyCalculator(3000000)
 )
+
+var ethashRewardsDebug = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false) ||
+	dbg.EnvBool("ERIGON_MDBX_MIGRATE_DEBUG", false) ||
+	dbg.EnvBool("MDBX_MIGRATE_DEBUG", false)
 
 // Various error messages to mark blocks invalid. These should be private to
 // prevent engine specific errors from being referenced in the remainder of the
@@ -570,6 +575,40 @@ func (ethash *Ethash) Finalize(config *chain.Config, header *types.Header, state
 	txs types.Transactions, uncles []*types.Header, r types.Receipts, withdrawals []*types.Withdrawal,
 	chain consensus.ChainReader, syscall consensus.SystemCall, skipReceiptsEval bool, logger log.Logger,
 ) (types.FlatRequests, error) {
+	if config.IsArbitrum() {
+		if ethashRewardsDebug {
+			logger.Info("ethash rewards skipped for arbitrum",
+				"block", header.Number.Uint64(),
+				"coinbase", header.Coinbase,
+			)
+		}
+		return nil, nil
+	}
+	if ethashRewardsDebug {
+		minerReward, uncleRewards := AccumulateRewards(config, header, uncles)
+		before, err := state.GetBalance(header.Coinbase)
+		if err != nil {
+			logger.Warn("ethash rewards balance read failed", "stage", "before", "err", err)
+		}
+		accumulateRewards(config, state, header, uncles)
+		after, err := state.GetBalance(header.Coinbase)
+		if err != nil {
+			logger.Warn("ethash rewards balance read failed", "stage", "after", "err", err)
+		}
+		var delta uint256.Int
+		delta.Sub(&after, &before)
+		logger.Info("ethash rewards applied",
+			"block", header.Number.Uint64(),
+			"coinbase", header.Coinbase,
+			"reward", minerReward.ToBig(),
+			"coinbase_before", before.ToBig(),
+			"coinbase_after", after.ToBig(),
+			"coinbase_delta", delta.ToBig(),
+			"uncles", len(uncles),
+			"uncle_rewards", len(uncleRewards),
+		)
+		return nil, nil
+	}
 	// Accumulate any block and uncle rewards and commit the final state root
 	accumulateRewards(config, state, header, uncles)
 	return nil, nil

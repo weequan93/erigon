@@ -19,6 +19,8 @@ package membatchwithdb
 import (
 	"bytes"
 	"context"
+	"errors"
+	"time"
 	"unsafe"
 
 	"github.com/c2h5oh/datasize"
@@ -726,6 +728,14 @@ func (m *MemoryMutation) AggTx() any {
 	return m.db.(hasAggCtx).AggTx()
 }
 
+func (m *MemoryMutation) temporalRwTx() (kv.TemporalRwTx, error) {
+	ttx, ok := m.db.(kv.TemporalRwTx)
+	if !ok {
+		return nil, errors.New("tx is not a temporal tx")
+	}
+	return ttx, nil
+}
+
 func (m *MemoryMutation) GetLatest(name kv.Domain, k []byte) (v []byte, step kv.Step, err error) {
 	// panic("not supported")
 	return m.db.(kv.TemporalTx).GetLatest(name, k)
@@ -774,4 +784,60 @@ func (m *MemoryMutation) AggForkablesTx(id kv.ForkableId) any {
 
 func (m *MemoryMutation) Unmarked(id kv.ForkableId) kv.UnmarkedTx {
 	return m.db.(kv.TemporalTx).Unmarked(id)
+}
+
+func (m *MemoryMutation) DomainPut(domain kv.Domain, k, v []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return err
+	}
+	return ttx.DomainPut(domain, k, v, txNum, prevVal, prevStep)
+}
+
+func (m *MemoryMutation) DomainDel(domain kv.Domain, k []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return err
+	}
+	return ttx.DomainDel(domain, k, txNum, prevVal, prevStep)
+}
+
+func (m *MemoryMutation) DomainDelPrefix(domain kv.Domain, prefix []byte, txNum uint64) error {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return err
+	}
+	return ttx.DomainDelPrefix(domain, prefix, txNum)
+}
+
+func (m *MemoryMutation) GreedyPruneHistory(ctx context.Context, domain kv.Domain) error {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return err
+	}
+	return ttx.GreedyPruneHistory(ctx, domain)
+}
+
+func (m *MemoryMutation) PruneSmallBatches(ctx context.Context, timeout time.Duration) (bool, error) {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return false, err
+	}
+	return ttx.PruneSmallBatches(ctx, timeout)
+}
+
+func (m *MemoryMutation) Unwind(ctx context.Context, txNumUnwindTo uint64, changeset *[kv.DomainLen][]kv.DomainEntryDiff) error {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return err
+	}
+	return ttx.Unwind(ctx, txNumUnwindTo, changeset)
+}
+
+func (m *MemoryMutation) UnmarkedRw(id kv.ForkableId) kv.UnmarkedRwTx {
+	ttx, err := m.temporalRwTx()
+	if err != nil {
+		return nil
+	}
+	return ttx.UnmarkedRw(id)
 }

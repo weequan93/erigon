@@ -24,11 +24,10 @@ import (
 
 	"golang.org/x/sync/errgroup"
 
-	"github.com/erigontech/nitro-erigon/arbos"
-	"github.com/erigontech/nitro-erigon/arbos/arbosState"
-	"github.com/erigontech/nitro-erigon/arbos/arbostypes"
-	"github.com/erigontech/nitro-erigon/gethhook"
-	"github.com/erigontech/nitro-erigon/statetransfer"
+	"github.com/offchainlabs/nitro/arbos"
+	"github.com/offchainlabs/nitro/arbos/arbosState"
+	"github.com/offchainlabs/nitro/gethhook"
+	offchainArbosState "github.com/offchainlabs/nitro/arbos/arbosState"
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
@@ -52,11 +51,15 @@ import (
 	"github.com/erigontech/erigon/turbo/shards"
 )
 
-var arbTrace bool
+var (
+	arbTrace     bool
+	badRootDebug bool
+)
 
 func init() {
 	gethhook.RequireHookedGeth()
 	arbTrace = dbg.EnvBool("ARB_TRACE", false)
+	badRootDebug = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 }
 
 var noop = state.NewNoopWriter()
@@ -234,14 +237,6 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	rw.rs.Domains().SetTxNum(txTask.TxNum)
 	rw.stateReader.ResetReadSet()
 	rw.stateWriter.ResetWriteSet()
-	if rw.chainConfig.IsArbitrum() && txTask.BlockNum > 0 {
-		if rw.evm.ProcessingHookSet.CompareAndSwap(false, true) {
-			rw.evm.ProcessingHook = arbos.NewTxProcessorIBS(rw.evm, state.NewArbitrum(rw.ibs), txTask.TxAsMessage)
-		} else {
-			rw.evm.ProcessingHook.SetMessage(txTask.TxAsMessage, state.NewArbitrum(rw.ibs))
-		}
-	}
-
 	rw.ibs.Reset()
 	ibs, hooks, cc := rw.ibs, rw.hooks, rw.chainConfig
 	rw.ibs.SetTrace(arbTrace)
@@ -251,6 +246,15 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	rules, header := txTask.Rules, txTask.Header
 	if arbTrace {
 		fmt.Printf("txNum=%d blockNum=%d history=%t\n", txTask.TxNum, txTask.BlockNum, txTask.HistoryExecution)
+	}
+	if badRootDebug && txTask.TxIndex == 0 && txTask.Tx != nil {
+		log.Warn("exec3 tx task",
+			"block_number", txTask.BlockNum,
+			"tx_index", txTask.TxIndex,
+			"tx_num", txTask.TxNum,
+			"tx_hash", txTask.Tx.Hash(),
+			"tx_type", txTask.Tx.Type(),
+		)
 	}
 
 	switch {
@@ -266,20 +270,15 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			rules = &chain.Rules{}
 
 			if rw.chainConfig.IsArbitrum() { // initialize arbos once
+				// GenesisToBlock uses a temporary DB; use the execution IBS so ArbOS writes persist.
 				ibsa := state.NewArbitrum(rw.ibs)
 				accountsPerSync := uint(100000) // const for sep-rollup
-				initMessage, err := arbostypes.GetSepoliaRollupInitMessage()
+				stateRoot, err := initializeArbosGenesis(ibsa, rw.rs.Domains(), rw.rs.TemporalPutDel(), rw.chainConfig, rw.evm.Context.Time, accountsPerSync)
 				if err != nil {
-					rw.logger.Error("Failed to get Sepolia Rollup init message", "err", err)
-					return
-				}
-
-				initData := statetransfer.ArbosInitializationInfo{
-					NextBlockNumber: 0,
-				}
-				initReader := statetransfer.NewMemoryInitDataReader(&initData)
-				stateRoot, err := arbosState.InitializeArbosInDatabase(ibsa, rw.rs.Domains(), rw.rs.TemporalPutDel(), initReader, rw.chainConfig, initMessage, rw.evm.Context.Time, accountsPerSync)
-				if err != nil {
+					if errors.Is(err, arbosState.ErrAlreadyInitialized) || errors.Is(err, offchainArbosState.ErrAlreadyInitialized) {
+						rw.logger.Info("ArbOS already initialized at genesis, skipping")
+						break
+					}
 					rw.logger.Error("Failed to init ArbOS", "err", err)
 					return
 				}
@@ -356,12 +355,44 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			}
 
 			rw.evm.ResetBetweenBlocks(txTask.EvmBlockContext, core.NewEVMTxContext(msg), ibs, rw.vmCfg, rules)
+			rw.updateArbosHook(txTask.BlockNum, msg)
 			rw.execAATxn(txTask)
 			break
 		}
 
 		msg := txTask.TxAsMessage
 		rw.evm.ResetBetweenBlocks(txTask.EvmBlockContext, core.NewEVMTxContext(msg), ibs, rw.vmCfg, rules)
+		rw.updateArbosHook(txTask.BlockNum, msg)
+		if badRootDebug && txTask.TxIndex == 1 && txTask.Tx != nil {
+			baseFee := "<nil>"
+			if rw.evm.Context.BaseFee != nil {
+				baseFee = rw.evm.Context.BaseFee.ToBig().String()
+			}
+			baseFeeInBlock := "<nil>"
+			if rw.evm.Context.BaseFeeInBlock != nil {
+				baseFeeInBlock = rw.evm.Context.BaseFeeInBlock.ToBig().String()
+			}
+			toAddr := "<nil>"
+			if msg.To() != nil {
+				toAddr = msg.To().Hex()
+			}
+			log.Warn("exec3 tx msg",
+				"block_number", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_hash", txTask.Tx.Hash(),
+				"from", msg.From().Hex(),
+				"to", toAddr,
+				"value", msg.Value().ToBig().String(),
+				"gas_limit", msg.Gas(),
+				"gas_price", msg.GasPrice().ToBig().String(),
+				"fee_cap", msg.FeeCap().ToBig().String(),
+				"tip_cap", msg.TipCap().ToBig().String(),
+				"skip_l1_charging", msg.SkipL1Charging,
+				"coinbase", rw.evm.Context.Coinbase,
+				"base_fee", baseFee,
+				"base_fee_in_block", baseFeeInBlock,
+			)
+		}
 
 		if hooks != nil && hooks.OnTxStart != nil {
 			hooks.OnTxStart(rw.evm.GetVMContext(), txn, msg.From())
@@ -409,6 +440,19 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	}
 }
 
+func (rw *Worker) updateArbosHook(blockNum uint64, msg *types.Message) {
+	if msg == nil || blockNum == 0 || !rw.chainConfig.IsArbitrum() {
+		return
+	}
+
+	arbState := state.NewArbitrum(rw.ibs)
+	if rw.evm.ProcessingHookSet.CompareAndSwap(false, true) {
+		rw.evm.ProcessingHook = arbos.NewTxProcessorIBS(rw.evm, arbState, msg)
+	} else {
+		rw.evm.ProcessingHook.SetMessage(msg, arbState)
+	}
+}
+
 func (rw *Worker) execAATxn(txTask *state.TxTask) {
 	if !txTask.InBatch {
 		// this is the first transaction in an AA transaction batch, run all validation frames, then execute execution frames in its own txtask
@@ -421,6 +465,7 @@ func (rw *Worker) execAATxn(txTask *state.TxTask) {
 		var outerErr error
 		for i := startIdx; i <= endIdx; i++ {
 			rw.evm.ResetBetweenBlocks(txTask.EvmBlockContext, core.NewEVMTxContext(txTask.TxAsMessage), rw.ibs, rw.vmCfg, txTask.Rules)
+			rw.updateArbosHook(txTask.BlockNum, txTask.TxAsMessage)
 			// check if next n transactions are AA transactions and run validation
 			if txTask.Txs[i].Type() == types.AccountAbstractionTxType {
 				aaTxn, ok := txTask.Txs[i].(*types.AccountAbstractionTransaction)
@@ -464,6 +509,7 @@ func (rw *Worker) execAATxn(txTask *state.TxTask) {
 	txTask.ValidationResults = txTask.ValidationResults[1:]
 
 	rw.evm.ResetBetweenBlocks(txTask.EvmBlockContext, core.NewEVMTxContext(txTask.TxAsMessage), rw.ibs, rw.vmCfg, txTask.Rules)
+	rw.updateArbosHook(txTask.BlockNum, txTask.TxAsMessage)
 	status, gasUsed, err := aa.ExecuteAATransaction(aaTxn, validationRes.PaymasterContext, validationRes.GasUsed, rw.taskGasPool, rw.evm, txTask.Header, rw.ibs)
 	if err != nil {
 		txTask.Error = err

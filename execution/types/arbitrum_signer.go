@@ -1,6 +1,8 @@
 package types
 
 import (
+	"github.com/erigontech/secp256k1"
+
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/holiman/uint256"
 )
@@ -59,6 +61,33 @@ func (s ArbitrumSigner) Sender(tx Transaction) (common.Address, error) {
 		return s.Signer.Sender(inner.LegacyTx)
 	default:
 		return s.Signer.Sender(tx)
+	}
+}
+
+func (s ArbitrumSigner) SenderWithContext(context *secp256k1.Context, tx Transaction) (common.Address, error) {
+	switch inner := tx.(type) {
+	case *ArbitrumUnsignedTx:
+		return inner.From, nil
+	case *ArbitrumContractTx:
+		return inner.From, nil
+	case *ArbitrumDepositTx:
+		return inner.From, nil
+	case *ArbitrumInternalTx:
+		return ArbosAddress, nil
+	case *ArbitrumRetryTx:
+		return inner.From, nil
+	case *ArbitrumSubmitRetryableTx:
+		return inner.From, nil
+	case *ArbitrumLegacyTxData:
+		if inner.OverrideSender != nil {
+			return *inner.OverrideSender, nil
+		}
+		if inner.LegacyTx.V.IsZero() && inner.LegacyTx.R.IsZero() && inner.LegacyTx.S.IsZero() {
+			return common.Address{}, nil
+		}
+		return s.Signer.SenderWithContext(context, inner.LegacyTx)
+	default:
+		return s.Signer.SenderWithContext(context, tx)
 	}
 }
 

@@ -28,7 +28,7 @@ import (
 	"github.com/erigontech/erigon/turbo/services"
 	"github.com/erigontech/erigon/turbo/transactions"
 
-	"github.com/erigontech/nitro-erigon/arbos"
+	"github.com/offchainlabs/nitro/arbos"
 )
 
 type Generator struct {

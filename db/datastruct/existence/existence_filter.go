@@ -58,7 +58,8 @@ func NewFilter(keysCount uint64, filePath string, useFuse bool) (*Filter, error)
 		}
 
 		m := bloomfilter.OptimalM(keysCount, 0.01)
-		e.filter, err = bloomfilter.New(m)
+		k := bloomfilter.OptimalK(m, keysCount)
+		e.filter, err = bloomfilter.New(m, k)
 		if err != nil {
 			return nil, fmt.Errorf("%w, %s", err, fileName)
 		}
@@ -202,7 +203,7 @@ func OpenFilter(filePath string, useFuse bool) (idx *Filter, err error) {
 		return idx, nil
 	}
 	filter := new(bloomfilter.Filter)
-	_, err = filter.UnmarshalFromReaderNoVerify(bufio.NewReaderSize(f, 1*1024*1024))
+	_, err = filter.UnmarshalFromReader(bufio.NewReaderSize(f, 1*1024*1024))
 	if err != nil {
 		return nil, fmt.Errorf("OpenFilter: %w, %s", err, fileName)
 	}

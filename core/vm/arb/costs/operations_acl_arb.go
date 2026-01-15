@@ -10,7 +10,7 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon/execution/chain"
 	"github.com/erigontech/erigon/execution/chain/params"
-	"github.com/erigontech/nitro-erigon/util/arbmath"
+	"github.com/offchainlabs/nitro/util/arbmath"
 	"github.com/holiman/uint256"
 )
 

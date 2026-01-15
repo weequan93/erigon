@@ -38,6 +38,10 @@ import (
 )
 
 var execTxsDone = metrics.NewCounter(`exec_txs_done`)
+var mdbxMigrateReceiptsDebug = dbg.EnvBool("MDBX_MIGRATE_DEBUG", false)
+var mdbxMigrateReceiptsDebugBlockRaw = dbg.EnvString("MDBX_MIGRATE_DEBUG_BLOCK", "")
+var mdbxMigrateReceiptsDebugBlock = dbg.EnvUint("MDBX_MIGRATE_DEBUG_BLOCK", 0)
+var mdbxMigrateReceiptsDebugBlockSet = mdbxMigrateReceiptsDebugBlockRaw != ""
 
 // ParallelExecutionState - mainly designed for parallel transactions execution. It does separate:
 //   - execution
@@ -58,6 +62,16 @@ type ParallelExecutionState struct {
 
 	syncCfg ethconfig.Sync
 	trace   bool
+}
+
+func mdbxMigrateShouldLogReceipts(blockNum uint64) bool {
+	if !mdbxMigrateReceiptsDebug {
+		return false
+	}
+	if mdbxMigrateReceiptsDebugBlockSet && blockNum != mdbxMigrateReceiptsDebugBlock {
+		return false
+	}
+	return true
 }
 
 func NewParallelExecutionState(domains *dbstate.SharedDomains, tx kv.Tx, syncCfg ethconfig.Sync, isBor bool, logger log.Logger) *ParallelExecutionState {
@@ -225,6 +239,7 @@ func (rs *ParallelExecutionState) ApplyState(ctx context.Context, txTask *TxTask
 }
 
 func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *dbstate.SharedDomains) error {
+	shouldLogReceipts := mdbxMigrateShouldLogReceipts(txTask.BlockNum)
 	for addr := range txTask.TraceFroms {
 		if err := domains.IndexAdd(kv.TracesFromIdx, addr[:], txTask.TxNum); err != nil {
 			return err
@@ -248,10 +263,46 @@ func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *db
 		}
 	}
 
+	if shouldLogReceipts && !rs.syncCfg.PersistReceiptsCacheV2 && txTask.TxIndex == 0 {
+		log.Info("mdbx-migrate receipts cache disabled",
+			"block_number", txTask.BlockNum,
+			"tx_num", txTask.TxNum,
+		)
+	}
+
 	if rs.syncCfg.PersistReceiptsCacheV2 {
 		var receipt *types.Receipt
+		receiptIndexValid := txTask.TxIndex >= 0 && txTask.TxIndex < len(txTask.BlockReceipts)
 		if txTask.TxIndex >= 0 && txTask.TxIndex < len(txTask.BlockReceipts) {
 			receipt = txTask.BlockReceipts[txTask.TxIndex]
+		}
+		if shouldLogReceipts {
+			logsLen := 0
+			cumGasUsed := uint64(0)
+			firstLogIndex := uint32(0)
+			receiptBlockNum := uint64(0)
+			receiptTxIndex := uint(0)
+			if receipt != nil {
+				logsLen = len(receipt.Logs)
+				cumGasUsed = receipt.CumulativeGasUsed
+				firstLogIndex = receipt.FirstLogIndexWithinBlock
+				if receipt.BlockNumber != nil {
+					receiptBlockNum = receipt.BlockNumber.Uint64()
+				}
+				receiptTxIndex = receipt.TransactionIndex
+			}
+			log.Info("mdbx-migrate receipts cache write",
+				"block_number", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"receipt_index_valid", receiptIndexValid,
+				"receipt_nil", receipt == nil,
+				"receipt_block_number", receiptBlockNum,
+				"receipt_tx_index", receiptTxIndex,
+				"receipt_logs", logsLen,
+				"receipt_cum_gas_used", cumGasUsed,
+				"receipt_first_log_index", firstLogIndex,
+			)
 		}
 		if err := rawdb.WriteReceiptCacheV2(domains.AsPutDel(rs.tx), receipt, txTask.TxNum); err != nil {
 			return err

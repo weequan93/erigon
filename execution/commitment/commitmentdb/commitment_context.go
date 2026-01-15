@@ -170,6 +170,64 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 	return rootHash, err
 }
 
+type noopTemporalPutDel struct{}
+
+func (noopTemporalPutDel) DomainPut(kv.Domain, []byte, []byte, uint64, []byte, kv.Step) error {
+	return nil
+}
+func (noopTemporalPutDel) DomainDel(kv.Domain, []byte, uint64, []byte, kv.Step) error { return nil }
+func (noopTemporalPutDel) DomainDelPrefix(kv.Domain, []byte, uint64) error            { return nil }
+
+// DebugRootHash computes the commitment root for the current updates without mutating the live context.
+// Intended for debug-only use; it snapshots trie state, runs a temporary commitment, then restores.
+func (sdc *SharedDomainsCommitmentContext) DebugRootHash(ctx context.Context, logPrefix string) (rootHash []byte, err error) {
+	if sdc == nil || sdc.patriciaTrie == nil {
+		return nil, errors.New("commitment context is not initialized")
+	}
+	if sdc.mainTtx == nil {
+		return nil, errors.New("commitment context is missing trie context")
+	}
+	if sdc.updates == nil || sdc.updates.Size() == 0 {
+		return sdc.patriciaTrie.RootHash()
+	}
+
+	snapshot := sdc.updates.DebugSnapshot()
+	if snapshot == nil || snapshot.Size() == 0 {
+		return sdc.patriciaTrie.RootHash()
+	}
+	defer snapshot.Close()
+
+	state, err := sdc.encodeCommitmentState(0, sdc.mainTtx.txNum)
+	if err != nil {
+		return nil, err
+	}
+
+	prevPutter := sdc.mainTtx.putter
+	prevJustRestored := sdc.justRestored.Load()
+	sdc.mainTtx.putter = noopTemporalPutDel{}
+
+	rootHash, err = func() ([]byte, error) {
+		sdc.patriciaTrie.SetTrace(sdc.trace)
+		sdc.Reset()
+		return sdc.patriciaTrie.Process(ctx, snapshot, logPrefix)
+	}()
+
+	restoreErr := func() error {
+		_, _, err := sdc.restorePatriciaState(state)
+		return err
+	}()
+	sdc.justRestored.Store(prevJustRestored)
+	sdc.mainTtx.putter = prevPutter
+
+	if err == nil && restoreErr != nil {
+		err = restoreErr
+	} else if err != nil && restoreErr != nil {
+		log.Warn("mdbx-migrate debug: failed to restore commitment state", "err", restoreErr)
+	}
+
+	return rootHash, err
+}
+
 // by that key stored latest root hash and tree state
 const keyCommitmentStateS = "state"
 
