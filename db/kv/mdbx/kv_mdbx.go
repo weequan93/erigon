@@ -60,6 +60,10 @@ const NonExistingDBI kv.DBI = 999_999_999
 
 type TableCfgFunc func(defaultBuckets kv.TableCfg) kv.TableCfg
 
+var mdbxRWLogEnabled = dbg.EnvBool("MDBX_RW_LOG", false)
+
+const mdbxRWLogKeyMax = 16
+
 func WithChaindataTables(defaultBuckets kv.TableCfg) kv.TableCfg {
 	return defaultBuckets
 }
@@ -1113,11 +1117,32 @@ func (tx *MdbxTx) statelessCursor(bucket string) (kv.RwCursor, error) {
 	return c, nil
 }
 
+func (tx *MdbxTx) logRW(op, table string, key, value []byte) {
+	if !mdbxRWLogEnabled {
+		return
+	}
+	keyHex := ""
+	if len(key) > 0 {
+		if len(key) > mdbxRWLogKeyMax {
+			keyHex = common.Bytes2Hex(key[:mdbxRWLogKeyMax]) + "..."
+		} else {
+			keyHex = common.Bytes2Hex(key)
+		}
+	}
+	valueLen := 0
+	if value != nil {
+		valueLen = len(value)
+	}
+	tx.db.opts.log.Info("[mdbx] rw", "op", op, "table", table, "key_len", len(key), "key_hex", keyHex, "value_len", valueLen, "tx_ro", tx.readOnly)
+}
+
 func (tx *MdbxTx) Put(table string, k, v []byte) error {
+	tx.logRW("put", table, k, v)
 	return tx.tx.Put(mdbx.DBI(tx.db.buckets[table].DBI), k, v, 0)
 }
 
 func (tx *MdbxTx) Delete(table string, k []byte) error {
+	tx.logRW("del", table, k, nil)
 	err := tx.tx.Del(mdbx.DBI(tx.db.buckets[table].DBI), k, nil)
 	if mdbx.IsNotFound(err) {
 		return nil
@@ -1126,6 +1151,7 @@ func (tx *MdbxTx) Delete(table string, k []byte) error {
 }
 
 func (tx *MdbxTx) GetOne(bucket string, k []byte) ([]byte, error) {
+	tx.logRW("get", bucket, k, nil)
 	v, err := tx.tx.Get(mdbx.DBI(tx.db.buckets[bucket].DBI), k)
 	if mdbx.IsNotFound(err) {
 		return nil, nil
@@ -1137,6 +1163,7 @@ func (tx *MdbxTx) GetOne(bucket string, k []byte) ([]byte, error) {
 }
 
 func (tx *MdbxTx) Has(bucket string, key []byte) (bool, error) {
+	tx.logRW("has", bucket, key, nil)
 	c, err := tx.statelessCursor(bucket)
 	if err != nil {
 		return false, err
@@ -1149,6 +1176,7 @@ func (tx *MdbxTx) Has(bucket string, key []byte) (bool, error) {
 }
 
 func (tx *MdbxTx) Append(bucket string, k, v []byte) error {
+	tx.logRW("append", bucket, k, v)
 	c, err := tx.statelessCursor(bucket)
 	if err != nil {
 		return err
@@ -1156,6 +1184,7 @@ func (tx *MdbxTx) Append(bucket string, k, v []byte) error {
 	return c.Append(k, v)
 }
 func (tx *MdbxTx) AppendDup(bucket string, k, v []byte) error {
+	tx.logRW("append_dup", bucket, k, v)
 	c, err := tx.statelessCursor(bucket)
 	if err != nil {
 		return err
@@ -1164,6 +1193,7 @@ func (tx *MdbxTx) AppendDup(bucket string, k, v []byte) error {
 }
 
 func (tx *MdbxTx) IncrementSequence(bucket string, amount uint64) (uint64, error) {
+	tx.logRW("seq_inc", kv.Sequence, []byte(bucket), nil)
 	c, err := tx.statelessCursor(kv.Sequence)
 	if err != nil {
 		return 0, err
@@ -1188,6 +1218,7 @@ func (tx *MdbxTx) IncrementSequence(bucket string, amount uint64) (uint64, error
 }
 
 func (tx *MdbxTx) ResetSequence(bucket string, newValue uint64) error {
+	tx.logRW("seq_reset", kv.Sequence, []byte(bucket), nil)
 	c, err := tx.statelessCursor(kv.Sequence)
 	if err != nil {
 		return err
@@ -1199,6 +1230,7 @@ func (tx *MdbxTx) ResetSequence(bucket string, newValue uint64) error {
 }
 
 func (tx *MdbxTx) ReadSequence(bucket string) (uint64, error) {
+	tx.logRW("seq_read", kv.Sequence, []byte(bucket), nil)
 	c, err := tx.statelessCursor(kv.Sequence)
 	if err != nil {
 		return 0, err
