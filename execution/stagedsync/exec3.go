@@ -23,6 +23,8 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -38,6 +40,7 @@ import (
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/db/config3"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/rawdb/rawdbhelpers"
@@ -49,6 +52,7 @@ import (
 	"github.com/erigontech/erigon/execution/consensus"
 	"github.com/erigontech/erigon/execution/exec3"
 	"github.com/erigontech/erigon/execution/stagedsync/stages"
+	etrie "github.com/erigontech/erigon/execution/trie"
 	"github.com/erigontech/erigon/execution/types"
 	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/turbo/services"
@@ -858,6 +862,11 @@ Loop:
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
 var ERIGON_BAD_ROOT_DEBUG = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var ERIGON_BAD_ROOT_DUMP_STATE = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_STATE", false)
+var ERIGON_BAD_ROOT_ACCOUNTS = dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil)
+var ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
+var ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS_MAX = dbg.EnvInt("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS_MAX", 200)
+var ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT", false)
+var ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT", false)
 
 // nolint
 func dumpPlainStateDebug(tx kv.TemporalRwTx, doms *dbstate.SharedDomains) {
@@ -910,7 +919,221 @@ func dumpPlainStateDebug(tx kv.TemporalRwTx, doms *dbstate.SharedDomains) {
 	}
 }
 
-func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHash []byte, applyTx kv.Tx, doms *dbstate.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, logger log.Logger) {
+func badRootAccountList(header *types.Header, logger log.Logger) []common.Address {
+	if header == nil {
+		return nil
+	}
+	out := make([]common.Address, 0, len(ERIGON_BAD_ROOT_ACCOUNTS)+1)
+	seen := make(map[common.Address]struct{}, len(ERIGON_BAD_ROOT_ACCOUNTS)+1)
+	add := func(addr common.Address) {
+		if _, ok := seen[addr]; ok {
+			return
+		}
+		seen[addr] = struct{}{}
+		out = append(out, addr)
+	}
+
+	add(header.Coinbase)
+	for _, raw := range ERIGON_BAD_ROOT_ACCOUNTS {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		if !common.IsHexAddress(raw) {
+			logger.Warn("Bad state root account address invalid", "value", raw)
+			continue
+		}
+		add(common.HexToAddress(raw))
+	}
+	return out
+}
+
+func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.SharedDomains, logger log.Logger) {
+	if header == nil {
+		return
+	}
+	temporalTx, ok := applyTx.(kv.TemporalTx)
+	if !ok {
+		logger.Warn("Bad state root account log skipped", "reason", "non-temporal tx")
+		return
+	}
+	addrs := badRootAccountList(header, logger)
+	if len(addrs) == 0 {
+		return
+	}
+	if doms == nil {
+		logger.Warn("Bad state root account log skipped", "reason", "missing domains")
+		return
+	}
+	for _, addr := range addrs {
+		val, step, err := doms.GetLatest(kv.AccountsDomain, temporalTx, addr[:])
+		if err != nil {
+			logger.Warn("Bad state root account read failed", "block", header.Number.Uint64(), "address", addr, "err", err)
+			continue
+		}
+		if len(val) == 0 {
+			logger.Warn("Bad state root account missing", "block", header.Number.Uint64(), "address", addr, "step", step)
+			continue
+		}
+		acc := accounts.NewAccount()
+		if err := accounts.DeserialiseV3(&acc, val); err != nil {
+			logger.Warn("Bad state root account decode failed", "block", header.Number.Uint64(), "address", addr, "err", err)
+			continue
+		}
+		logger.Warn("Bad state root account",
+			"block", header.Number.Uint64(),
+			"address", addr,
+			"nonce", acc.Nonce,
+			"balance", acc.Balance.String(),
+			"incarnation", acc.Incarnation,
+			"code_hash", acc.CodeHash,
+			"root", acc.Root,
+			"step", step,
+		)
+	}
+}
+
+func computeStorageRootFromDomain(ttx kv.TemporalTx, addr common.Address, txNum uint64) (common.Hash, int, error) {
+	to, ok := kv.NextSubtree(addr[:])
+	if !ok {
+		to = nil
+	}
+	it, err := ttx.RangeAsOf(kv.StorageDomain, addr[:], to, txNum, order.Asc, kv.Unlim)
+	if err != nil {
+		return common.Hash{}, 0, err
+	}
+	defer it.Close()
+
+	tr := etrie.New(common.Hash{})
+	items := 0
+	for it.HasNext() {
+		k, v, err := it.Next()
+		if err != nil {
+			return common.Hash{}, items, err
+		}
+		if len(v) == 0 {
+			continue
+		}
+		if len(k) < 20 {
+			return common.Hash{}, items, fmt.Errorf("short storage key: %d bytes", len(k))
+		}
+		slot := k[20:]
+		slotHash, _ := common.HashData(slot)
+		tr.Update(slotHash.Bytes(), common.Copy(v))
+		items++
+	}
+	return tr.Hash(), items, nil
+}
+
+func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.SharedDomains, touchedPlainKeys [][]byte, logger log.Logger) {
+	if header == nil || doms == nil {
+		return
+	}
+	if !ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS {
+		return
+	}
+	temporalTx, ok := applyTx.(kv.TemporalTx)
+	if !ok {
+		logger.Warn("Bad state root touched account log skipped", "reason", "non-temporal tx")
+		return
+	}
+	keys := touchedPlainKeys
+	if len(keys) == 0 {
+		commitCtx := doms.GetCommitmentContext()
+		if commitCtx == nil {
+			logger.Warn("Bad state root touched account log skipped", "reason", "missing commitment context")
+			return
+		}
+		keys = commitCtx.DebugLastPlainKeys()
+		if len(keys) == 0 {
+			keys = commitCtx.DebugPlainKeys()
+		}
+	}
+	if len(keys) == 0 {
+		logger.Warn("Bad state root touched account log skipped", "reason", "no touched keys")
+		return
+	}
+	txNum, err := rawdbv3.TxNums.Max(temporalTx, header.Number.Uint64())
+	if err != nil {
+		logger.Warn("Bad state root touched account txnum read failed", "block", header.Number.Uint64(), "err", err)
+		return
+	}
+
+	addrSet := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) < 20 {
+			continue
+		}
+		addrSet[string(key[:20])] = struct{}{}
+	}
+	if len(addrSet) == 0 {
+		logger.Warn("Bad state root touched account log skipped", "reason", "no addresses")
+		return
+	}
+
+	addrs := make([]string, 0, len(addrSet))
+	for addr := range addrSet {
+		addrs = append(addrs, addr)
+	}
+	sort.Slice(addrs, func(i, j int) bool {
+		return bytes.Compare([]byte(addrs[i]), []byte(addrs[j])) < 0
+	})
+
+	max := ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS_MAX
+	if max <= 0 || max > len(addrs) {
+		max = len(addrs)
+	}
+
+	logger.Warn("Bad state root touched accounts summary",
+		"block", header.Number.Uint64(),
+		"count", len(addrs),
+		"max", max,
+	)
+	for i := 0; i < max; i++ {
+		addr := common.BytesToAddress([]byte(addrs[i]))
+		val, step, err := doms.GetLatest(kv.AccountsDomain, temporalTx, addr[:])
+		if err != nil {
+			logger.Warn("Bad state root touched account read failed", "block", header.Number.Uint64(), "address", addr, "err", err)
+			continue
+		}
+
+		root, items, err := computeStorageRootFromDomain(temporalTx, addr, txNum)
+		if err != nil {
+			logger.Warn("Bad state root touched account storage root failed", "block", header.Number.Uint64(), "address", addr, "err", err)
+			continue
+		}
+
+		if len(val) == 0 {
+			logger.Warn("Bad state root touched account missing",
+				"block", header.Number.Uint64(),
+				"address", addr,
+				"storage_root", root,
+				"storage_items", items,
+				"step", step,
+			)
+			continue
+		}
+
+		acc := accounts.NewAccount()
+		if err := accounts.DeserialiseV3(&acc, val); err != nil {
+			logger.Warn("Bad state root touched account decode failed", "block", header.Number.Uint64(), "address", addr, "err", err)
+			continue
+		}
+		logger.Warn("Bad state root touched account",
+			"block", header.Number.Uint64(),
+			"address", addr,
+			"nonce", acc.Nonce,
+			"balance", acc.Balance.String(),
+			"incarnation", acc.Incarnation,
+			"code_hash", acc.CodeHash,
+			"root", root,
+			"storage_items", items,
+			"step", step,
+		)
+	}
+}
+
+func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHash []byte, applyTx kv.Tx, doms *dbstate.SharedDomains, touchedPlainKeys [][]byte, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, logger log.Logger) {
 	if header == nil {
 		logger.Warn("Bad state root details: missing header")
 		return
@@ -1131,6 +1354,8 @@ func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHa
 				}
 			}
 		}
+		logBadRootAccounts(header, applyTx, doms, logger)
+		logBadRootTouchedAccounts(header, applyTx, doms, touchedPlainKeys, logger)
 	}
 
 	if ERIGON_BAD_ROOT_DUMP_STATE {
@@ -1144,6 +1369,10 @@ func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHa
 }
 
 func handleIncorrectRootHashError(header *types.Header, applyTx kv.TemporalRwTx, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, logger log.Logger, u Unwinder) (bool, error) {
+	if ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT {
+		logger.Warn("Skipping unwind due to incorrect root hash (debug)", "block", header.Number.Uint64())
+		return false, nil
+	}
 	if cfg.badBlockHalt {
 		return false, fmt.Errorf("%w: wrong trie root", consensus.ErrInvalidBlock)
 	}
@@ -1190,6 +1419,7 @@ type FlushAndComputeCommitmentTimes struct {
 // flushAndCheckCommitmentV3 - does write state to db and then check commitment
 func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyTx kv.RwTx, doms *dbstate.SharedDomains, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, parallel bool, logger log.Logger, u Unwinder, inMemExec bool) (ok bool, times FlushAndComputeCommitmentTimes, err error) {
 	start := time.Now()
+	var touchedPlainKeys [][]byte
 	// E2 state root check was in another stage - means we did flush state even if state root will not match
 	// And Unwind expecting it
 	if !parallel {
@@ -1212,6 +1442,12 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		panic(fmt.Errorf("%d != %d", doms.BlockNum(), header.Number.Uint64()))
 	}
 
+	if ERIGON_BAD_ROOT_DEBUG && ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS {
+		if commitCtx := doms.GetCommitmentContext(); commitCtx != nil {
+			touchedPlainKeys = commitCtx.DebugPlainKeys()
+		}
+	}
+
 	computedRootHash, err := doms.ComputeCommitment(ctx, true, header.Number.Uint64(), doms.TxNum(), e.LogPrefix())
 	times.ComputeCommitment = time.Since(start)
 	if err != nil {
@@ -1224,7 +1460,14 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	}
 	if !bytes.Equal(computedRootHash, header.Root.Bytes()) {
 		logger.Warn(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", e.LogPrefix(), header.Number.Uint64(), computedRootHash, header.Root.Bytes(), header.Hash()))
-		logBadRootDetails(ctx, header, computedRootHash, applyTx, doms, cfg, e, maxBlockNum, logger)
+		if ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT && !inMemExec {
+			flushStart := time.Now()
+			if err := doms.Flush(ctx, applyTx); err != nil {
+				return false, times, err
+			}
+			times.Flush = time.Since(flushStart)
+		}
+		logBadRootDetails(ctx, header, computedRootHash, applyTx, doms, touchedPlainKeys, cfg, e, maxBlockNum, logger)
 		ok, err = handleIncorrectRootHashError(header, applyTx.(kv.TemporalRwTx), cfg, e, maxBlockNum, logger, u)
 		return ok, times, err
 	}

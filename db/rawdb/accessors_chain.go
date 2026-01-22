@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/erigontech/erigon-lib/common"
@@ -1250,9 +1251,23 @@ func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, 
 }
 
 var (
-	mdbxMigrateReceiptsDebug                                = os.Getenv("MDBX_MIGRATE_DEBUG") != ""
-	mdbxMigrateReceiptsDebugBlock, mdbxMigrateReceiptsDebugBlockSet = parseEnvUintRawdb("MDBX_MIGRATE_DEBUG_BLOCK")
+	mdbxMigrateReceiptsDebug = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DEBUG", false) || os.Getenv("MDBX_MIGRATE_DEBUG") != ""
+	mdbxMigrateReceiptsDebugBlock, mdbxMigrateReceiptsDebugBlockSet = parseEnvUintRawdbWithFallback(
+		"ERIGON_MDBX_MIGRATE_DEBUG_BLOCK",
+		"MDBX_MIGRATE_DEBUG_BLOCK",
+	)
+	mdbxMigrateReceiptsMem sync.Map
 )
+
+type receiptMemDebugEntry struct {
+	raw        []byte
+	nilReceipt bool
+	blockNum   uint64
+	txIndex    uint
+	status     uint64
+	gasUsed    uint64
+	logs       int
+}
 
 func parseEnvUintRawdb(name string) (uint64, bool) {
 	value := os.Getenv(name)
@@ -1267,6 +1282,13 @@ func parseEnvUintRawdb(name string) (uint64, bool) {
 	return parsed, true
 }
 
+func parseEnvUintRawdbWithFallback(primary, fallback string) (uint64, bool) {
+	if parsed, ok := parseEnvUintRawdb(primary); ok {
+		return parsed, true
+	}
+	return parseEnvUintRawdb(fallback)
+}
+
 func mdbxMigrateShouldLogReceipts(blockNum uint64) bool {
 	if !mdbxMigrateReceiptsDebug {
 		return false
@@ -1275,6 +1297,97 @@ func mdbxMigrateShouldLogReceipts(blockNum uint64) bool {
 		return false
 	}
 	return true
+}
+
+func mdbxMigrateStoreReceiptMem(txNum uint64, receipt *types.Receipt, raw []byte) {
+	if !mdbxMigrateReceiptsDebug {
+		return
+	}
+	entry := receiptMemDebugEntry{
+		raw:        append([]byte(nil), raw...),
+		nilReceipt: receipt == nil,
+	}
+	if receipt != nil {
+		entry.txIndex = receipt.TransactionIndex
+		entry.status = receipt.Status
+		entry.gasUsed = receipt.GasUsed
+		entry.logs = len(receipt.Logs)
+		if receipt.BlockNumber != nil {
+			entry.blockNum = receipt.BlockNumber.Uint64()
+		}
+	}
+	mdbxMigrateReceiptsMem.Store(txNum, entry)
+}
+
+func mdbxMigrateCollectMemReceipts(blockNum uint64) map[uint]receiptMemDebugEntry {
+	out := make(map[uint]receiptMemDebugEntry)
+	mdbxMigrateReceiptsMem.Range(func(_, value any) bool {
+		entry := value.(receiptMemDebugEntry)
+		if entry.nilReceipt || entry.blockNum != blockNum || len(entry.raw) == 0 {
+			return true
+		}
+		if _, ok := out[entry.txIndex]; ok {
+			log.Info("mdbx-migrate receipt mem duplicate", "block", blockNum, "tx_index", entry.txIndex)
+		}
+		out[entry.txIndex] = entry
+		return true
+	})
+	return out
+}
+
+func mdbxMigrateLogMemReceiptRoot(block *types.Block) {
+	blockNum := block.NumberU64()
+	if !mdbxMigrateShouldLogReceipts(blockNum) {
+		return
+	}
+	txs := block.Transactions()
+	if len(txs) == 0 {
+		log.Info("mdbx-migrate mem receipt root", "block", blockNum, "txs", 0, "note", "no transactions")
+		return
+	}
+
+	entries := mdbxMigrateCollectMemReceipts(blockNum)
+	receipts := make(types.Receipts, len(txs))
+	missing := 0
+	for i := 0; i < len(txs); i++ {
+		entry, ok := entries[uint(i)]
+		if !ok {
+			missing++
+			log.Info("mdbx-migrate mem receipt missing", "block", blockNum, "tx_index", i)
+			continue
+		}
+		storageReceipt := &types.ReceiptForStorage{}
+		if err := rlp.DecodeBytes(entry.raw, storageReceipt); err != nil {
+			missing++
+			log.Info("mdbx-migrate mem receipt decode error", "block", blockNum, "tx_index", i, "err", err)
+			continue
+		}
+		r := (*types.Receipt)(storageReceipt)
+		if int(r.TransactionIndex) != i {
+			log.Info("mdbx-migrate mem receipt index mismatch",
+				"block", blockNum,
+				"tx_index", i,
+				"receipt_tx_index", r.TransactionIndex,
+			)
+		}
+		r.DeriveFieldsV4ForCachedReceipt(block.Hash(), blockNum, txs[i].Hash(), true)
+		receipts[i] = r
+	}
+	if missing > 0 {
+		log.Info("mdbx-migrate mem receipt root incomplete",
+			"block", blockNum,
+			"txs", len(txs),
+			"missing", missing,
+		)
+		return
+	}
+	computed := types.DeriveSha(receipts)
+	log.Info("mdbx-migrate mem receipt root",
+		"block", blockNum,
+		"txs", len(txs),
+		"computed", computed,
+		"header", block.ReceiptHash(),
+	)
 }
 
 func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdbv3.TxNumsReader) (res types.Receipts, err error) {
@@ -1328,6 +1441,57 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 				firstMissing = txnID
 			}
 			lastMissing = txnID
+			if shouldLog {
+				log.Info("mdbx-migrate receipt missing", "block", blockNum, "txnum", txnID)
+				if entryRaw, ok := mdbxMigrateReceiptsMem.Load(txnID); ok {
+					entry := entryRaw.(receiptMemDebugEntry)
+					log.Info("mdbx-migrate receipt mem hit",
+						"block", blockNum,
+						"txnum", txnID,
+						"mem_nil", entry.nilReceipt,
+						"mem_raw_len", len(entry.raw),
+						"mem_block", entry.blockNum,
+						"mem_tx_index", entry.txIndex,
+						"mem_status", entry.status,
+						"mem_gas_used", entry.gasUsed,
+						"mem_logs", entry.logs,
+					)
+				} else {
+					log.Info("mdbx-migrate receipt mem miss", "block", blockNum, "txnum", txnID)
+				}
+				logAltHistorySeek := func(ts uint64, label string) {
+					altV, altOk, altErr := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, ts)
+					if altErr != nil {
+						log.Info("mdbx-migrate receipt alt seek error", "block", blockNum, "txnum", txnID, "ts", ts, "label", label, "err", altErr)
+						return
+					}
+					if !altOk {
+						log.Info("mdbx-migrate receipt alt seek miss", "block", blockNum, "txnum", txnID, "ts", ts, "label", label)
+						return
+					}
+					if len(altV) == 0 {
+						log.Info("mdbx-migrate receipt alt seek empty", "block", blockNum, "txnum", txnID, "ts", ts, "label", label)
+						return
+					}
+					altReceipt := &types.ReceiptForStorage{}
+					if err := rlp.DecodeBytes(altV, altReceipt); err != nil {
+						log.Info("mdbx-migrate receipt alt seek decode error", "block", blockNum, "txnum", txnID, "ts", ts, "label", label, "err", err)
+						return
+					}
+					log.Info("mdbx-migrate receipt alt seek hit",
+						"block", blockNum,
+						"txnum", txnID,
+						"ts", ts,
+						"label", label,
+						"tx_index", altReceipt.TransactionIndex,
+						"status", altReceipt.Status,
+						"gas_used", altReceipt.GasUsed,
+						"logs", len(altReceipt.Logs),
+					)
+				}
+				logAltHistorySeek(txnID, "txnum")
+				logAltHistorySeek(txnID+2, "txnum+2")
+			}
 			continue
 		}
 		if len(v) == 0 {
@@ -1336,6 +1500,57 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 				firstEmpty = txnID
 			}
 			lastEmpty = txnID
+			if shouldLog {
+				log.Info("mdbx-migrate receipt empty", "block", blockNum, "txnum", txnID)
+				if entryRaw, ok := mdbxMigrateReceiptsMem.Load(txnID); ok {
+					entry := entryRaw.(receiptMemDebugEntry)
+					log.Info("mdbx-migrate receipt mem hit",
+						"block", blockNum,
+						"txnum", txnID,
+						"mem_nil", entry.nilReceipt,
+						"mem_raw_len", len(entry.raw),
+						"mem_block", entry.blockNum,
+						"mem_tx_index", entry.txIndex,
+						"mem_status", entry.status,
+						"mem_gas_used", entry.gasUsed,
+						"mem_logs", entry.logs,
+					)
+				} else {
+					log.Info("mdbx-migrate receipt mem miss", "block", blockNum, "txnum", txnID)
+				}
+				logAltHistorySeek := func(ts uint64, label string) {
+					altV, altOk, altErr := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, ts)
+					if altErr != nil {
+						log.Info("mdbx-migrate receipt alt seek error", "block", blockNum, "txnum", txnID, "ts", ts, "label", label, "err", altErr)
+						return
+					}
+					if !altOk {
+						log.Info("mdbx-migrate receipt alt seek miss", "block", blockNum, "txnum", txnID, "ts", ts, "label", label)
+						return
+					}
+					if len(altV) == 0 {
+						log.Info("mdbx-migrate receipt alt seek empty", "block", blockNum, "txnum", txnID, "ts", ts, "label", label)
+						return
+					}
+					altReceipt := &types.ReceiptForStorage{}
+					if err := rlp.DecodeBytes(altV, altReceipt); err != nil {
+						log.Info("mdbx-migrate receipt alt seek decode error", "block", blockNum, "txnum", txnID, "ts", ts, "label", label, "err", err)
+						return
+					}
+					log.Info("mdbx-migrate receipt alt seek hit",
+						"block", blockNum,
+						"txnum", txnID,
+						"ts", ts,
+						"label", label,
+						"tx_index", altReceipt.TransactionIndex,
+						"status", altReceipt.Status,
+						"gas_used", altReceipt.GasUsed,
+						"logs", len(altReceipt.Logs),
+					)
+				}
+				logAltHistorySeek(txnID, "txnum")
+				logAltHistorySeek(txnID+2, "txnum+2")
+			}
 			continue
 		}
 
@@ -1351,6 +1566,17 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 		}
 		res = append(res, x)
 		found++
+		if shouldLog {
+			log.Info("mdbx-migrate receipt read",
+				"block", blockNum,
+				"txnum", txnID,
+				"tx_index", receipt.TransactionIndex,
+				"tx_hash", x.TxHash,
+				"status", receipt.Status,
+				"gas_used", receipt.GasUsed,
+				"logs", len(receipt.Logs),
+			)
+		}
 	}
 	if shouldLog {
 		fields := []interface{}{
@@ -1369,6 +1595,7 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 			fields = append(fields, "empty_first", firstEmpty, "empty_last", lastEmpty)
 		}
 		log.Info("mdbx-migrate receipts scan done", fields...)
+		mdbxMigrateLogMemReceiptRoot(block)
 	}
 	return res, nil
 }
@@ -1397,9 +1624,22 @@ func WriteReceiptCacheV2(tx kv.TemporalPutDel, receipt *types.Receipt, txNum uin
 				panic(fmt.Sprintf("assert: %x, %x\n", storageReceipt.FirstLogIndexWithinBlock, storageReceipt2.FirstLogIndexWithinBlock))
 			}
 		}
+		if receipt.BlockNumber != nil && mdbxMigrateShouldLogReceipts(receipt.BlockNumber.Uint64()) {
+			log.Info("mdbx-migrate receipt write",
+				"block", receipt.BlockNumber.Uint64(),
+				"txnum", txNum,
+				"tx_index", receipt.TransactionIndex,
+				"tx_hash", receipt.TxHash,
+				"status", receipt.Status,
+				"gas_used", receipt.GasUsed,
+				"logs", len(receipt.Logs),
+			)
+		}
 	} else {
 		toWrite = []byte{}
 	}
+
+	mdbxMigrateStoreReceiptMem(txNum, receipt, toWrite)
 
 	if err := tx.DomainPut(kv.RCacheDomain, receiptCacheKey, toWrite, txNum, nil, 0); err != nil {
 		return fmt.Errorf("WriteReceiptCache: %w", err)

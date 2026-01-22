@@ -95,6 +95,9 @@ type Worker struct {
 	dirs datadir.Dirs
 
 	isMining bool
+
+	escrowTouched map[common.Address]struct{}
+	escrowBlock   uint64
 }
 
 func NewWorker(lock sync.Locker, logger log.Logger, hooks *tracing.Hooks, ctx context.Context, background bool, chainDb kv.RoDB, in *state.QueueWithRetry, blockReader services.FullBlockReader, chainConfig *chain.Config, genesis *types.Genesis, results *state.ResultsQueue, engine consensus.Engine, dirs datadir.Dirs, isMining bool) *Worker {
@@ -230,6 +233,10 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 		rw.stateReader.SetTx(rw.chainTx)
 		rw.chain = consensuschain.NewReader(rw.chainConfig, rw.chainTx, rw.blockReader, rw.logger)
 	}
+	if txTask.BlockNum != rw.escrowBlock {
+		rw.escrowBlock = txTask.BlockNum
+		rw.escrowTouched = nil
+	}
 	txTask.Error = nil
 
 	rw.stateReader.SetTxNum(txTask.TxNum)
@@ -238,6 +245,9 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	rw.stateReader.ResetReadSet()
 	rw.stateWriter.ResetWriteSet()
 	rw.ibs.Reset()
+	if len(rw.escrowTouched) > 0 {
+		rw.ibs.RestoreEscrowTouched(rw.escrowTouched)
+	}
 	ibs, hooks, cc := rw.ibs, rw.hooks, rw.chainConfig
 	rw.ibs.SetTrace(arbTrace)
 	ibs.SetHooks(hooks)
@@ -426,6 +436,14 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	// Prepare read set, write set and balanceIncrease set and send for serialisation
 	if txTask.Error == nil {
 		txTask.BalanceIncreaseSet = ibs.BalanceIncreaseSet()
+		if snapshot := ibs.EscrowTouchedSnapshot(); len(snapshot) > 0 {
+			if rw.escrowTouched == nil {
+				rw.escrowTouched = make(map[common.Address]struct{}, len(snapshot))
+			}
+			for addr := range snapshot {
+				rw.escrowTouched[addr] = struct{}{}
+			}
+		}
 		if arbTrace {
 			for addr, bal := range txTask.BalanceIncreaseSet {
 				fmt.Printf("BalanceIncreaseSet [%x]=>[%d]\n", addr, &(bal.Amount))

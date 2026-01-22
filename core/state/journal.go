@@ -36,23 +36,35 @@ type journalEntry interface {
 	dirtied() *common.Address
 }
 
+type possibleZombie interface {
+	isZombie() bool
+}
+
+func isZombieEntry(entry journalEntry) bool {
+	z, ok := entry.(possibleZombie)
+	return ok && z.isZombie()
+}
+
 // journal contains the list of state modifications applied since the last state
 // commit. These are tracked to be able to be reverted in case of an execution
 // exception or revertal request.
 type journal struct {
-	entries []journalEntry         // Current changes tracked by the journal
-	dirties map[common.Address]int // Dirty accounts and the number of changes
+	entries       []journalEntry         // Current changes tracked by the journal
+	dirties       map[common.Address]int // Dirty accounts and the number of changes
+	zombieEntries map[common.Address]int // Arbitrum: number of zombie changes per address
 }
 
 // newJournal create a new initialized journal.
 func newJournal() *journal {
 	return &journal{
-		dirties: make(map[common.Address]int),
+		dirties:       make(map[common.Address]int),
+		zombieEntries: make(map[common.Address]int),
 	}
 }
 func (j *journal) Reset() {
 	j.entries = j.entries[:0]
 	clear(j.dirties)
+	clear(j.zombieEntries)
 }
 
 // append inserts a new modification entry to the end of the change journal.
@@ -60,6 +72,9 @@ func (j *journal) append(entry journalEntry) {
 	j.entries = append(j.entries, entry)
 	if addr := entry.dirtied(); addr != nil {
 		j.dirties[*addr]++
+		if isZombieEntry(entry) {
+			j.zombieEntries[*addr]++
+		}
 	}
 }
 
@@ -74,6 +89,11 @@ func (j *journal) revert(statedb *IntraBlockState, snapshot int) {
 		if addr := j.entries[i].dirtied(); addr != nil {
 			if j.dirties[*addr]--; j.dirties[*addr] == 0 {
 				delete(j.dirties, *addr)
+			}
+			if isZombieEntry(j.entries[i]) {
+				if j.zombieEntries[*addr]--; j.zombieEntries[*addr] == 0 {
+					delete(j.zombieEntries, *addr)
+				}
 			}
 		}
 	}
@@ -97,7 +117,14 @@ type (
 	createObjectChange struct {
 		account common.Address
 	}
+	createZombieChange struct {
+		account common.Address
+	}
 	resetObjectChange struct {
+		account common.Address
+		prev    *stateObject
+	}
+	resetZombieChange struct {
 		account common.Address
 		prev    *stateObject
 	}
@@ -183,6 +210,18 @@ func (ch createObjectChange) dirtied() *common.Address {
 	return &ch.account
 }
 
+func (ch createZombieChange) revert(s *IntraBlockState) error {
+	delete(s.stateObjects, ch.account)
+	delete(s.stateObjectsDirty, ch.account)
+	return nil
+}
+
+func (ch createZombieChange) dirtied() *common.Address {
+	return &ch.account
+}
+
+func (ch createZombieChange) isZombie() bool { return true }
+
 func (ch resetObjectChange) revert(s *IntraBlockState) error {
 	s.setStateObject(ch.account, ch.prev)
 	return nil
@@ -191,6 +230,17 @@ func (ch resetObjectChange) revert(s *IntraBlockState) error {
 func (ch resetObjectChange) dirtied() *common.Address {
 	return nil
 }
+
+func (ch resetZombieChange) revert(s *IntraBlockState) error {
+	s.setStateObject(ch.account, ch.prev)
+	return nil
+}
+
+func (ch resetZombieChange) dirtied() *common.Address {
+	return &ch.account
+}
+
+func (ch resetZombieChange) isZombie() bool { return true }
 
 func (ch selfdestructChange) revert(s *IntraBlockState) error {
 	obj, err := s.getStateObject(*ch.account)

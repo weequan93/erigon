@@ -17,6 +17,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -27,6 +28,7 @@ import (
 	btree2 "github.com/tidwall/btree"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/state/changeset"
 )
@@ -70,6 +72,13 @@ func newTemporalMemBatch(tx kv.TemporalTx) *TemporalMemBatch {
 		sd.domains[id] = map[string]dataWithPrevStep{}
 		sd.domainWriters[id] = d.NewWriter()
 	}
+	if aw := sd.domainWriters[kv.AccountsDomain]; aw != nil {
+		log.Info("escrow trace mem_new",
+			"mem", fmt.Sprintf("%p", sd),
+			"writer", fmt.Sprintf("%p", aw),
+			"values", fmt.Sprintf("%p", aw.values),
+		)
+	}
 
 	return sd
 }
@@ -85,6 +94,17 @@ func (sd *TemporalMemBatch) DomainDel(domain kv.Domain, k string, txNum uint64, 
 }
 
 func (sd *TemporalMemBatch) putHistory(domain kv.Domain, k, v []byte, txNum uint64, preval []byte, prevStep kv.Step) error {
+	if domain == kv.AccountsDomain && bytes.Equal(k, escrowTraceAddrBytes) {
+		w := sd.domainWriters[domain]
+		log.Info("escrow trace mem_put",
+			"mem", fmt.Sprintf("%p", sd),
+			"writer", fmt.Sprintf("%p", w),
+			"values", fmt.Sprintf("%p", w.values),
+			"tx_num", txNum,
+			"val_len", len(v),
+			"prev_len", len(preval),
+		)
+	}
 	if len(v) == 0 {
 		return sd.domainWriters[domain].DeleteWithPrev(k, txNum, preval, prevStep)
 	}
@@ -239,6 +259,15 @@ func (sd *TemporalMemBatch) flushWriters(ctx context.Context, tx kv.RwTx) error 
 	for di, w := range sd.domainWriters {
 		if w == nil {
 			continue
+		}
+		if kv.Domain(di) == kv.AccountsDomain {
+			log.Info("escrow trace mem_flush",
+				"mem", fmt.Sprintf("%p", sd),
+				"writer", fmt.Sprintf("%p", w),
+				"values", fmt.Sprintf("%p", w.values),
+				"discard", w.discard,
+				"large_vals", w.largeVals,
+			)
 		}
 		if err := w.Flush(ctx, tx); err != nil {
 			return err

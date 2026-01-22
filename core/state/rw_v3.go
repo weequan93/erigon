@@ -17,15 +17,19 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 
 	"github.com/holiman/uint256"
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
+	"github.com/erigontech/erigon-lib/common/length"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
 	"github.com/erigontech/erigon/db/kv"
@@ -42,6 +46,121 @@ var mdbxMigrateReceiptsDebug = dbg.EnvBool("MDBX_MIGRATE_DEBUG", false)
 var mdbxMigrateReceiptsDebugBlockRaw = dbg.EnvString("MDBX_MIGRATE_DEBUG_BLOCK", "")
 var mdbxMigrateReceiptsDebugBlock = dbg.EnvUint("MDBX_MIGRATE_DEBUG_BLOCK", 0)
 var mdbxMigrateReceiptsDebugBlockSet = mdbxMigrateReceiptsDebugBlockRaw != ""
+var mdbxMigrateDebugWriteSet = os.Getenv("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET") != "" || os.Getenv("MDBX_MIGRATE_DEBUG_WRITESET") != ""
+var mdbxMigrateKeyTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEYTRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var mdbxMigrateAccountTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_ACCOUNTTRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var mdbxMigrateStorageTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_STORAGETRACE", false)
+var mdbxMigrateStorageTraceBlockRaw = dbg.EnvString("ERIGON_MDBX_MIGRATE_STORAGETRACE_BLOCK", "")
+var mdbxMigrateStorageTraceBlock = dbg.EnvUint("ERIGON_MDBX_MIGRATE_STORAGETRACE_BLOCK", 0)
+var mdbxMigrateStorageTraceBlockSet = mdbxMigrateStorageTraceBlockRaw != ""
+var mdbxMigrateStorageTraceTxIndexRaw = dbg.EnvString("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", "")
+var mdbxMigrateStorageTraceTxIndex = dbg.EnvInt("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", 0)
+var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
+var mdbxMigrateTraceKeys = [][]byte{
+	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe600"),
+	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff33f46529933152e1782e51b69b5bebb0810705b1e56844f07ef4225ddbc0d700"),
+	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff1c2916348c6a2141e372f746967464575851d1fd7b468e88ffde720bb27f0f00"),
+}
+var mdbxMigrateTraceAccounts = loadMdbxMigrateTraceAccounts()
+
+func isMdbxMigrateTraceKey(key []byte) bool {
+	for _, want := range mdbxMigrateTraceKeys {
+		if bytes.Equal(key, want) {
+			return true
+		}
+	}
+	return false
+}
+
+func loadMdbxMigrateTraceAccounts() []common.Address {
+	raw := os.Getenv("ERIGON_MDBX_MIGRATE_ACCOUNTTRACE_ADDRS")
+	if raw == "" {
+		return []common.Address{
+			common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce"),
+			common.HexToAddress("0x31c5a1C83265113bd089385d76dfe4D8A2577204"),
+			common.HexToAddress("0xA4b000000000000000000073657175656e636572"),
+			common.HexToAddress("0xA4B00000000000000000000000000000000000f6"),
+			common.HexToAddress("0x00000000000000000000000000000000000A4B05"),
+			common.HexToAddress("0xA4B05FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"),
+		}
+	}
+
+	parts := strings.Split(raw, ",")
+	addrs := make([]common.Address, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		if !common.IsHexAddress(part) {
+			continue
+		}
+		addrs = append(addrs, common.HexToAddress(part))
+	}
+	return addrs
+}
+
+func isMdbxMigrateTraceAccount(addr common.Address) bool {
+	for _, want := range mdbxMigrateTraceAccounts {
+		if addr == want {
+			return true
+		}
+	}
+	return false
+}
+
+func logMdbxMigrateAccountTrace(op string, txNum uint64, address common.Address, original, account *accounts.Account) {
+	if !mdbxMigrateAccountTrace || !isMdbxMigrateTraceAccount(address) {
+		return
+	}
+	fields := []interface{}{
+		"op", op,
+		"tx_num", txNum,
+		"addr", address.Hex(),
+	}
+	if original != nil {
+		fields = append(fields,
+			"orig_nonce", original.Nonce,
+			"orig_balance", original.Balance.ToBig().String(),
+			"orig_incarnation", original.Incarnation,
+			"orig_code_hash", original.CodeHash.Hex(),
+			"orig_root", original.Root.Hex(),
+		)
+	}
+	if account != nil {
+		fields = append(fields,
+			"new_nonce", account.Nonce,
+			"new_balance", account.Balance.ToBig().String(),
+			"new_incarnation", account.Incarnation,
+			"new_code_hash", account.CodeHash.Hex(),
+			"new_root", account.Root.Hex(),
+		)
+	}
+	log.Info("mdbx-migrate accounttrace", fields...)
+}
+
+func shouldMdbxMigrateStorageTrace(blockNum uint64, txIndex int) bool {
+	if !mdbxMigrateStorageTrace {
+		return false
+	}
+	if mdbxMigrateStorageTraceBlockSet && blockNum != mdbxMigrateStorageTraceBlock {
+		return false
+	}
+	if mdbxMigrateStorageTraceTxIndexSet && txIndex != mdbxMigrateStorageTraceTxIndex {
+		return false
+	}
+	return true
+}
+
+func hexPreviewBytes(raw []byte, max int) string {
+	if len(raw) == 0 || max <= 0 {
+		return ""
+	}
+	if len(raw) <= max {
+		return fmt.Sprintf("%x", raw)
+	}
+	return fmt.Sprintf("%x...len=%d", raw[:max], len(raw))
+}
 
 // ParallelExecutionState - mainly designed for parallel transactions execution. It does separate:
 //   - execution
@@ -149,12 +268,75 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			}
 
 			for i, key := range list.Keys {
+				keyBytes := []byte(key)
+				if mdbxMigrateKeyTrace && domain == kv.StorageDomain && isMdbxMigrateTraceKey(keyBytes) {
+					val := list.Vals[i]
+					op := "put"
+					if val == nil {
+						op = "del"
+					}
+					log.Info("mdbx-migrate keytrace",
+						"op", op,
+						"domain", domain.String(),
+						"tx_num", txTask.TxNum,
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"key", fmt.Sprintf("0x%x", keyBytes),
+						"val_len", len(val),
+						"val", hexPreviewBytes(val, 64),
+					)
+				}
+				if domain == kv.StorageDomain && shouldMdbxMigrateStorageTrace(txTask.BlockNum, txTask.TxIndex) {
+					val := list.Vals[i]
+					op := "put"
+					if val == nil {
+						op = "del"
+					}
+					log.Info("mdbx-migrate storagetrace",
+						"op", op,
+						"tx_num", txTask.TxNum,
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"key_len", len(keyBytes),
+						"key", fmt.Sprintf("0x%x", keyBytes),
+						"val_len", len(val),
+						"val", hexPreviewBytes(val, 64),
+					)
+				}
+				if mdbxMigrateAccountTrace && domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+					addr := common.BytesToAddress(keyBytes)
+					if isMdbxMigrateTraceAccount(addr) {
+						enc0, _, err := domains.GetLatest(kv.AccountsDomain, rs.tx, keyBytes)
+						if err != nil {
+							return err
+						}
+						var origAcc *accounts.Account
+						if len(enc0) > 0 {
+							acc.Reset()
+							if err := accounts.DeserialiseV3(&acc, enc0); err != nil {
+								return err
+							}
+							orig := acc
+							origAcc = &orig
+						}
+						if list.Vals[i] == nil {
+							logMdbxMigrateAccountTrace("apply_del", txTask.TxNum, addr, origAcc, nil)
+						} else {
+							acc.Reset()
+							if err := accounts.DeserialiseV3(&acc, list.Vals[i]); err != nil {
+								return err
+							}
+							newAcc := acc
+							logMdbxMigrateAccountTrace("apply_put", txTask.TxNum, addr, origAcc, &newAcc)
+						}
+					}
+				}
 				if list.Vals[i] == nil {
-					if err := domains.DomainDel(domain, rs.tx, []byte(key), txTask.TxNum, nil, 0); err != nil {
+					if err := domains.DomainDel(domain, rs.tx, keyBytes, txTask.TxNum, nil, 0); err != nil {
 						return err
 					}
 				} else {
-					if err := domains.DomainPut(domain, rs.tx, []byte(key), list.Vals[i], txTask.TxNum, nil, 0); err != nil {
+					if err := domains.DomainPut(domain, rs.tx, keyBytes, list.Vals[i], txTask.TxNum, nil, 0); err != nil {
 						return err
 					}
 				}
@@ -162,9 +344,9 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 		}
 	}
 
-	emptyRemoval := txTask.Rules.IsSpuriousDragon
 	for addr, increase := range txTask.BalanceIncreaseSet {
 		increase := increase
+		emptyRemoval := txTask.Rules.IsSpuriousDragon && !increase.IsEscrow
 		addrBytes := addr.Bytes()
 		enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
 		if err != nil {
@@ -176,16 +358,79 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 				return err
 			}
 		}
+		var origAcc *accounts.Account
+		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(addr) {
+			orig := acc
+			origAcc = &orig
+		}
 		acc.Balance.Add(&acc.Balance, &increase.Amount)
+		if origAcc != nil {
+			newAcc := acc
+			logMdbxMigrateAccountTrace("balance_increase", txTask.TxNum, addr, origAcc, &newAcc)
+		}
+		if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
+			log.Info("mdbx-migrate escrow debug balance_increase",
+				"tx_num", txTask.TxNum,
+				"addr", addr.Hex(),
+				"is_escrow", increase.IsEscrow,
+				"empty_removal", emptyRemoval,
+				"nonce", acc.Nonce,
+				"balance", acc.Balance.String(),
+				"code_hash", fmt.Sprintf("0x%x", acc.CodeHash.Bytes()),
+				"enc0_len", len(enc0),
+				"step0", step0,
+			)
+		}
 		if !increase.IsEscrow && emptyRemoval && acc.Nonce == 0 && acc.Balance.IsZero() && acc.IsEmptyCodeHash() {
+			if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
+				log.Info("mdbx-migrate escrow debug domain_del",
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"is_escrow", increase.IsEscrow,
+					"empty_removal", emptyRemoval,
+				)
+			}
 			if err := domains.DomainDel(kv.AccountsDomain, rs.tx, addrBytes, txTask.TxNum, enc0, step0); err != nil {
 				return err
 			}
 		} else {
 			enc1 := accounts.SerialiseV3(&acc)
+			if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
+				log.Info("mdbx-migrate escrow debug domain_put",
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"is_escrow", increase.IsEscrow,
+					"empty_removal", emptyRemoval,
+					"enc1_len", len(enc1),
+				)
+			}
 			if err := domains.DomainPut(kv.AccountsDomain, rs.tx, addrBytes, enc1, txTask.TxNum, enc0, step0); err != nil {
 				return err
 			}
+		}
+	}
+	if mdbxMigrateKeyTrace && shouldMdbxMigrateStorageTrace(txTask.BlockNum, txTask.TxIndex) {
+		for _, key := range mdbxMigrateTraceKeys {
+			val, step, err := domains.GetLatest(kv.StorageDomain, rs.tx, key)
+			if err != nil {
+				log.Warn("mdbx-migrate keytrace final read failed",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"key", fmt.Sprintf("0x%x", key),
+					"err", err,
+				)
+				continue
+			}
+			log.Info("mdbx-migrate keytrace final",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"key", fmt.Sprintf("0x%x", key),
+				"val_len", len(val),
+				"val", hexPreviewBytes(val, 64),
+				"step", step,
+			)
 		}
 	}
 	return nil
@@ -372,6 +617,7 @@ func (w *StateWriterBufferedV3) PrevAndDels() (map[string][]byte, map[string]*ac
 }
 
 func (w *StateWriterBufferedV3) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
+	logMdbxMigrateAccountTrace("put", w.txNum, address, original, account)
 	if w.trace {
 		fmt.Printf("acc %x: {Balance: %d, Nonce: %d, Inc: %d, CodeHash: %x}\n", address, &account.Balance, account.Nonce, account.Incarnation, account.CodeHash)
 	}
@@ -409,6 +655,7 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
+	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)
 	if w.trace {
 		fmt.Printf("del acc: %x\n", address)
 	}
@@ -432,7 +679,23 @@ func (w *StateWriterBufferedV3) WriteAccountStorage(address common.Address, inca
 	if original == value {
 		return nil
 	}
-	compositeS := string(append(address[:], key.Bytes()...))
+	composite := append(address[:], key.Bytes()...)
+	if mdbxMigrateKeyTrace && isMdbxMigrateTraceKey(composite) {
+		v := value.Bytes()
+		op := "put"
+		if len(v) == 0 {
+			op = "del"
+		}
+		log.Info("mdbx-migrate keytrace",
+			"op", op,
+			"domain", kv.StorageDomain.String(),
+			"tx_num", w.rs.domains.TxNum(),
+			"key", fmt.Sprintf("0x%x", composite),
+			"val_len", len(v),
+			"val", hexPreviewBytes(v, 64),
+		)
+	}
+	compositeS := string(composite)
 	w.writeLists[kv.StorageDomain.String()].Push(compositeS, value.Bytes())
 	if w.trace {
 		fmt.Printf("storage: %x,%x,%x\n", address, key, value.Bytes())
@@ -466,22 +729,31 @@ type Writer struct {
 	trace       bool
 	accumulator *shards.Accumulator
 	txNum       uint64
+	writeLists  map[string]*dbstate.KvList
 }
 
 func NewWriter(tx kv.TemporalPutDel, accumulator *shards.Accumulator, txNum uint64) *Writer {
-	return &Writer{
+	writer := &Writer{
 		tx:          tx,
 		accumulator: accumulator,
 		txNum:       txNum,
 		//trace: true,
 	}
+	if mdbxMigrateDebugWriteSet {
+		writer.writeLists = newWriteList()
+	}
+	return writer
 }
 
 func (w *Writer) SetTxNum(v uint64) { w.txNum = v }
-func (w *Writer) ResetWriteSet()    {}
+func (w *Writer) ResetWriteSet() {
+	if w.writeLists != nil {
+		w.writeLists = newWriteList()
+	}
+}
 
 func (w *Writer) WriteSet() map[string]*dbstate.KvList {
-	return nil
+	return w.writeLists
 }
 
 func (w *Writer) PrevAndDels() (map[string][]byte, map[string]*accounts.Account, map[string][]byte, map[string]uint64) {
@@ -489,6 +761,7 @@ func (w *Writer) PrevAndDels() (map[string][]byte, map[string]*accounts.Account,
 }
 
 func (w *Writer) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
+	logMdbxMigrateAccountTrace("put", w.txNum, address, original, account)
 	if w.trace {
 		fmt.Printf("acc %x: {Balance: %d, Nonce: %d, Inc: %d, CodeHash: %x}\n", address, &account.Balance, account.Nonce, account.Incarnation, account.CodeHash)
 	}
@@ -497,8 +770,14 @@ func (w *Writer) UpdateAccountData(address common.Address, original, account *ac
 		if err := w.tx.DomainDel(kv.CodeDomain, address[:], w.txNum, nil, 0); err != nil {
 			return err
 		}
+		if w.writeLists != nil {
+			w.writeLists[kv.CodeDomain.String()].Push(string(address[:]), nil)
+		}
 		if err := w.tx.DomainDelPrefix(kv.StorageDomain, address[:], w.txNum); err != nil {
 			return err
+		}
+		if w.writeLists != nil {
+			w.writeLists[kv.StorageDomain.String()].Push(string(address[:]), nil)
 		}
 	}
 	value := accounts.SerialiseV3(account)
@@ -508,6 +787,9 @@ func (w *Writer) UpdateAccountData(address common.Address, original, account *ac
 
 	if err := w.tx.DomainPut(kv.AccountsDomain, address[:], value, w.txNum, nil, 0); err != nil {
 		return err
+	}
+	if w.writeLists != nil {
+		w.writeLists[kv.AccountsDomain.String()].Push(string(address[:]), value)
 	}
 	return nil
 }
@@ -519,6 +801,9 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 	if err := w.tx.DomainPut(kv.CodeDomain, address[:], code, w.txNum, nil, 0); err != nil {
 		return err
 	}
+	if w.writeLists != nil {
+		w.writeLists[kv.CodeDomain.String()].Push(string(address[:]), code)
+	}
 	if w.accumulator != nil {
 		w.accumulator.ChangeCode(address, incarnation, code)
 	}
@@ -526,6 +811,7 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
+	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)
 	if w.trace {
 		fmt.Printf("del acc: %x\n", address)
 	}
@@ -539,6 +825,9 @@ func (w *Writer) DeleteAccount(address common.Address, original *accounts.Accoun
 	if err := w.tx.DomainDel(kv.AccountsDomain, address[:], w.txNum, nil, 0); err != nil {
 		return err
 	}
+	if w.writeLists != nil {
+		w.writeLists[kv.AccountsDomain.String()].Push(string(address[:]), nil)
+	}
 	// if w.accumulator != nil { TODO: investigate later. basically this will always panic. keeping this out should be fine anyway.
 	// 	w.accumulator.DeleteAccount(address)
 	// }
@@ -551,17 +840,43 @@ func (w *Writer) WriteAccountStorage(address common.Address, incarnation uint64,
 	}
 	composite := append(address[:], key.Bytes()...)
 	v := value.Bytes()
+	if mdbxMigrateKeyTrace && isMdbxMigrateTraceKey(composite) {
+		op := "put"
+		if len(v) == 0 {
+			op = "del"
+		}
+		log.Info("mdbx-migrate keytrace",
+			"op", op,
+			"domain", kv.StorageDomain.String(),
+			"tx_num", w.txNum,
+			"key", fmt.Sprintf("0x%x", composite),
+			"val_len", len(v),
+			"val", hexPreviewBytes(v, 64),
+		)
+	}
 	if w.trace {
 		fmt.Printf("storage: %x,%x,%x\n", address, key, v)
 	}
 	if len(v) == 0 {
-		return w.tx.DomainDel(kv.StorageDomain, composite, w.txNum, nil, 0)
+		if err := w.tx.DomainDel(kv.StorageDomain, composite, w.txNum, nil, 0); err != nil {
+			return err
+		}
+		if w.writeLists != nil {
+			w.writeLists[kv.StorageDomain.String()].Push(string(composite), nil)
+		}
+		return nil
 	}
 	if w.accumulator != nil {
 		w.accumulator.ChangeStorage(address, incarnation, key, v)
 	}
 
-	return w.tx.DomainPut(kv.StorageDomain, composite, v, w.txNum, nil, 0)
+	if err := w.tx.DomainPut(kv.StorageDomain, composite, v, w.txNum, nil, 0); err != nil {
+		return err
+	}
+	if w.writeLists != nil {
+		w.writeLists[kv.StorageDomain.String()].Push(string(composite), v)
+	}
+	return nil
 }
 
 var fastCreate = dbg.EnvBool("FAST_CREATE", false)
@@ -575,6 +890,9 @@ func (w *Writer) CreateContract(address common.Address) error {
 	}
 	if err := w.tx.DomainDelPrefix(kv.StorageDomain, address[:], w.txNum); err != nil {
 		return err
+	}
+	if w.writeLists != nil {
+		w.writeLists[kv.StorageDomain.String()].Push(string(address[:]), nil)
 	}
 	return nil
 }

@@ -71,6 +71,8 @@ type IntraBlockStateArbitrum interface {
 	AddStylusPagesEver(new uint16)
 
 	HasSelfDestructed(addr common.Address) bool
+	WasDeleted(addr common.Address) bool
+	CreateZombieAccount(addr common.Address) error
 
 	StartRecording()
 	RecordProgram(targets []wasmdb.WasmTarget, moduleHash common.Hash)
@@ -338,6 +340,18 @@ func (s *IntraBlockState) HasSelfDestructed(addr common.Address) bool {
 		return stateObject.selfdestructed
 	}
 	return false
+}
+
+func (s *IntraBlockState) WasDeleted(addr common.Address) bool {
+	stateObject, err := s.getStateObject(addr)
+	if err != nil {
+		panic(err)
+	}
+	if stateObject != nil {
+		return stateObject.deleted
+	}
+	_, ok := s.deletedAccounts[addr]
+	return ok
 }
 
 func (s *IntraBlockState) IntermediateRoot(deleteEmptyObjects bool) common.Hash {

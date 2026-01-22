@@ -29,9 +29,12 @@ type serialExecutor struct {
 }
 
 var (
-	mdbxMigrateDebug                                = os.Getenv("MDBX_MIGRATE_DEBUG") != ""
-	mdbxMigrateDebugBlock, mdbxMigrateDebugBlockSet = parseEnvUint("MDBX_MIGRATE_DEBUG_BLOCK")
-	mdbxMigrateDebugTxIndex, mdbxMigrateDebugTxSet  = parseEnvInt("MDBX_MIGRATE_DEBUG_TX_INDEX")
+	mdbxMigrateDebug                                            = envBoolPrefer("ERIGON_MDBX_MIGRATE_DEBUG", "MDBX_MIGRATE_DEBUG")
+	mdbxMigrateDebugBlock, mdbxMigrateDebugBlockSet             = parseEnvUintPrefer("ERIGON_MDBX_MIGRATE_DEBUG_BLOCK", "MDBX_MIGRATE_DEBUG_BLOCK")
+	mdbxMigrateDebugTxIndex, mdbxMigrateDebugTxSet              = parseEnvIntPrefer("ERIGON_MDBX_MIGRATE_DEBUG_TX_INDEX", "MDBX_MIGRATE_DEBUG_TX_INDEX")
+	mdbxMigrateDebugTxData                                      = envBoolPrefer("ERIGON_MDBX_MIGRATE_DEBUG_TX_DATA", "MDBX_MIGRATE_DEBUG_TX_DATA")
+	mdbxMigrateDebugWriteSet                                    = envBoolPrefer("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET", "MDBX_MIGRATE_DEBUG_WRITESET")
+	mdbxMigrateDebugWriteSetMax, mdbxMigrateDebugWriteSetMaxSet = parseEnvIntPrefer("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET_MAX", "MDBX_MIGRATE_DEBUG_WRITESET_MAX")
 )
 
 func parseEnvUint(name string) (uint64, bool) {
@@ -42,6 +45,19 @@ func parseEnvUint(name string) (uint64, bool) {
 	parsed, err := strconv.ParseUint(value, 10, 64)
 	if err != nil {
 		log.Warn("mdbx-migrate debug: invalid uint env", "name", name, "value", value, "err", err)
+		return 0, false
+	}
+	return parsed, true
+}
+
+func parseEnvUintPrefer(primary, fallback string) (uint64, bool) {
+	value := os.Getenv(primary)
+	if value == "" {
+		return parseEnvUint(fallback)
+	}
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		log.Warn("mdbx-migrate debug: invalid uint env", "name", primary, "value", value, "err", err)
 		return 0, false
 	}
 	return parsed, true
@@ -60,6 +76,26 @@ func parseEnvInt(name string) (int, bool) {
 	return parsed, true
 }
 
+func parseEnvIntPrefer(primary, fallback string) (int, bool) {
+	value := os.Getenv(primary)
+	if value == "" {
+		return parseEnvInt(fallback)
+	}
+	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		log.Warn("mdbx-migrate debug: invalid int env", "name", primary, "value", value, "err", err)
+		return 0, false
+	}
+	return parsed, true
+}
+
+func envBoolPrefer(primary, fallback string) bool {
+	if os.Getenv(primary) != "" {
+		return true
+	}
+	return os.Getenv(fallback) != ""
+}
+
 func mdbxMigrateShouldLog(blockNum uint64, txIndex int) bool {
 	if !mdbxMigrateDebug {
 		return false
@@ -71,6 +107,108 @@ func mdbxMigrateShouldLog(blockNum uint64, txIndex int) bool {
 		return false
 	}
 	return true
+}
+
+func hexPreview(raw []byte, max int) string {
+	if len(raw) == 0 || max <= 0 {
+		return ""
+	}
+	if len(raw) <= max {
+		return fmt.Sprintf("%x", raw)
+	}
+	return fmt.Sprintf("%x...len=%d", raw[:max], len(raw))
+}
+
+func logMdbxMigrateWriteSet(txTask *state.TxTask, maxEntries int, maxEntriesSet bool) {
+	if txTask == nil {
+		return
+	}
+	if txTask.WriteLists == nil && len(txTask.BalanceIncreaseSet) == 0 {
+		return
+	}
+
+	limit := 50
+	if maxEntriesSet && maxEntries > 0 {
+		limit = maxEntries
+	}
+
+	log.Info("mdbx-migrate writeset",
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"tx_num", txTask.TxNum,
+		"limit", limit,
+	)
+
+	for _, domain := range []kv.Domain{kv.AccountsDomain, kv.CodeDomain, kv.StorageDomain} {
+		list, ok := txTask.WriteLists[domain.String()]
+		if !ok || list == nil || list.Len() == 0 {
+			continue
+		}
+		log.Info("mdbx-migrate writeset domain",
+			"block", txTask.BlockNum,
+			"tx_index", txTask.TxIndex,
+			"domain", domain.String(),
+			"entries", list.Len(),
+		)
+		entries := list.Len()
+		if entries > limit {
+			entries = limit
+		}
+		for i := 0; i < entries; i++ {
+			key := []byte(list.Keys[i])
+			val := list.Vals[i]
+			log.Info("mdbx-migrate writeset entry",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"domain", domain.String(),
+				"idx", i,
+				"key_len", len(key),
+				"key", hexPreview(key, 64),
+				"val_len", len(val),
+				"val", hexPreview(val, 64),
+				"delete", val == nil,
+			)
+		}
+		if list.Len() > entries {
+			log.Info("mdbx-migrate writeset truncated",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"domain", domain.String(),
+				"entries", list.Len(),
+				"logged", entries,
+			)
+		}
+	}
+
+	if len(txTask.BalanceIncreaseSet) > 0 {
+		log.Info("mdbx-migrate balance increases",
+			"block", txTask.BlockNum,
+			"tx_index", txTask.TxIndex,
+			"entries", len(txTask.BalanceIncreaseSet),
+		)
+		count := 0
+		for addr, entry := range txTask.BalanceIncreaseSet {
+			log.Info("mdbx-migrate balance increase",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"address", addr,
+				"amount", entry.Amount.ToBig().String(),
+				"escrow", entry.IsEscrow,
+			)
+			count++
+			if count >= limit {
+				if len(txTask.BalanceIncreaseSet) > count {
+					log.Info("mdbx-migrate balance increase truncated",
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"entries", len(txTask.BalanceIncreaseSet),
+						"logged", count,
+					)
+				}
+				break
+			}
+		}
+	}
 }
 
 func kvListCounts(lists map[string]*dbstate.KvList) (domains int, entries int) {
@@ -123,47 +261,59 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 					"tx_nil", true,
 				)
 			} else {
-			from := "<unknown>"
-			if sender := txTask.Sender(); sender != nil {
-				from = sender.Hex()
+				from := "<unknown>"
+				if sender := txTask.Sender(); sender != nil {
+					from = sender.Hex()
+				}
+				to := "<nil>"
+				if toAddr := txTask.Tx.GetTo(); toAddr != nil {
+					to = toAddr.Hex()
+				}
+				value := "<nil>"
+				if txValue := txTask.Tx.GetValue(); txValue != nil {
+					value = txValue.ToBig().String()
+				}
+				data := txTask.Tx.GetData()
+				dataSig := ""
+				if len(data) >= 4 {
+					dataSig = fmt.Sprintf("0x%x", data[:4])
+				} else if len(data) > 0 {
+					dataSig = fmt.Sprintf("0x%x", data)
+				}
+				writeDomains, writeEntries := kvListCounts(txTask.WriteLists)
+				readDomains, readEntries := kvListCounts(txTask.ReadLists)
+				log.Info("mdbx-migrate tx",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"hash", txTask.Tx.Hash(),
+					"type", txTask.Tx.Type(),
+					"from", from,
+					"to", to,
+					"nonce", txTask.Tx.GetNonce(),
+					"gas_limit", txTask.Tx.GetGasLimit(),
+					"gas_used", txTask.GasUsed,
+					"failed", txTask.Failed,
+					"value", value,
+					"data_len", len(data),
+					"data_sig", dataSig,
+					"write_domains", writeDomains,
+					"write_entries", writeEntries,
+					"read_domains", readDomains,
+					"read_entries", readEntries,
+				)
+				if mdbxMigrateDebugTxData {
+					log.Info("mdbx-migrate tx data",
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"tx_num", txTask.TxNum,
+						"data_len", len(data),
+						"data", fmt.Sprintf("0x%x", data),
+					)
+				}
 			}
-			to := "<nil>"
-			if toAddr := txTask.Tx.GetTo(); toAddr != nil {
-				to = toAddr.Hex()
-			}
-			value := "<nil>"
-			if txValue := txTask.Tx.GetValue(); txValue != nil {
-				value = txValue.ToBig().String()
-			}
-			data := txTask.Tx.GetData()
-			dataSig := ""
-			if len(data) >= 4 {
-				dataSig = fmt.Sprintf("0x%x", data[:4])
-			} else if len(data) > 0 {
-				dataSig = fmt.Sprintf("0x%x", data)
-			}
-			writeDomains, writeEntries := kvListCounts(txTask.WriteLists)
-			readDomains, readEntries := kvListCounts(txTask.ReadLists)
-			log.Info("mdbx-migrate tx",
-				"block", txTask.BlockNum,
-				"tx_index", txTask.TxIndex,
-				"tx_num", txTask.TxNum,
-				"hash", txTask.Tx.Hash(),
-				"type", txTask.Tx.Type(),
-				"from", from,
-				"to", to,
-				"nonce", txTask.Tx.GetNonce(),
-				"gas_limit", txTask.Tx.GetGasLimit(),
-				"gas_used", txTask.GasUsed,
-				"failed", txTask.Failed,
-				"value", value,
-				"data_len", len(data),
-				"data_sig", dataSig,
-				"write_domains", writeDomains,
-				"write_entries", writeEntries,
-				"read_domains", readDomains,
-				"read_entries", readEntries,
-			)
+			if mdbxMigrateDebugWriteSet {
+				logMdbxMigrateWriteSet(txTask, mdbxMigrateDebugWriteSetMax, mdbxMigrateDebugWriteSetMaxSet)
 			}
 			if txTask.Error == nil && se.doms != nil {
 				if sdc := se.doms.GetCommitmentContext(); sdc != nil {
@@ -204,15 +354,15 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 				se.blobGasUsed += txTask.Tx.GetBlobGas()
 			}
 
-				if txTask.Final {
-					if !se.isMining && !se.skipPostEvaluation && !se.execStage.CurrentSyncCycle.IsInitialCycle {
-						// note this assumes the bloach reciepts is a fixed array shared by
-						// all tasks - if that changes this will need to change - robably need to
-						// add this to the executor
-						if se.cfg.notifications != nil && se.cfg.notifications.RecentLogs != nil {
-							se.cfg.notifications.RecentLogs.Add(txTask.BlockReceipts)
-						}
+			if txTask.Final {
+				if !se.isMining && !se.skipPostEvaluation && !se.execStage.CurrentSyncCycle.IsInitialCycle {
+					// note this assumes the bloach reciepts is a fixed array shared by
+					// all tasks - if that changes this will need to change - robably need to
+					// add this to the executor
+					if se.cfg.notifications != nil && se.cfg.notifications.RecentLogs != nil {
+						se.cfg.notifications.RecentLogs.Add(txTask.BlockReceipts)
 					}
+				}
 				// TODO arbitrum enable receipt checking
 				checkReceipts := false //!se.cfg.vmConfig.StatelessExec && se.cfg.chainConfig.IsByzantium(txTask.BlockNum) && !se.cfg.vmConfig.NoReceipts && !se.isMining
 

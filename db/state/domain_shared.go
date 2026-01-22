@@ -82,6 +82,10 @@ func NewSharedDomains(tx kv.TemporalTx, logger log.Logger) (*SharedDomains, erro
 		//trace:   true,
 		mem: newTemporalMemBatch(tx),
 	}
+	log.Info("escrow trace sd_new",
+		"sd", fmt.Sprintf("%p", sd),
+		"mem", fmt.Sprintf("%p", sd.mem),
+	)
 	sd.stepSize = tx.Debug().StepSize()
 
 	tv := commitment.VariantHexPatriciaTrie
@@ -164,6 +168,8 @@ func (sd *SharedDomains) SizeEstimate() uint64 {
 
 const CodeSizeTableFake = "CodeSize"
 
+var escrowTraceAddrBytes = common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93").Bytes()
+
 func (sd *SharedDomains) IndexAdd(table kv.InvertedIdx, key []byte, txNum uint64) (err error) {
 	return sd.mem.IndexAdd(table, key, txNum)
 }
@@ -209,6 +215,10 @@ func (sd *SharedDomains) Close() {
 	if sd.sdCtx == nil { //idempotency
 		return
 	}
+	log.Info("escrow trace sd_close",
+		"sd", fmt.Sprintf("%p", sd),
+		"mem", fmt.Sprintf("%p", sd.mem),
+	)
 
 	sd.SetBlockNum(0)
 	sd.SetTxNum(0)
@@ -224,6 +234,12 @@ func (sd *SharedDomains) Close() {
 
 func (sd *SharedDomains) Flush(ctx context.Context, tx kv.RwTx) error {
 	defer mxFlushTook.ObserveDuration(time.Now())
+	log.Info("escrow trace sd_flush",
+		"sd", fmt.Sprintf("%p", sd),
+		"mem", fmt.Sprintf("%p", sd.mem),
+		"tx_num", sd.txNum,
+		"block_num", sd.blockNum.Load(),
+	)
 	return sd.mem.Flush(ctx, tx)
 }
 
@@ -260,6 +276,18 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 		if err != nil {
 			return err
 		}
+	}
+	if domain == kv.AccountsDomain && bytes.Equal(k, escrowTraceAddrBytes) {
+		log.Info("escrow trace shared_domain_put",
+			"sd", fmt.Sprintf("%p", sd),
+			"mem", fmt.Sprintf("%p", sd.mem),
+			"tx_num", txNum,
+			"key", fmt.Sprintf("0x%x", k),
+			"val_len", len(v),
+			"prev_len", len(prevVal),
+			"prev_equal", bytes.Equal(prevVal, v),
+			"prev_step", prevStep,
+		)
 	}
 	switch domain {
 	case kv.CodeDomain:

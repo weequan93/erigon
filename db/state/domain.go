@@ -361,6 +361,20 @@ func (w *DomainBufferedWriter) PutWithPrev(k, v []byte, txNum uint64, preval []b
 	if tracePutWithPrev != "" && tracePutWithPrev == w.h.ii.filenameBase {
 		fmt.Printf("PutWithPrev(%s, txn %d, key[%x] value[%x] preval[%x])\n", w.h.ii.filenameBase, step, k, v, preval)
 	}
+	if bytes.Equal(k, escrowTraceAddrBytes) {
+		log.Info("escrow trace put_with_prev",
+			"domain", w.h.ii.filenameBase,
+			"writer", fmt.Sprintf("%p", w),
+			"values", fmt.Sprintf("%p", w.values),
+			"discard", w.discard,
+			"large_vals", w.largeVals,
+			"tx_num", txNum,
+			"step", step,
+			"key", fmt.Sprintf("0x%x", k),
+			"val_len", len(v),
+			"prev_len", len(preval),
+		)
+	}
 	if err := w.h.AddPrevValue(k, txNum, preval); err != nil {
 		return err
 	}
@@ -376,6 +390,15 @@ func (w *DomainBufferedWriter) DeleteWithPrev(k []byte, txNum uint64, prev []byt
 	// This call to update needs to happen before d.tx.Delete() later, because otherwise the content of `original`` slice is invalidated
 	if tracePutWithPrev != "" && tracePutWithPrev == w.h.ii.filenameBase {
 		fmt.Printf("DeleteWithPrev(%s, txn %d, key[%x] preval[%x])\n", w.h.ii.filenameBase, txNum, k, prev)
+	}
+	if bytes.Equal(k, escrowTraceAddrBytes) {
+		log.Info("escrow trace delete_with_prev",
+			"domain", w.h.ii.filenameBase,
+			"tx_num", txNum,
+			"step", step,
+			"key", fmt.Sprintf("0x%x", k),
+			"prev_len", len(prev),
+		)
 	}
 	if err := w.h.AddPrevValue(k, txNum, prev); err != nil {
 		return err
@@ -453,6 +476,16 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	if w.discard {
 		return nil
 	}
+	if w.h.ii.filenameBase == kv.AccountsDomain.String() {
+		log.Info("escrow trace flush_start",
+			"domain", w.h.ii.filenameBase,
+			"writer", fmt.Sprintf("%p", w),
+			"values", fmt.Sprintf("%p", w.values),
+			"discard", w.discard,
+			"large_vals", w.largeVals,
+			"vals_table", w.valsTable,
+		)
+	}
 	if err := w.h.Flush(ctx, tx); err != nil {
 		return err
 	}
@@ -471,6 +504,18 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	}
 	defer valuesCursor.Close()
 	if err := w.values.Load(tx, w.valsTable, func(k, v []byte, table etl.CurrentTableReader, next etl.LoadNextFunc) error {
+		if bytes.Equal(k, escrowTraceAddrBytes) && len(v) >= 8 {
+			invStep := binary.BigEndian.Uint64(v[:8])
+			log.Info("escrow trace flush_load",
+				"domain", w.h.ii.filenameBase,
+				"writer", fmt.Sprintf("%p", w),
+				"values", fmt.Sprintf("%p", w.values),
+				"key", fmt.Sprintf("0x%x", k),
+				"inv_step", fmt.Sprintf("0x%x", v[:8]),
+				"step", ^invStep,
+				"val_len", len(v)-8,
+			)
+		}
 		foundVal, err := valuesCursor.SeekBothRange(k, v[:8])
 		if err != nil {
 			return err
@@ -490,6 +535,30 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 		return nil
 	}, etl.TransformArgs{Quit: ctx.Done(), EmptyVals: true}); err != nil {
 		return err
+	}
+	if w.h.ii.filenameBase == kv.AccountsDomain.String() && len(escrowTraceAddrBytes) == 20 {
+		_, stepWithVal, err := valuesCursor.SeekExact(escrowTraceAddrBytes)
+		if err != nil {
+			return err
+		}
+		found := len(stepWithVal) > 0
+		valLen := 0
+		invStep := uint64(0)
+		invStepHex := ""
+		if found && len(stepWithVal) >= 8 {
+			invStep = binary.BigEndian.Uint64(stepWithVal[:8])
+			invStepHex = fmt.Sprintf("0x%x", stepWithVal[:8])
+			valLen = len(stepWithVal) - 8
+		}
+		log.Info("escrow trace flush_seek",
+			"domain", w.h.ii.filenameBase,
+			"writer", fmt.Sprintf("%p", w),
+			"values", fmt.Sprintf("%p", w.values),
+			"found", found,
+			"inv_step", invStepHex,
+			"step", ^invStep,
+			"val_len", valLen,
+		)
 	}
 	w.Close()
 

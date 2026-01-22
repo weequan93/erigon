@@ -46,6 +46,11 @@ import (
 	witnesstypes "github.com/erigontech/erigon/execution/types/witness"
 )
 
+var (
+	erigonCommitmentTraceKeys    = dbg.EnvBool("ERIGON_COMMITMENT_TRACE_KEYS", false)
+	erigonCommitmentTraceKeysMax = dbg.EnvInt("ERIGON_COMMITMENT_TRACE_KEYS_MAX", 200)
+)
+
 // keccakState wraps sha3.state. In addition to the usual hash methods, it also supports
 // Read to get a variable amount of data from the hash state. Read is faster than Sum
 // because it doesn't copy the internal state, but also modifies the internal state.
@@ -2192,6 +2197,7 @@ func (hph *HexPatriciaHashed) Process(ctx context.Context, updates *Updates, log
 		updatesCount = updates.Size()
 		start        = time.Now()
 		logEvery     = time.NewTicker(20 * time.Second)
+		traceLimit   = uint64(0)
 	)
 
 	if collectCommitmentMetrics {
@@ -2205,6 +2211,14 @@ func (hph *HexPatriciaHashed) Process(ctx context.Context, updates *Updates, log
 
 	defer func() { logEvery.Stop() }()
 
+	if erigonCommitmentTraceKeys {
+		traceLimit = uint64(erigonCommitmentTraceKeysMax)
+		if traceLimit == 0 {
+			traceLimit = 200
+		}
+		log.Warn("Commitment trace keys enabled", "prefix", logPrefix, "updates", updatesCount, "max", traceLimit)
+	}
+
 	err = updates.HashSort(ctx, func(hashedKey, plainKey []byte, stateUpdate *Update) error {
 		select {
 		case <-logEvery.C:
@@ -2214,6 +2228,30 @@ func (hph *HexPatriciaHashed) Process(ctx context.Context, updates *Updates, log
 				"alloc", common.ByteCount(m.Alloc), "sys", common.ByteCount(m.Sys))
 
 		default:
+		}
+		if traceLimit > 0 && ki < traceLimit {
+			addr := "<short>"
+			if len(plainKey) >= 20 {
+				addr = fmt.Sprintf("0x%x", plainKey[:20])
+			}
+			slot := ""
+			if len(plainKey) >= 52 {
+				slot = fmt.Sprintf("0x%x", plainKey[20:])
+			}
+			flags := "<nil>"
+			if stateUpdate != nil {
+				flags = stateUpdate.Flags.String()
+			}
+			log.Warn("Commitment touched key",
+				"prefix", logPrefix,
+				"idx", ki,
+				"plain_len", len(plainKey),
+				"addr", addr,
+				"slot", slot,
+				"plain", fmt.Sprintf("0x%x", plainKey),
+				"hashed", fmt.Sprintf("0x%x", hashedKey),
+				"flags", flags,
+			)
 		}
 		if hph.trace {
 			fmt.Printf("\n%d/%d) plainKey [%x] hashedKey [%x] currentKey [%x]\n", ki+1, updatesCount, plainKey, hashedKey, hph.currentKey[:hph.currentKeyLen])

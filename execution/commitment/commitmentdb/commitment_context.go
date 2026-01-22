@@ -13,6 +13,7 @@ import (
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/assert"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/crypto"
 	"github.com/erigontech/erigon-lib/log/v3"
@@ -48,7 +49,11 @@ type SharedDomainsCommitmentContext struct {
 	justRestored atomic.Bool // set to true when commitment trie was just restored from snapshot
 
 	trace bool
+
+	debugLastPlainKeys atomic.Value // [][]byte
 }
+
+var debugDumpTouchedAccounts = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
 
 func (sdc *SharedDomainsCommitmentContext) SetTrace(enable bool) {
 	sdc.trace = enable
@@ -146,6 +151,9 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 			log.Trace("ComputeCommitment", "block", blockNum, "keys", common.PrettyCounter(updateCount), "mode", sdc.updates.Mode(), "spent", time.Since(start))
 		}()
 	}
+	if debugDumpTouchedAccounts && updateCount > 0 {
+		sdc.debugLastPlainKeys.Store(sdc.updates.DebugPlainKeys())
+	}
 	if updateCount == 0 {
 		rootHash, err = sdc.patriciaTrie.RootHash()
 		return rootHash, err
@@ -226,6 +234,30 @@ func (sdc *SharedDomainsCommitmentContext) DebugRootHash(ctx context.Context, lo
 	}
 
 	return rootHash, err
+}
+
+// DebugPlainKeys returns a snapshot of current plain keys tracked by updates.
+func (sdc *SharedDomainsCommitmentContext) DebugPlainKeys() [][]byte {
+	if sdc == nil || sdc.updates == nil {
+		return nil
+	}
+	snapshot := sdc.updates.DebugSnapshot()
+	if snapshot == nil {
+		return nil
+	}
+	defer snapshot.Close()
+	return snapshot.DebugPlainKeys()
+}
+
+// DebugLastPlainKeys returns the most recent plain keys snapshot captured during ComputeCommitment.
+func (sdc *SharedDomainsCommitmentContext) DebugLastPlainKeys() [][]byte {
+	if sdc == nil {
+		return nil
+	}
+	if v := sdc.debugLastPlainKeys.Load(); v != nil {
+		return v.([][]byte)
+	}
+	return nil
 }
 
 // by that key stored latest root hash and tree state

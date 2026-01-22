@@ -31,6 +31,7 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/empty"
 	"github.com/erigontech/erigon-lib/common/u256"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/core/tracing"
 	"github.com/erigontech/erigon/execution/rlp"
 	"github.com/erigontech/erigon/execution/types/accounts"
@@ -87,6 +88,7 @@ type stateObject struct {
 	deleted         bool // true if account was deleted during the lifetime of this object
 	newlyCreated    bool // true if this object was created in the current transaction
 	createdContract bool // true if this object represents a newly created contract
+	escrowTouched   bool // Arbitrum: preserve escrow accounts across empty removal passes
 }
 
 // empty returns whether the account is considered empty.
@@ -107,6 +109,7 @@ func (s *stateObject) deepCopy(db *IntraBlockState) *stateObject {
 	stateObject.deleted = s.deleted
 	stateObject.newlyCreated = s.newlyCreated
 	stateObject.createdContract = s.createdContract
+	stateObject.escrowTouched = s.escrowTouched
 	return stateObject
 }
 
@@ -144,13 +147,30 @@ func (so *stateObject) markSelfdestructed() {
 }
 
 func (so *stateObject) touch() {
+	dirtyBefore := so.db.journal.dirties[so.address]
 	so.db.journal.append(touchChange{
 		account: so.address,
 	})
+	if so.escrowTouched {
+		// Ensure escrow-touched accounts are kept in the write set.
+		so.db.stateObjectsDirty[so.address] = struct{}{}
+	}
+	dirtyAfter := so.db.journal.dirties[so.address]
 	if so.address == ripemd {
 		// Explicitly put it in the dirty-cache, which is otherwise generated from
 		// flattened journals.
 		so.db.journal.dirty(so.address)
+	}
+	if so.address == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
+		_, stateDirty := so.db.stateObjectsDirty[so.address]
+		log.Info("mdbx-migrate escrow debug touch",
+			"addr", so.address.Hex(),
+			"tx_index", so.db.txIndex,
+			"escrow_touched", so.escrowTouched,
+			"journal_dirty_before", dirtyBefore,
+			"journal_dirty_after", dirtyAfter,
+			"state_dirty", stateDirty,
+		)
 	}
 }
 

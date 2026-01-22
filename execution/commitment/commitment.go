@@ -1186,6 +1186,28 @@ func (t *Updates) DebugSnapshot() *Updates {
 	}
 }
 
+// DebugPlainKeys returns a copy of the current plain keys for debug usage.
+func (t *Updates) DebugPlainKeys() [][]byte {
+	if t == nil {
+		return nil
+	}
+	out := make([][]byte, 0, t.Size())
+	switch t.mode {
+	case ModeDirect:
+		for key := range t.keys {
+			out = append(out, []byte(key))
+		}
+	case ModeUpdate:
+		t.tree.Ascend(func(item *KeyUpdate) bool {
+			out = append(out, []byte(item.plainKey))
+			return true
+		})
+	default:
+		return nil
+	}
+	return out
+}
+
 // Reset clears all updates
 func (t *Updates) Reset() {
 	switch t.mode {
