@@ -78,9 +78,32 @@ func (hr *HistoryReaderV3) ReadAccountData(address common.Address) (*accounts.Ac
 		}
 		return nil, err
 	}
-	var a accounts.Account
-	if err := accounts.DeserialiseV3(&a, enc); err != nil {
-		return nil, fmt.Errorf("ReadAccountData(%x): %w", address, err)
+
+	// Some values may carry an 8-byte prefix (txnum marker) in plain tables; values
+	// returned from GetAsOf are usually already prefix-stripped. Heuristically drop
+	// the prefix only when it looks like a marker (0xff...) to avoid over-stripping.
+	accountEnc := enc
+	if len(enc) >= 9 && enc[0] == 0xff && enc[1] == 0xff {
+		accountEnc = enc[8:]
+	}
+	if len(accountEnc) < 5 { // nonceLen + balanceLen + codeHashLen
+		return nil, nil
+	}
+	var (
+		a        accounts.Account
+		decodeOk = true
+	)
+	defer func() {
+		if r := recover(); r != nil {
+			decodeOk = false
+		}
+	}()
+	if err := accounts.DeserialiseV3(&a, accountEnc); err != nil || !decodeOk {
+		if hr.trace {
+			fmt.Printf("ReadAccountData [%x] => [decode error: %v]\n", address, err)
+		}
+		// Treat undecodable values as non-existent to mirror Nitro's state.
+		return nil, nil
 	}
 	if hr.trace {
 		fmt.Printf("ReadAccountData [%x] => [nonce: %d, balance: %d, codeHash: %x]\n", address, a.Nonce, &a.Balance, a.CodeHash)

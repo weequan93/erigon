@@ -718,7 +718,7 @@ func (sdb *IntraBlockState) AddBalance(addr common.Address, amount uint256.Int, 
 			if bal.Cmp(expected) != 0 {
 				panic(fmt.Sprintf("add failed: expected: %d got: %d", expected, &bal))
 			}
-			fmt.Printf("%d (%d.%d) AddBalance %x, %d+%d=%d\n", sdb.blockNum, sdb.txIndex, sdb.version, addr, &prev0, &amount, &bal)
+			fmt.Printf("%d (%d.%d) AddBalance %x, %d+%d=%d reason=%s\n", sdb.blockNum, sdb.txIndex, sdb.version, addr, &prev0, &amount, &bal, reason.String())
 		}()
 	}
 
@@ -824,7 +824,7 @@ func (sdb *IntraBlockState) SubBalance(addr common.Address, amount uint256.Int, 
 		prev, _ := sdb.GetBalance(addr)
 		defer func() {
 			bal, _ := sdb.GetBalance(addr)
-			fmt.Printf("%d (%d.%d) SubBalance %x, %d-%d=%d\n", sdb.blockNum, sdb.txIndex, sdb.version, addr, &prev, &amount, &bal)
+			fmt.Printf("%d (%d.%d) SubBalance %x, %d-%d=%d reason=%s\n", sdb.blockNum, sdb.txIndex, sdb.version, addr, &prev, &amount, &bal, reason.String())
 		}()
 	}
 
@@ -1466,25 +1466,58 @@ func (sdb *IntraBlockState) GetRefund() uint64 {
 }
 
 func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, addr common.Address, stateObject *stateObject, isDirty bool, isZombie bool, trace bool, tracingHooks *tracing.Hooks) error {
-	emptyRemoval := EIP161Enabled && stateObject.empty() && (!isAura || addr != SystemAddress)
-	if isZombie {
-		emptyRemoval = false
-	}
 	isEscrow := false
 	if stateObject.escrowTouched {
 		isEscrow = true
 	}
 	if stateObject.db != nil {
-		// Arbitrum escrow accounts should not be removed just because they are empty.
 		if _, ok := stateObject.db.escrowTouched[addr]; ok {
 			isEscrow = true
 		}
 		if bi, ok := stateObject.db.balanceInc[addr]; ok && bi.isEscrow {
 			isEscrow = true
 		}
-		if isEscrow {
-			emptyRemoval = false
+	}
+	emptyRemoval := EIP161Enabled && stateObject.empty() && (!isAura || addr != SystemAddress)
+	if isZombie {
+		emptyRemoval = false
+	}
+	// Arbitrum: preserve escrow-touched empties (Nitro leaves these accounts in state),
+	// but transient escrow accounts created in a block and left empty must be removed
+	// to match geth. Any escrow account that ends empty in this block is eligible for removal.
+	if isEscrow && stateObject.empty() {
+		emptyRemoval = true
+	}
+	// If this account originated from a missing read (nilAccount) and is still empty, allow removal.
+	if stateObject.db != nil && stateObject.empty() {
+		if _, fromNil := stateObject.db.nilAccounts[addr]; fromNil {
+			emptyRemoval = true
 		}
+	}
+	if traceAccount(addr) {
+		blockNum := uint64(0)
+		txIndex := 0
+		version := 0
+		if stateObject.db != nil {
+			blockNum = stateObject.db.blockNum
+			txIndex = stateObject.db.txIndex
+			version = stateObject.db.version
+		}
+		fmt.Printf("%d (%d.%d) trace updateAccount %x emptyRemoval=%v dirty=%v zombie=%v selfdestructed=%v created=%v escrow=%v nonce=%d balance=%s codehash=%x\n",
+			blockNum,
+			txIndex,
+			version,
+			addr,
+			emptyRemoval,
+			isDirty,
+			isZombie,
+			stateObject.selfdestructed,
+			stateObject.createdContract,
+			isEscrow,
+			stateObject.data.Nonce,
+			stateObject.data.Balance.String(),
+			stateObject.data.CodeHash,
+		)
 	}
 	if dbg.TraceTransactionIO && addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
 		blockNum := uint64(0)
@@ -1777,6 +1810,10 @@ func (sdb *IntraBlockState) MakeWriteSet(chainRules *chain.Rules, stateWriter St
 		}
 		if dbg.TraceTransactionIO && (sdb.trace || traceAccount(addr)) {
 			fmt.Printf("%d (%d.%d) Update Account %x\n", sdb.blockNum, sdb.txIndex, sdb.version, addr)
+		}
+		// Ensure newly-created accounts that end up empty are treated as dirty so they can be removed.
+		if stateObject.newlyCreated && stateObject.empty() {
+			isDirty = true
 		}
 		dirtyCount, hasDirty := sdb.journal.dirties[addr]
 		zombieCount := sdb.journal.zombieEntries[addr]

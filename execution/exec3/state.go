@@ -26,8 +26,8 @@ import (
 
 	"github.com/offchainlabs/nitro/arbos"
 	"github.com/offchainlabs/nitro/arbos/arbosState"
-	"github.com/offchainlabs/nitro/gethhook"
 	offchainArbosState "github.com/offchainlabs/nitro/arbos/arbosState"
+	"github.com/offchainlabs/nitro/gethhook"
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/dbg"
@@ -346,6 +346,16 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			}
 		}
 	default:
+		if badRootDebug {
+			log.Warn("exec3 tx start",
+				"block_number", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_hash", txTask.Tx.Hash(),
+				"tx_type", txTask.Tx.Type(),
+				"header_root", txTask.Header.Root,
+				"parent_hash", txTask.Header.ParentHash,
+			)
+		}
 		rw.taskGasPool.Reset(txTask.Tx.GetGasLimit(), rw.chainConfig.GetMaxBlobGasPerBlock(header.Time, rules.ArbOSVersion)) // ARBITRUM only
 
 		rw.callTracer.Reset()
@@ -414,11 +424,27 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			if hooks != nil && hooks.OnTxEnd != nil {
 				hooks.OnTxEnd(nil, err)
 			}
+			if badRootDebug {
+				log.Warn("exec3 applymessage error",
+					"block_number", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_hash", txTask.Tx.Hash(),
+					"err", err,
+				)
+			}
 		} else {
 			txTask.Failed = applyRes.Failed()
 			txTask.GasUsed = applyRes.GasUsed
 			// Update the state with pending changes
 			ibs.SoftFinalise()
+			if badRootDebug {
+				root := ibs.IntermediateRoot(true)
+				log.Warn("exec3 intermediate root",
+					"block_number", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"root", root,
+				)
+			}
 			//txTask.Error = ibs.FinalizeTx(rules, noop)
 			txTask.Logs = ibs.GetRawLogs(txTask.TxIndex)
 			txTask.TraceFroms = rw.callTracer.Froms()
@@ -427,6 +453,17 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			txTask.CreateReceipt(rw.Tx())
 			if hooks != nil && hooks.OnTxEnd != nil {
 				hooks.OnTxEnd(txTask.BlockReceipts[txTask.TxIndex], nil)
+			}
+			if badRootDebug {
+				log.Warn("exec3 tx after apply",
+					"block_number", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_hash", txTask.Tx.Hash(),
+					"gas_used", txTask.GasUsed,
+					"failed", txTask.Failed,
+					"logs_len", len(txTask.Logs),
+					"receipts_len", len(txTask.BlockReceipts),
+				)
 			}
 		}
 	}
