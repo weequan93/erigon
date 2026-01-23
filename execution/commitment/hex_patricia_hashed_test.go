@@ -841,7 +841,7 @@ func Test_Cell_EncodeDecode(t *testing.T) {
 	first := &cell{
 		hashLen:         length.Hash,
 		accountAddrLen:  length.Addr,
-		storageAddrLen:  length.Addr + length.Hash,
+		storageAddrLen:  length.Addr + length.Incarnation + length.Hash,
 		hashedExtLen:    rnd.Intn(129),
 		extLen:          rnd.Intn(65),
 		hashedExtension: [128]byte{},

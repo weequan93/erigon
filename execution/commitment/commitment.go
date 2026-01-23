@@ -83,6 +83,8 @@ var (
 	}
 )
 
+const storagePlainKeyLen = length.Addr + length.Incarnation + length.Hash
+
 // Trie represents commitment variant.
 type Trie interface {
 	// RootHash produces root hash of the trie
@@ -471,11 +473,11 @@ func (branchData BranchData) ReplacePlainKeys(newData []byte, fn func(key []byte
 			}
 			if newKey == nil {
 				newData = append(newData, branchData[pos-int(l)-n:pos]...) // -n to include length
-				if l != length.Addr+length.Hash {
+				if l != storagePlainKeyLen {
 					fmt.Printf("COPY %x LEN %d\n", []byte(branchData[pos-int(l):pos]), l)
 				}
 			} else {
-				if len(newKey) > 8 && len(newKey) != length.Addr+length.Hash {
+				if len(newKey) > 8 && len(newKey) != storagePlainKeyLen {
 					fmt.Printf("SHORT %x LEN %d\n", newKey, len(newKey))
 				}
 

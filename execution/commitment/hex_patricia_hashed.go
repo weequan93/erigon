@@ -131,8 +131,8 @@ func NewHexPatriciaHashed(accountKeyLen int, ctx PatriciaContext) *HexPatriciaHa
 type cell struct {
 	hashedExtension [128]byte
 	extension       [64]byte
-	accountAddr     common.Address                  // account plain key
-	storageAddr     [length.Addr + length.Hash]byte // storage plain key
+	accountAddr     common.Address                                        // account plain key
+	storageAddr     [length.Addr + length.Incarnation + length.Hash]byte // storage plain key
 	hash            common.Hash                     // cell hash
 	stateHash       common.Hash
 	hashedExtLen    int       // length of the hashed extension, if any
@@ -195,7 +195,28 @@ func (cell *cell) hashAccKey(keccak keccakState, depth int) error {
 }
 
 func (cell *cell) hashStorageKey(keccak keccakState, accountKeyLen, downOffset int, hashedKeyOffset int) error {
-	return hashKey(keccak, cell.storageAddr[accountKeyLen:cell.storageAddrLen], cell.hashedExtension[downOffset:], hashedKeyOffset, cell.hashBuf[:])
+	var preimage []byte
+	switch cell.storageAddrLen {
+	case length.Addr + length.Hash: // address || slot
+		preimage = cell.storageAddr[accountKeyLen:cell.storageAddrLen]
+	case length.Addr + length.Incarnation + length.Hash: // address || incarnation || slot
+		switch accountKeyLen {
+		case 0:
+			// drop incarnation, hash addr||slot
+			var buf [length.Addr + length.Hash]byte
+			copy(buf[:length.Addr], cell.storageAddr[:length.Addr])
+			copy(buf[length.Addr:], cell.storageAddr[length.Addr+length.Incarnation:]) // skip inc
+			preimage = buf[:]
+		case length.Addr:
+			// storage trie path: hash slot only (skip incarnation)
+			preimage = cell.storageAddr[length.Addr+length.Incarnation : cell.storageAddrLen]
+		default:
+			preimage = cell.storageAddr[accountKeyLen:cell.storageAddrLen]
+		}
+	default:
+		return fmt.Errorf("unexpected storage plain key len=%d (addr part=%d)", cell.storageAddrLen, accountKeyLen)
+	}
+	return hashKey(keccak, preimage, cell.hashedExtension[downOffset:], hashedKeyOffset, cell.hashBuf[:])
 }
 
 func (cell *cell) reset() {

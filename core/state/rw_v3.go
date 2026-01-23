@@ -56,6 +56,7 @@ var mdbxMigrateStorageTraceBlockSet = mdbxMigrateStorageTraceBlockRaw != ""
 var mdbxMigrateStorageTraceTxIndexRaw = dbg.EnvString("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", "")
 var mdbxMigrateStorageTraceTxIndex = dbg.EnvInt("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", 0)
 var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
+var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
 var mdbxMigrateTraceKeys = [][]byte{
 	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe600"),
 	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff33f46529933152e1782e51b69b5bebb0810705b1e56844f07ef4225ddbc0d700"),
@@ -347,6 +348,9 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 	for addr, increase := range txTask.BalanceIncreaseSet {
 		increase := increase
 		emptyRemoval := txTask.Rules.IsSpuriousDragon && !increase.IsEscrow
+		if keepEmptyAccounts {
+			emptyRemoval = false
+		}
 		addrBytes := addr.Bytes()
 		enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
 		if err != nil {
@@ -655,6 +659,10 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
+	if keepEmptyAccounts && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+		return nil
+	}
 	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)
 	if w.trace {
 		fmt.Printf("del acc: %x\n", address)
@@ -811,6 +819,10 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
+	if keepEmptyAccounts && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+		return nil
+	}
 	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)
 	if w.trace {
 		fmt.Printf("del acc: %x\n", address)
