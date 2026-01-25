@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -931,8 +932,34 @@ var tracedAccounts map[common.Address]struct{} = func() map[common.Address]struc
 	return ta
 }()
 
+var mdbxMigrateTraceAccountsSet map[common.Address]struct{} = func() map[common.Address]struct{} {
+	raw := os.Getenv("ERIGON_MDBX_MIGRATE_ACCOUNTTRACE_ADDRS")
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make(map[common.Address]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || !common.IsHexAddress(part) {
+			continue
+		}
+		out[common.HexToAddress(part)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}()
+
 func traceAccount(addr common.Address) bool {
-	_, ok := tracedAccounts[addr]
+	if _, ok := tracedAccounts[addr]; ok {
+		return true
+	}
+	if len(mdbxMigrateTraceAccountsSet) == 0 {
+		return false
+	}
+	_, ok := mdbxMigrateTraceAccountsSet[addr]
 	return ok
 }
 
@@ -1272,6 +1299,23 @@ func (sdb *IntraBlockState) createObject(addr common.Address, previous *stateObj
 		sdb.journal.append(resetObjectChange{account: addr, prev: previous})
 	}
 	newobj.newlyCreated = true
+	if traceAccount(addr) {
+		prevDeleted := false
+		prevSelfdestructed := false
+		if previous != nil {
+			prevDeleted = previous.deleted
+			prevSelfdestructed = previous.selfdestructed
+		}
+		log.Info("state createObject",
+			"block", sdb.blockNum,
+			"tx_index", sdb.txIndex,
+			"version", sdb.version,
+			"addr", addr.Hex(),
+			"prev_exists", previous != nil,
+			"prev_deleted", prevDeleted,
+			"prev_selfdestructed", prevSelfdestructed,
+		)
+	}
 	sdb.setStateObject(addr, newobj)
 	data := newobj.data
 	sdb.versionWritten(addr, AddressPath, common.Hash{}, &data)
@@ -1311,6 +1355,7 @@ func (sdb *IntraBlockState) CreateZombieAccount(addr common.Address) error {
 		return err
 	}
 	if previous != nil && !previous.deleted {
+		sdb.journal.append(zombieTouchChange{account: addr})
 		return nil
 	}
 	if previous != nil && previous.selfdestructed {
@@ -1367,6 +1412,25 @@ func (sdb *IntraBlockState) CreateAccount(addr common.Address, contractCreation 
 	}
 
 	newObj := sdb.createObject(addr, previous)
+	if traceAccount(addr) {
+		prevDeleted := false
+		prevSelfdestructed := false
+		if previous != nil {
+			prevDeleted = previous.deleted
+			prevSelfdestructed = previous.selfdestructed
+		}
+		log.Info("state CreateAccount",
+			"block", sdb.blockNum,
+			"tx_index", sdb.txIndex,
+			"version", sdb.version,
+			"addr", addr.Hex(),
+			"contract_creation", contractCreation,
+			"prev_exists", previous != nil,
+			"prev_deleted", prevDeleted,
+			"prev_selfdestructed", prevSelfdestructed,
+			"prev_incarnation", prevInc,
+		)
+	}
 	if previous != nil && !previous.selfdestructed {
 		newObj.data.Balance.Set(&previous.data.Balance)
 	}
@@ -1482,14 +1546,8 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 	if isZombie {
 		emptyRemoval = false
 	}
-	// Arbitrum: preserve escrow-touched empties (Nitro leaves these accounts in state),
-	// but transient escrow accounts created in a block and left empty must be removed
-	// to match geth. Any escrow account that ends empty in this block is eligible for removal.
-	if isEscrow && stateObject.empty() {
-		emptyRemoval = true
-	}
 	// If this account originated from a missing read (nilAccount) and is still empty, allow removal.
-	if stateObject.db != nil && stateObject.empty() {
+	if stateObject.db != nil && stateObject.empty() && !isZombie {
 		if _, fromNil := stateObject.db.nilAccounts[addr]; fromNil {
 			emptyRemoval = true
 		}
@@ -1548,6 +1606,29 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 		if tracingHooks != nil && tracingHooks.OnBalanceChange != nil && !(&balance).IsZero() && stateObject.selfdestructed {
 			tracingHooks.OnBalanceChange(stateObject.address, balance, *uint256.NewInt(0), tracing.BalanceDecreaseSelfdestructBurn)
 		}
+		if traceAccount(addr) {
+			blockNum := uint64(0)
+			txIndex := 0
+			version := 0
+			if stateObject.db != nil {
+				blockNum = stateObject.db.blockNum
+				txIndex = stateObject.db.txIndex
+				version = stateObject.db.version
+			}
+			log.Info("state deleteAccount",
+				"block", blockNum,
+				"tx_index", txIndex,
+				"version", version,
+				"addr", addr.Hex(),
+				"selfdestructed", stateObject.selfdestructed,
+				"empty_removal", emptyRemoval,
+				"dirty", isDirty,
+				"created_contract", stateObject.createdContract,
+				"nonce", stateObject.data.Nonce,
+				"balance", stateObject.data.Balance.String(),
+				"code_hash", stateObject.data.CodeHash.Hex(),
+			)
+		}
 		if dbg.TraceTransactionIO && (trace || traceAccount(addr)) {
 			fmt.Printf("%d (%d.%d) Delete Account: %x selfdestructed=%v\n", stateObject.db.blockNum, stateObject.db.txIndex, stateObject.db.version, addr, stateObject.selfdestructed)
 		}
@@ -1580,6 +1661,28 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 		}
 		if dbg.TraceTransactionIO && (trace || traceAccount(addr)) {
 			fmt.Printf("%d (%d.%d) Update Account Data: %x, balance=%d, nonce=%d codehash=%x\n", stateObject.db.blockNum, stateObject.db.txIndex, stateObject.db.version, addr, &stateObject.data.Balance, stateObject.data.Nonce, stateObject.data.CodeHash)
+		}
+		if traceAccount(addr) {
+			blockNum := uint64(0)
+			txIndex := 0
+			version := 0
+			if stateObject.db != nil {
+				blockNum = stateObject.db.blockNum
+				txIndex = stateObject.db.txIndex
+				version = stateObject.db.version
+			}
+			log.Info("state updateAccount",
+				"block", blockNum,
+				"tx_index", txIndex,
+				"version", version,
+				"addr", addr.Hex(),
+				"nonce", stateObject.data.Nonce,
+				"balance", stateObject.data.Balance.String(),
+				"code_hash", stateObject.data.CodeHash.Hex(),
+				"created_contract", stateObject.createdContract,
+				"selfdestructed", stateObject.selfdestructed,
+				"empty_removal", emptyRemoval,
+			)
 		}
 		if err := stateWriter.UpdateAccountData(addr, &stateObject.original, &stateObject.data); err != nil {
 			return err
@@ -1627,7 +1730,7 @@ func (sdb *IntraBlockState) FinalizeTx(chainRules *chain.Rules, stateWriter Stat
 
 		dirtyCount := sdb.journal.dirties[addr]
 		zombieCount := sdb.journal.zombieEntries[addr]
-		isZombie := zombieCount != 0 && zombieCount == dirtyCount
+		isZombie := zombieCount == dirtyCount
 		if dbg.TraceTransactionIO && addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
 			_, dirty := sdb.stateObjectsDirty[addr]
 			_, touched := sdb.escrowTouched[addr]
@@ -1815,9 +1918,9 @@ func (sdb *IntraBlockState) MakeWriteSet(chainRules *chain.Rules, stateWriter St
 		if stateObject.newlyCreated && stateObject.empty() {
 			isDirty = true
 		}
-		dirtyCount, hasDirty := sdb.journal.dirties[addr]
+		dirtyCount := sdb.journal.dirties[addr]
 		zombieCount := sdb.journal.zombieEntries[addr]
-		isZombie := hasDirty && zombieCount != 0 && zombieCount == dirtyCount
+		isZombie := zombieCount != 0 && zombieCount == dirtyCount
 		if err := updateAccount(chainRules.IsSpuriousDragon, chainRules.IsAura, stateWriter, addr, stateObject, isDirty, isZombie, sdb.trace, sdb.tracingHooks); err != nil {
 			return err
 		}

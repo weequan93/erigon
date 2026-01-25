@@ -161,17 +161,17 @@ func (so *stateObject) touch() {
 		// flattened journals.
 		so.db.journal.dirty(so.address)
 	}
-	if so.address == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
-		_, stateDirty := so.db.stateObjectsDirty[so.address]
-		log.Info("mdbx-migrate escrow debug touch",
-			"addr", so.address.Hex(),
-			"tx_index", so.db.txIndex,
-			"escrow_touched", so.escrowTouched,
-			"journal_dirty_before", dirtyBefore,
-			"journal_dirty_after", dirtyAfter,
-			"state_dirty", stateDirty,
-		)
-	}
+
+	_, stateDirty := so.db.stateObjectsDirty[so.address]
+	log.Info("mdbx-migrate escrow debug touch",
+		"addr", so.address.Hex(),
+		"tx_index", so.db.txIndex,
+		"escrow_touched", so.escrowTouched,
+		"journal_dirty_before", dirtyBefore,
+		"journal_dirty_after", dirtyAfter,
+		"state_dirty", stateDirty,
+	)
+
 }
 
 // GetState returns a value from account storage.

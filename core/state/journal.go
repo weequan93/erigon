@@ -177,6 +177,9 @@ type (
 	touchChange struct {
 		account common.Address
 	}
+	zombieTouchChange struct {
+		account common.Address
+	}
 
 	// Changes to the access list
 	accessListAddAccountChange struct {
@@ -276,6 +279,14 @@ func (ch touchChange) revert(s *IntraBlockState) error {
 }
 
 func (ch touchChange) dirtied() *common.Address { return &ch.account }
+
+func (ch zombieTouchChange) revert(s *IntraBlockState) error {
+	return nil
+}
+
+func (ch zombieTouchChange) dirtied() *common.Address { return &ch.account }
+
+func (ch zombieTouchChange) isZombie() bool { return true }
 
 func (ch balanceChange) revert(s *IntraBlockState) error {
 	obj, err := s.getStateObject(*ch.account)

@@ -575,6 +575,16 @@ func (sdc *TrieContext) Account(plainKey []byte) (u *commitment.Update, err erro
 		return nil, err
 	}
 
+	// Defensive: treat history tombstones/short markers as deletions.
+	// Accounts are RLP-encoded and start with a small bitset (< 0x10). Values
+	// beginning with 0xFF (or otherwise too short to be a valid encoding) are
+	// tombstone markers left in the values table and must not be included in the trie.
+	if len(encAccount) > 0 {
+		if encAccount[0] == 0xff || len(encAccount) < 4 {
+			encAccount = nil
+		}
+	}
+
 	u = &commitment.Update{CodeHash: empty.CodeHash}
 	if len(encAccount) == 0 {
 		u.Flags = commitment.DeleteUpdate

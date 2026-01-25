@@ -1498,6 +1498,15 @@ func blockWithSenders(ctx context.Context, db kv.RoDB, tx kv.Tx, blockReader ser
 	if b == nil {
 		return nil, nil
 	}
+	if mdbxMigrateDebug && (!mdbxMigrateDebugBlockSet || blockNum == mdbxMigrateDebugBlock) {
+		log.Info("mdbx-migrate block read",
+			"block", blockNum,
+			"hash", b.Hash(),
+			"txs", len(b.Transactions()),
+			"uncles", len(b.Uncles()),
+			"size", b.Size(),
+		)
+	}
 	return b, err
 }
 
@@ -1513,4 +1522,67 @@ func shouldGenerateChangeSets(cfg ExecuteBlockCfg, blockNum, maxBlockNum uint64,
 	}
 	// once past the initial cycle, make sure to generate changesets for the last blocks that fall in the reorg window
 	return blockNum+cfg.syncCfg.MaxReorgDepth >= maxBlockNum
+}
+
+// sweepAccountTombstonesPlain removes plain-state account rows that are clearly
+// delete markers (e.g. values shorter than the 8-byte prefix + account encoding).
+// Leaving these in AccountVals causes the commitment trie
+// to think the account exists, leading to state-root mismatches during
+// migration (seen at block 13).
+func sweepAccountTombstonesPlain(tx kv.Tx, doms *dbstate.SharedDomains, logger log.Logger) {
+	if tx == nil {
+		return
+	}
+	const accountValsMinLen = 8 + 4
+	rwTx, ok := tx.(kv.RwTx)
+	if !ok {
+		return
+	}
+	c, err := rwTx.Cursor(kv.TblAccountVals)
+	if err != nil {
+		logger.Warn("sweepAccountTombstonesPlain: open cursor failed", "err", err)
+		return
+	}
+	defer c.Close()
+
+	for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+		if err != nil {
+			logger.Warn("sweepAccountTombstonesPlain: cursor next failed", "err", err)
+			break
+		}
+		if len(v) > 0 && len(v) < accountValsMinLen {
+			if err := rwTx.Delete(kv.TblAccountVals, k); err != nil {
+				logger.Warn("sweepAccountTombstonesPlain: delete failed", "err", err, "addr", fmt.Sprintf("0x%x", k))
+			}
+		}
+	}
+
+	// Also purge from the hashed/temporal Accounts domain so the commitment trie
+	// doesn't see the tombstone as a live account.
+	if doms == nil {
+		return
+	}
+	temporalTx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return
+	}
+	keys, err := temporalTx.Debug().RangeLatest(kv.AccountsDomain, nil, nil, -1)
+	if err != nil {
+		logger.Warn("sweepAccountTombstonesPlain: range hashed failed", "err", err)
+		return
+	}
+	defer keys.Close()
+
+	for keys.HasNext() {
+		k, v, err := keys.Next()
+		if err != nil {
+			logger.Warn("sweepAccountTombstonesPlain: hashed next failed", "err", err)
+			break
+		}
+		if len(v) > 0 && (len(v) < 4 || v[0] == 0xff) {
+			if err := doms.DomainDel(kv.AccountsDomain, temporalTx, k, doms.TxNum(), v, 0); err != nil {
+				logger.Warn("sweepAccountTombstonesPlain: hashed delete failed", "err", err, "addr", fmt.Sprintf("0x%x", k))
+			}
+		}
+	}
 }

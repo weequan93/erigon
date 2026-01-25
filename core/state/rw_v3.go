@@ -57,6 +57,85 @@ var mdbxMigrateStorageTraceTxIndexRaw = dbg.EnvString("ERIGON_MDBX_MIGRATE_STORA
 var mdbxMigrateStorageTraceTxIndex = dbg.EnvInt("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", 0)
 var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
 var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
+var keepEmptyAccountsList = loadKeepEmptyAccountsList()
+var mdbxMigrateSweepTombstones = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES", false)
+var mdbxMigrateSweepTombstonesBlock = dbg.EnvUint("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_BLOCK", 0)
+var repairTombstonesOnce sync.Once
+
+func loadKeepEmptyAccountsList() map[common.Address]struct{} {
+	raw := os.Getenv("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_ADDRS")
+	if raw == "" {
+		raw = os.Getenv("ERIGON_MDBX_MIGRATE_FORCE_EMPTY_ACCOUNTS")
+	}
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make(map[common.Address]struct{}, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" || !common.IsHexAddress(part) {
+			continue
+		}
+		out[common.HexToAddress(part)] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func shouldKeepEmptyAccount(addr common.Address) bool {
+	if !keepEmptyAccounts && len(keepEmptyAccountsList) == 0 {
+		return false
+	}
+	if len(keepEmptyAccountsList) == 0 {
+		return true
+	}
+	_, ok := keepEmptyAccountsList[addr]
+	return ok
+}
+
+func shouldKeepEmptyAccountBytes(key []byte) bool {
+	if len(key) != length.Addr {
+		if len(keepEmptyAccountsList) == 0 {
+			return keepEmptyAccounts
+		}
+		return false
+	}
+	return shouldKeepEmptyAccount(common.BytesToAddress(key))
+}
+
+const (
+	accountEncodingMinLen = 4
+	accountValsPrefixLen  = 8
+	accountValsMinLen     = accountValsPrefixLen + accountEncodingMinLen
+)
+
+var emptyAccountEncoding = []byte{0, 0, 0, 0}
+
+func isAccountTombstone(val []byte) bool {
+	if len(val) == 0 {
+		return false
+	}
+	// Account encodings use 4+ bytes; 0xff indicates a tombstone marker.
+	if val[0] == 0xff {
+		return true
+	}
+	return len(val) < accountEncodingMinLen
+}
+
+func isAccountValsTombstone(val []byte) bool {
+	if len(val) == 0 {
+		return false
+	}
+	return len(val) < accountValsMinLen
+}
+
+func isEmptyAccountEncoding(val []byte) bool {
+	return len(val) == accountEncodingMinLen && bytes.Equal(val, emptyAccountEncoding)
+}
+
 var mdbxMigrateTraceKeys = [][]byte{
 	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe600"),
 	common.FromHex("0xa4b05fffffffffffffffffffffffffffffffffff33f46529933152e1782e51b69b5bebb0810705b1e56844f07ef4225ddbc0d700"),
@@ -120,7 +199,9 @@ func logMdbxMigrateAccountTrace(op string, txNum uint64, address common.Address,
 		"addr", address.Hex(),
 	}
 	if original != nil {
+		origEmpty := original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash()
 		fields = append(fields,
+			"orig_empty", origEmpty,
 			"orig_nonce", original.Nonce,
 			"orig_balance", original.Balance.ToBig().String(),
 			"orig_incarnation", original.Incarnation,
@@ -129,15 +210,35 @@ func logMdbxMigrateAccountTrace(op string, txNum uint64, address common.Address,
 		)
 	}
 	if account != nil {
+		newEmpty := account.Nonce == 0 && account.Balance.IsZero() && account.IsEmptyCodeHash()
+		enc := accounts.SerialiseV3(account)
 		fields = append(fields,
+			"new_empty", newEmpty,
 			"new_nonce", account.Nonce,
 			"new_balance", account.Balance.ToBig().String(),
 			"new_incarnation", account.Incarnation,
 			"new_code_hash", account.CodeHash.Hex(),
 			"new_root", account.Root.Hex(),
+			"new_enc_len", len(enc),
+			"new_enc", hexPreviewBytes(enc, 64),
 		)
 	}
 	log.Info("mdbx-migrate accounttrace", fields...)
+}
+
+func logMdbxMigrateAccountDrop(reason string, txTask *TxTask, address common.Address, val []byte) {
+	if !mdbxMigrateAccountTrace || !isMdbxMigrateTraceAccount(address) {
+		return
+	}
+	log.Info("mdbx-migrate accountdrop",
+		"reason", reason,
+		"tx_num", txTask.TxNum,
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"addr", address.Hex(),
+		"val_len", len(val),
+		"val", hexPreviewBytes(val, 64),
+	)
 }
 
 func shouldMdbxMigrateStorageTrace(blockNum uint64, txIndex int) bool {
@@ -259,6 +360,103 @@ func (rs *ParallelExecutionState) CommitTxNum(sender *common.Address, txNum uint
 
 func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.SharedDomains) error {
 	var acc accounts.Account
+	deletePlainAccount := func(key []byte, force bool) {
+		if rwTx, ok := rs.tx.(kv.RwTx); ok {
+			keep := keepEmptyAccounts
+			if keepEmptyAccounts {
+				keep = shouldKeepEmptyAccountBytes(key)
+			}
+			wantLog := false
+			var addr common.Address
+			if mdbxMigrateAccountTrace && len(key) == length.Addr {
+				addr = common.BytesToAddress(key)
+				wantLog = isMdbxMigrateTraceAccount(addr)
+			}
+			var cur []byte
+			if (keep && !force) || wantLog {
+				cur, _ = rwTx.GetOne(kv.TblAccountVals, key)
+			}
+			// When keeping empty accounts, only drop obvious tombstones/garbage.
+			if keep && !force {
+				if !isAccountValsTombstone(cur) {
+					if wantLog {
+						log.Info("mdbx-migrate accountdrop",
+							"reason", "plain-keep",
+							"tx_num", txTask.TxNum,
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"addr", addr.Hex(),
+							"force", force,
+							"keep", keep,
+							"val_len", len(cur),
+							"val", hexPreviewBytes(cur, 64),
+						)
+					}
+					return
+				}
+				force = true
+			}
+			if force || !keep {
+				if wantLog {
+					log.Info("mdbx-migrate accountdrop",
+						"reason", "plain-delete",
+						"tx_num", txTask.TxNum,
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"addr", addr.Hex(),
+						"force", force,
+						"keep", keep,
+						"val_len", len(cur),
+						"val", hexPreviewBytes(cur, 64),
+					)
+				}
+				_ = rwTx.Delete(kv.TblAccountVals, key)
+			}
+		}
+	}
+
+	// One-time sweep: clean up account tombstones that may have been left behind by history import.
+	// Runs only when explicitly requested, to avoid mutating healthy states (e.g. L3 local chains).
+	if mdbxMigrateSweepTombstones && (mdbxMigrateSweepTombstonesBlock == 0 || txTask.BlockNum >= mdbxMigrateSweepTombstonesBlock) {
+		var tombstoneErr error
+		repairTombstonesOnce.Do(func() {
+			if rwTx, ok := rs.tx.(kv.RwTx); ok {
+				if c, err := rwTx.Cursor(kv.TblAccountVals); err == nil {
+					defer c.Close()
+					for k, v, err := c.First(); k != nil; k, v, err = c.Next() {
+						if err != nil {
+							tombstoneErr = err
+							return
+						}
+						if isAccountValsTombstone(v) {
+							if err := rwTx.Delete(kv.TblAccountVals, k); err != nil {
+								tombstoneErr = err
+								return
+							}
+						}
+					}
+				} else {
+					tombstoneErr = err
+					return
+				}
+			}
+			_ = domains.IteratePrefix(kv.AccountsDomain, nil, rs.tx, func(k, v []byte, step kv.Step) (bool, error) {
+				if isAccountTombstone(v) {
+					if len(k) == length.Addr {
+						addr := common.BytesToAddress(k)
+						logMdbxMigrateAccountDrop("tombstone-sweep", txTask, addr, v)
+					}
+					// Purge plain-state tombstones/obviously short records so account existence matches source.
+					_ = domains.DomainDel(kv.AccountsDomain, rs.tx, k, txTask.TxNum, v, step)
+					deletePlainAccount(k, true)
+				}
+				return true, nil
+			})
+		})
+		if tombstoneErr != nil {
+			return tombstoneErr
+		}
+	}
 
 	//maps are unordered in Go! don't iterate over it. SharedDomains.deleteAccount will call GetLatest(Code) and expecting it not been delete yet
 	if txTask.WriteLists != nil {
@@ -332,9 +530,50 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 						}
 					}
 				}
+				// Treat account tombstones (0xff...) and obviously short encodings as deletes.
+				if domain == kv.AccountsDomain && list.Vals[i] != nil {
+					if isAccountTombstone(list.Vals[i]) {
+						if len(keyBytes) == length.Addr {
+							addr := common.BytesToAddress(keyBytes)
+							logMdbxMigrateAccountDrop("tombstone", txTask, addr, list.Vals[i])
+						}
+						// Drop tombstone/garbage writes entirely and make sure the plain state is cleared.
+						deletePlainAccount(keyBytes, true)
+						list.Vals[i] = nil
+					} else if txTask.Rules != nil && txTask.Rules.IsSpuriousDragon && isEmptyAccountEncoding(list.Vals[i]) && !shouldKeepEmptyAccountBytes(keyBytes) {
+						if len(keyBytes) == length.Addr {
+							addr := common.BytesToAddress(keyBytes)
+							logMdbxMigrateAccountDrop("empty-encoding", txTask, addr, list.Vals[i])
+						}
+						// EIP-161: touched empty accounts should be deleted unless explicitly kept.
+						list.Vals[i] = nil
+					}
+				}
+
 				if list.Vals[i] == nil {
+					if domain == kv.AccountsDomain && mdbxMigrateAccountTrace && len(keyBytes) == length.Addr {
+						addr := common.BytesToAddress(keyBytes)
+						if isMdbxMigrateTraceAccount(addr) {
+							prev, _, err := domains.GetLatest(kv.AccountsDomain, rs.tx, keyBytes)
+							if err != nil {
+								return err
+							}
+							log.Info("mdbx-migrate accountdrop",
+								"reason", "domain-del",
+								"tx_num", txTask.TxNum,
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"addr", addr.Hex(),
+								"val_len", len(prev),
+								"val", hexPreviewBytes(prev, 64),
+							)
+						}
+					}
 					if err := domains.DomainDel(domain, rs.tx, keyBytes, txTask.TxNum, nil, 0); err != nil {
 						return err
+					}
+					if domain == kv.AccountsDomain {
+						deletePlainAccount(keyBytes, false)
 					}
 				} else {
 					if err := domains.DomainPut(domain, rs.tx, keyBytes, list.Vals[i], txTask.TxNum, nil, 0); err != nil {
@@ -348,7 +587,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 	for addr, increase := range txTask.BalanceIncreaseSet {
 		increase := increase
 		emptyRemoval := txTask.Rules.IsSpuriousDragon && !increase.IsEscrow
-		if keepEmptyAccounts {
+		if shouldKeepEmptyAccount(addr) {
 			emptyRemoval = false
 		}
 		addrBytes := addr.Bytes()
@@ -659,8 +898,25 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
-	if keepEmptyAccounts && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
 		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
+			fields := []interface{}{
+				"action", "skip_keep_empty",
+				"tx_num", w.txNum,
+				"addr", address.Hex(),
+			}
+			if original != nil {
+				fields = append(fields,
+					"orig_nonce", original.Nonce,
+					"orig_balance", original.Balance.ToBig().String(),
+					"orig_incarnation", original.Incarnation,
+					"orig_code_hash", original.CodeHash.Hex(),
+					"orig_root", original.Root.Hex(),
+				)
+			}
+			log.Info("mdbx-migrate accountdelete", fields...)
+		}
 		return nil
 	}
 	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)
@@ -819,8 +1075,25 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
-	if keepEmptyAccounts && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
 		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
+			fields := []interface{}{
+				"action", "skip_keep_empty",
+				"tx_num", w.txNum,
+				"addr", address.Hex(),
+			}
+			if original != nil {
+				fields = append(fields,
+					"orig_nonce", original.Nonce,
+					"orig_balance", original.Balance.ToBig().String(),
+					"orig_incarnation", original.Incarnation,
+					"orig_code_hash", original.CodeHash.Hex(),
+					"orig_root", original.Root.Hex(),
+				)
+			}
+			log.Info("mdbx-migrate accountdelete", fields...)
+		}
 		return nil
 	}
 	logMdbxMigrateAccountTrace("del", w.txNum, address, original, nil)

@@ -72,6 +72,12 @@ func (hr *HistoryReaderV3) DiscardReadList()                  {}
 
 func (hr *HistoryReaderV3) ReadAccountData(address common.Address) (*accounts.Account, error) {
 	enc, ok, err := hr.ttx.GetAsOf(kv.AccountsDomain, address[:], hr.txNum)
+	if (!ok || len(enc) == 0) && shouldKeepEmptyAccount(address) {
+		if latest, _, e := hr.ttx.GetLatest(kv.AccountsDomain, address[:]); e == nil && len(latest) > 0 {
+			enc = latest
+			ok = true
+		}
+	}
 	if err != nil || !ok || len(enc) == 0 {
 		if hr.trace {
 			fmt.Printf("ReadAccountData [%x] => []\n", address)
@@ -85,9 +91,6 @@ func (hr *HistoryReaderV3) ReadAccountData(address common.Address) (*accounts.Ac
 	accountEnc := enc
 	if len(enc) >= 9 && enc[0] == 0xff && enc[1] == 0xff {
 		accountEnc = enc[8:]
-	}
-	if len(accountEnc) < 5 { // nonceLen + balanceLen + codeHashLen
-		return nil, nil
 	}
 	var (
 		a        accounts.Account

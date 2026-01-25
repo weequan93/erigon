@@ -26,6 +26,7 @@ import (
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/common/assert"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/state/changeset"
@@ -72,6 +73,8 @@ type SharedDomains struct {
 	mem *TemporalMemBatch
 }
 
+var sweepAccountTombstonesInit = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_INIT", false)
+
 type HasAgg interface {
 	Agg() any
 }
@@ -97,6 +100,14 @@ func NewSharedDomains(tx kv.TemporalTx, logger log.Logger) (*SharedDomains, erro
 
 	if err := sd.SeekCommitment(context.Background(), tx); err != nil {
 		return nil, err
+	}
+
+	// Clean up any tombstone/short account entries that may be present in the
+	// latest state before we start processing blocks. These should be treated as
+	// deletions; if they remain, the commitment trie will think the account
+	// exists and state roots will diverge (e.g. block 13 mismatch).
+	if sweepAccountTombstonesInit {
+		sd.sweepAccountTombstones(tx)
 	}
 
 	return sd, nil
@@ -160,6 +171,38 @@ func (sd *SharedDomains) ClearRam(resetCommitment bool) {
 		sd.sdCtx.ClearRam()
 	}
 	sd.mem.ClearRam()
+}
+
+func (sd *SharedDomains) sweepAccountTombstones(tx kv.TemporalTx) {
+	if tx == nil {
+		return
+	}
+	keys, err := tx.Debug().RangeLatest(kv.AccountsDomain, nil, nil, -1)
+	if err != nil {
+		sd.logger.Warn("sweepAccountTombstones: range failed", "err", err)
+		return
+	}
+	defer keys.Close()
+
+	txNum := sd.txNum
+	if txNum == 0 {
+		txNum = 1
+	}
+
+	for keys.HasNext() {
+		k, v, err := keys.Next()
+		if err != nil {
+			sd.logger.Warn("sweepAccountTombstones: next failed", "err", err)
+			break
+		}
+		if len(v) > 0 && (len(v) < 4 || v[0] == 0xff) {
+			// Use txNum 0 for the cleanup; we only care about the latest view,
+			// and this runs before any block execution in migrate.
+			if err := sd.DomainDel(kv.AccountsDomain, tx, k, txNum, v, 0); err != nil {
+				sd.logger.Warn("sweepAccountTombstones: delete failed", "err", err, "addr", fmt.Sprintf("0x%x", k))
+			}
+		}
+	}
 }
 
 func (sd *SharedDomains) SizeEstimate() uint64 {
