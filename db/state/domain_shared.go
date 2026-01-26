@@ -70,7 +70,8 @@ type SharedDomains struct {
 	blockNum atomic.Uint64
 	trace    bool //nolint
 
-	mem *TemporalMemBatch
+	mem      *TemporalMemBatch
+	origVals [kv.DomainLen]map[string]dataWithPrevStep
 }
 
 var sweepAccountTombstonesInit = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_INIT", false)
@@ -171,6 +172,7 @@ func (sd *SharedDomains) ClearRam(resetCommitment bool) {
 		sd.sdCtx.ClearRam()
 	}
 	sd.mem.ClearRam()
+	sd.clearOrigVals()
 }
 
 func (sd *SharedDomains) sweepAccountTombstones(tx kv.TemporalTx) {
@@ -222,6 +224,9 @@ func (sd *SharedDomains) StepSize() uint64 { return sd.stepSize }
 // SetTxNum sets txNum for all domains as well as common txNum for all domains
 // Requires for sd.rwTx because of commitment evaluation in shared domains if stepSize is reached
 func (sd *SharedDomains) SetTxNum(txNum uint64) {
+	if sd.txNum != txNum {
+		sd.clearOrigVals()
+	}
 	sd.txNum = txNum
 	sd.sdCtx.SetTxNum(txNum)
 }
@@ -236,6 +241,28 @@ func (sd *SharedDomains) SetBlockNum(blockNum uint64) {
 
 func (sd *SharedDomains) SetTrace(b bool) {
 	sd.trace = b
+}
+
+func (sd *SharedDomains) clearOrigVals() {
+	for idx := range sd.origVals {
+		if sd.origVals[idx] != nil {
+			clear(sd.origVals[idx])
+		}
+	}
+}
+
+func (sd *SharedDomains) origPrev(domain kv.Domain, key string, curVal []byte, curStep kv.Step) (dataWithPrevStep, bool) {
+	if sd.origVals[domain] != nil {
+		if data, ok := sd.origVals[domain][key]; ok {
+			return data, true
+		}
+	}
+	if sd.origVals[domain] == nil {
+		sd.origVals[domain] = make(map[string]dataWithPrevStep)
+	}
+	data := dataWithPrevStep{data: curVal, prevStep: curStep}
+	sd.origVals[domain][key] = data
+	return data, false
 }
 
 func (sd *SharedDomains) HasPrefix(domain kv.Domain, prefix []byte, roTx kv.Tx) ([]byte, []byte, bool, error) {
@@ -313,13 +340,16 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 	ks := string(k)
 	sd.sdCtx.TouchKey(domain, ks, v)
 
-	if prevVal == nil {
+	curVal := prevVal
+	curStep := prevStep
+	if curVal == nil {
 		var err error
-		prevVal, prevStep, err = sd.GetLatest(domain, roTx, k)
+		curVal, curStep, err = sd.GetLatest(domain, roTx, k)
 		if err != nil {
 			return err
 		}
 	}
+	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
 	if domain == kv.AccountsDomain && bytes.Equal(k, escrowTraceAddrBytes) {
 		log.Info("escrow trace shared_domain_put",
 			"sd", fmt.Sprintf("%p", sd),
@@ -327,24 +357,24 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 			"tx_num", txNum,
 			"key", fmt.Sprintf("0x%x", k),
 			"val_len", len(v),
-			"prev_len", len(prevVal),
-			"prev_equal", bytes.Equal(prevVal, v),
-			"prev_step", prevStep,
+			"prev_len", len(curVal),
+			"prev_equal", bytes.Equal(curVal, v),
+			"prev_step", curStep,
 		)
 	}
 	switch domain {
 	case kv.CodeDomain:
-		if bytes.Equal(prevVal, v) {
+		if bytes.Equal(curVal, v) {
 			return nil
 		}
 	case kv.StorageDomain, kv.AccountsDomain, kv.CommitmentDomain, kv.RCacheDomain:
 		//noop
 	default:
-		if bytes.Equal(prevVal, v) {
+		if bytes.Equal(curVal, v) {
 			return nil
 		}
 	}
-	return sd.mem.DomainPut(domain, ks, v, txNum, prevVal, prevStep)
+	return sd.mem.DomainPut(domain, ks, v, txNum, orig.data, orig.prevStep)
 }
 
 // DomainDel
@@ -355,13 +385,16 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
 	ks := string(k)
 	sd.sdCtx.TouchKey(domain, ks, nil)
-	if prevVal == nil {
+	curVal := prevVal
+	curStep := prevStep
+	if curVal == nil {
 		var err error
-		prevVal, prevStep, err = sd.GetLatest(domain, tx, k)
+		curVal, curStep, err = sd.GetLatest(domain, tx, k)
 		if err != nil {
 			return err
 		}
 	}
+	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
 
 	switch domain {
 	case kv.AccountsDomain:
@@ -371,15 +404,15 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 		if err := sd.DomainDel(kv.CodeDomain, tx, k, txNum, nil, 0); err != nil {
 			return err
 		}
-		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, prevVal, prevStep)
+		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, orig.data, orig.prevStep)
 	case kv.CodeDomain:
-		if prevVal == nil {
+		if curVal == nil {
 			return nil
 		}
 	default:
 		//noop
 	}
-	return sd.mem.DomainDel(domain, ks, txNum, prevVal, prevStep)
+	return sd.mem.DomainDel(domain, ks, txNum, orig.data, orig.prevStep)
 }
 
 func (sd *SharedDomains) DomainDelPrefix(domain kv.Domain, roTx kv.TemporalTx, prefix []byte, txNum uint64) error {
