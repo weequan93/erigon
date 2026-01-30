@@ -1602,6 +1602,31 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 		)
 	}
 	if stateObject.selfdestructed || (isDirty && emptyRemoval) {
+		if isBadRootAccount(addr) {
+			blockNum := uint64(0)
+			txIndex := 0
+			version := 0
+			if stateObject.db != nil {
+				blockNum = stateObject.db.blockNum
+				txIndex = stateObject.db.txIndex
+				version = stateObject.db.version
+			}
+			log.Warn("state deleteAccount (bad root watch)",
+				"block", blockNum,
+				"tx_index", txIndex,
+				"version", version,
+				"addr", addr.Hex(),
+				"selfdestructed", stateObject.selfdestructed,
+				"empty_removal", emptyRemoval,
+				"dirty", isDirty,
+				"created_contract", stateObject.createdContract,
+				"escrow", isEscrow,
+				"zombie", isZombie,
+				"nonce", stateObject.data.Nonce,
+				"balance", stateObject.data.Balance.String(),
+				"code_hash", stateObject.data.CodeHash.Hex(),
+			)
+		}
 		balance := stateObject.Balance()
 		if tracingHooks != nil && tracingHooks.OnBalanceChange != nil && !(&balance).IsZero() && stateObject.selfdestructed {
 			tracingHooks.OnBalanceChange(stateObject.address, balance, *uint256.NewInt(0), tracing.BalanceDecreaseSelfdestructBurn)

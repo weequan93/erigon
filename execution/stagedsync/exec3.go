@@ -958,6 +958,16 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 		return
 	}
 	addrs := badRootAccountList(header, logger)
+	addrStrs := make([]string, 0, len(addrs))
+	for _, addr := range addrs {
+		addrStrs = append(addrStrs, addr.Hex())
+	}
+	logger.Warn("Bad state root account dump start",
+		"block", header.Number.Uint64(),
+		"count", len(addrs),
+		"coinbase", header.Coinbase,
+		"addrs", addrStrs,
+	)
 	if len(addrs) == 0 {
 		return
 	}
@@ -1126,6 +1136,7 @@ func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstat
 			"balance", acc.Balance.String(),
 			"incarnation", acc.Incarnation,
 			"code_hash", acc.CodeHash,
+			"account_root", acc.Root,
 			"root", root,
 			"storage_items", items,
 			"step", step,

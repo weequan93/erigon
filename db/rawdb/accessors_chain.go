@@ -28,6 +28,7 @@ import (
 	"math/big"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -1394,6 +1395,22 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 	blockHash := block.Hash()
 	blockNum := block.NumberU64()
 	shouldLog := mdbxMigrateShouldLogReceipts(blockNum)
+	if strings.EqualFold(os.Getenv("ERIGON_BAD_ROOT_DEBUG"), "true") {
+		log.Warn("mdbx-migrate receipts debug state",
+			"block", blockNum,
+			"debug", mdbxMigrateReceiptsDebug,
+			"filter_set", mdbxMigrateReceiptsDebugBlockSet,
+			"filter_block", mdbxMigrateReceiptsDebugBlock,
+			"should_log", shouldLog,
+		)
+	}
+	if mdbxMigrateReceiptsDebug && !shouldLog {
+		log.Warn("mdbx-migrate receipts debug gate",
+			"block", blockNum,
+			"filter_set", mdbxMigrateReceiptsDebugBlockSet,
+			"filter_block", mdbxMigrateReceiptsDebugBlock,
+		)
+	}
 
 	_min, err := txNumReader.Min(tx, blockNum)
 	if err != nil {
@@ -1416,6 +1433,14 @@ func ReadReceiptsCacheV2(tx kv.TemporalTx, block *types.Block, txNumReader rawdb
 	}
 	if shouldLog {
 		log.Info("mdbx-migrate receipts scan start",
+			"block", blockNum,
+			"block_hash", blockHash,
+			"txs", len(block.Transactions()),
+			"txnum_min", _min,
+			"txnum_max", _max,
+			"txnum_count", txNumCount,
+		)
+		log.Warn("mdbx-migrate receipts scan start",
 			"block", blockNum,
 			"block_hash", blockHash,
 			"txs", len(block.Transactions()),

@@ -530,25 +530,33 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 						}
 					}
 				}
-				// Treat account tombstones (0xff...) and obviously short encodings as deletes.
-				if domain == kv.AccountsDomain && list.Vals[i] != nil {
-					if isAccountTombstone(list.Vals[i]) {
-						if len(keyBytes) == length.Addr {
-							addr := common.BytesToAddress(keyBytes)
-							logMdbxMigrateAccountDrop("tombstone", txTask, addr, list.Vals[i])
+					// Treat account tombstones (0xff...) and obviously short encodings as deletes.
+					if domain == kv.AccountsDomain && list.Vals[i] != nil {
+						if isAccountTombstone(list.Vals[i]) {
+							if len(keyBytes) == length.Addr {
+								addr := common.BytesToAddress(keyBytes)
+								logMdbxMigrateAccountDrop("tombstone", txTask, addr, list.Vals[i])
+							}
+							// Drop tombstone/garbage writes entirely and make sure the plain state is cleared.
+							deletePlainAccount(keyBytes, true)
+							list.Vals[i] = nil
+						} else if txTask.Rules != nil && txTask.Rules.IsSpuriousDragon && isEmptyAccountEncoding(list.Vals[i]) && !shouldKeepEmptyAccountBytes(keyBytes) {
+							if len(keyBytes) == length.Addr {
+								addr := common.BytesToAddress(keyBytes)
+								logMdbxMigrateAccountDrop("empty-encoding", txTask, addr, list.Vals[i])
+								if isBadRootAccount(addr) {
+									log.Warn("state account drop empty-encoding (bad root watch)",
+										"tx_num", txTask.TxNum,
+										"block", txTask.BlockNum,
+										"tx_index", txTask.TxIndex,
+										"addr", addr.Hex(),
+									)
+								}
+							}
+							// EIP-161: touched empty accounts should be deleted unless explicitly kept.
+							list.Vals[i] = nil
 						}
-						// Drop tombstone/garbage writes entirely and make sure the plain state is cleared.
-						deletePlainAccount(keyBytes, true)
-						list.Vals[i] = nil
-					} else if txTask.Rules != nil && txTask.Rules.IsSpuriousDragon && isEmptyAccountEncoding(list.Vals[i]) && !shouldKeepEmptyAccountBytes(keyBytes) {
-						if len(keyBytes) == length.Addr {
-							addr := common.BytesToAddress(keyBytes)
-							logMdbxMigrateAccountDrop("empty-encoding", txTask, addr, list.Vals[i])
-						}
-						// EIP-161: touched empty accounts should be deleted unless explicitly kept.
-						list.Vals[i] = nil
 					}
-				}
 
 				if list.Vals[i] == nil {
 					if domain == kv.AccountsDomain && mdbxMigrateAccountTrace && len(keyBytes) == length.Addr {
@@ -624,10 +632,20 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 				"step0", step0,
 			)
 		}
-		if !increase.IsEscrow && emptyRemoval && acc.Nonce == 0 && acc.Balance.IsZero() && acc.IsEmptyCodeHash() {
-			if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
-				log.Info("mdbx-migrate escrow debug domain_del",
-					"tx_num", txTask.TxNum,
+			if !increase.IsEscrow && emptyRemoval && acc.Nonce == 0 && acc.Balance.IsZero() && acc.IsEmptyCodeHash() {
+				if isBadRootAccount(addr) {
+					log.Warn("state account drop empty-removal (bad root watch)",
+						"tx_num", txTask.TxNum,
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"addr", addr.Hex(),
+						"is_escrow", increase.IsEscrow,
+						"empty_removal", emptyRemoval,
+					)
+				}
+				if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
+					log.Info("mdbx-migrate escrow debug domain_del",
+						"tx_num", txTask.TxNum,
 					"addr", addr.Hex(),
 					"is_escrow", increase.IsEscrow,
 					"empty_removal", emptyRemoval,
@@ -749,6 +767,16 @@ func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *db
 				return err
 			}
 		}
+	}
+
+	if txTask.TxIndex == 0 && strings.EqualFold(os.Getenv("ERIGON_BAD_ROOT_DEBUG"), "true") {
+		log.Warn("exec3 receipts cache state",
+			"block_number", txTask.BlockNum,
+			"txs_in_block", len(txTask.BlockReceipts),
+			"persist_rcache", rs.syncCfg.PersistReceiptsCacheV2,
+			"should_log_receipts", shouldLogReceipts,
+			"tx_num", txTask.TxNum,
+		)
 	}
 
 	if shouldLogReceipts && !rs.syncCfg.PersistReceiptsCacheV2 && txTask.TxIndex == 0 {
