@@ -835,6 +835,31 @@ func (hph *HexPatriciaHashed) witnessComputeCellHashWithStorage(cell *cell, dept
 		}
 		cell.hashedExtension[64-depth] = terminatorHexByte // Add terminator
 		if !storageRootHashIsSet {
+			if cell.storageAddrLen > 0 && depth <= 64 {
+				// Storage exists but root wasn't set; compute from singleton storage leaf.
+				var hashedKeyOffset int
+				if depth >= 64 {
+					hashedKeyOffset = depth - 64
+				}
+				koffset := hph.accountKeyLen
+				if depth == 0 && cell.accountAddrLen == 0 {
+					koffset = 0
+				}
+				var storageExt [65]byte
+				var storageHashBuf [64]byte
+				if err = hashKey(hph.keccak, cell.storageAddr[koffset:cell.storageAddrLen], storageExt[:], hashedKeyOffset, storageHashBuf[:]); err != nil {
+					return nil, storageRootHashIsSet, nil, err
+				}
+				storageExt[64-hashedKeyOffset] = terminatorHexByte
+				aux := make([]byte, 0, 33)
+				if aux, err = hph.leafHashWithKeyVal(aux, storageExt[:64-hashedKeyOffset+1], cell.Storage[:cell.StorageLen], true); err != nil {
+					return nil, storageRootHashIsSet, nil, err
+				}
+				storageRootHash = *(*common.Hash)(aux[1:])
+				storageRootHashIsSet = true
+			}
+		}
+		if !storageRootHashIsSet {
 			if cell.extLen > 0 { // Extension
 				if cell.hashLen == 0 {
 					return nil, storageRootHashIsSet, nil, errors.New("computeCellHash extension without hash")
@@ -990,6 +1015,31 @@ func (hph *HexPatriciaHashed) computeCellHash(cell *cell, depth int, buf []byte)
 			return nil, err
 		}
 		cell.hashedExtension[64-depth] = terminatorHexByte // Add terminator
+		if !storageRootHashIsSet {
+			if cell.storageAddrLen > 0 && depth <= 64 {
+				// Storage exists but root wasn't set; compute from singleton storage leaf.
+				var hashedKeyOffset int
+				if depth >= 64 {
+					hashedKeyOffset = depth - 64
+				}
+				koffset := hph.accountKeyLen
+				if depth == 0 && cell.accountAddrLen == 0 {
+					koffset = 0
+				}
+				var storageExt [65]byte
+				var storageHashBuf [64]byte
+				if err = hashKey(hph.keccak, cell.storageAddr[koffset:cell.storageAddrLen], storageExt[:], hashedKeyOffset, storageHashBuf[:]); err != nil {
+					return nil, err
+				}
+				storageExt[64-hashedKeyOffset] = terminatorHexByte
+				aux := make([]byte, 0, 33)
+				if aux, err = hph.leafHashWithKeyVal(aux, storageExt[:64-hashedKeyOffset+1], cell.Storage[:cell.StorageLen], true); err != nil {
+					return nil, err
+				}
+				storageRootHash = *(*common.Hash)(aux[1:])
+				storageRootHashIsSet = true
+			}
+		}
 		if !storageRootHashIsSet {
 			if cell.extLen > 0 { // Extension
 				if cell.hashLen == 0 {

@@ -632,7 +632,7 @@ func TestDomainRoTx_CursorParentCheck(t *testing.T) {
 	defer writer.Close()
 
 	val := []byte("value1")
-	writer.addValue([]byte("key1"), val, kv.Step(1/d.stepSize))
+	writer.addValue([]byte("key1"), val, kv.Step(1/d.stepSize), 1)
 
 	err = writer.Flush(ctx, tx)
 	require.NoError(err)

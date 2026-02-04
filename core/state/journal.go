@@ -254,6 +254,13 @@ func (ch selfdestructChange) revert(s *IntraBlockState) error {
 		obj.selfdestructed = ch.prev
 		obj.setBalance(ch.prevbalance)
 	}
+	if s.selfdestructedAccounts != nil {
+		if ch.prev {
+			s.selfdestructedAccounts[*ch.account] = struct{}{}
+		} else {
+			delete(s.selfdestructedAccounts, *ch.account)
+		}
+	}
 	if s.versionMap != nil {
 		if obj.original.Balance == ch.prevbalance {
 			s.versionedWrites.Delete(*ch.account, AccountKey{Path: BalancePath})

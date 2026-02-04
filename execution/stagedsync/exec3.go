@@ -975,14 +975,26 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 		logger.Warn("Bad state root account log skipped", "reason", "missing domains")
 		return
 	}
+	txNum := doms.TxNum()
 	for _, addr := range addrs {
 		val, step, err := doms.GetLatest(kv.AccountsDomain, temporalTx, addr[:])
 		if err != nil {
 			logger.Warn("Bad state root account read failed", "block", header.Number.Uint64(), "address", addr, "err", err)
 			continue
 		}
+		storageRoot, storageItems, storageErr := computeStorageRootFromDomain(temporalTx, addr, txNum)
+		if storageErr != nil {
+			logger.Warn("Bad state root storage root read failed", "block", header.Number.Uint64(), "address", addr, "tx_num", txNum, "err", storageErr)
+		}
 		if len(val) == 0 {
-			logger.Warn("Bad state root account missing", "block", header.Number.Uint64(), "address", addr, "step", step)
+			logger.Warn("Bad state root account missing",
+				"block", header.Number.Uint64(),
+				"address", addr,
+				"step", step,
+				"tx_num", txNum,
+				"storage_root", storageRoot,
+				"storage_items", storageItems,
+			)
 			continue
 		}
 		acc := accounts.NewAccount()
@@ -999,6 +1011,9 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 			"code_hash", acc.CodeHash,
 			"root", acc.Root,
 			"step", step,
+			"tx_num", txNum,
+			"storage_root", storageRoot,
+			"storage_items", storageItems,
 		)
 	}
 }

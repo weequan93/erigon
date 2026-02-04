@@ -332,6 +332,11 @@ func (s *IntraBlockState) GetRecentWasms() RecentWasms {
 }
 
 func (s *IntraBlockState) HasSelfDestructed(addr common.Address) bool {
+	if s.selfdestructedAccounts != nil {
+		if _, ok := s.selfdestructedAccounts[addr]; ok {
+			return true
+		}
+	}
 	stateObject, err := s.getStateObject(addr)
 	if err != nil {
 		panic(err)

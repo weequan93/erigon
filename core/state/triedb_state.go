@@ -455,14 +455,6 @@ func (tds *TrieDbState) buildAccountWrites() (common.Hashes, []*accounts.Account
 			aValues[i] = nil // Entry that would wipe out existing storage
 		} else {
 			a := tds.aggregateBuffer.accountUpdates[addrHash]
-			if a.Account != nil {
-				if _, ok := tds.aggregateBuffer.storageUpdates[addrHash]; ok {
-					var ac accounts.Account
-					ac.Copy(a.Account)
-					ac.Root = trie.EmptyRoot
-					a.Account = &ac
-				}
-			}
 			aValues[i] = a.Account
 			if code, ok := tds.aggregateBuffer.codeUpdates[addrHash]; ok {
 				aCodes[i] = code
@@ -596,9 +588,14 @@ func (tds *TrieDbState) updateTrieRoots(forward bool) ([]common.Hash, error) {
 					accountWithAddress.Account.Root = root
 					//fmt.Printf("(b)Set %x root for addrHash %x\n", root, addrHash)
 				} else {
-					//fmt.Printf("(b)Set empty root for addrHash %x\n", addrHash)
-					accountWithAddress.Account.Root = trie.EmptyRoot
+					hasStorage, err := tds.HasStorage(accountWithAddress.Address)
+					if err == nil && !hasStorage && accountWithAddress.Account.Root == (common.Hash{}) {
+						//fmt.Printf("(b)Set empty root for addrHash %x\n", addrHash)
+						accountWithAddress.Account.Root = trie.EmptyRoot
+					}
 				}
+				// Account was already inserted before storage updates; update again so trie hashes include storage root.
+				tds.t.UpdateAccount(addrHash[:], accountWithAddress.Account)
 			}
 		}
 		roots[i] = tds.t.Hash()

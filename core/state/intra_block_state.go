@@ -87,6 +87,8 @@ type IntraBlockState struct {
 	nilAccounts map[common.Address]struct{} // Remember non-existent account to avoid reading them again
 	// Track accounts deleted during the current block to support zombie recreation in later txs.
 	deletedAccounts map[common.Address]struct{}
+	// Track accounts self-destructed during the current block to mirror geth's stateObjectsDestruct.
+	selfdestructedAccounts map[common.Address]struct{}
 
 	// The refund counter, also used by state transitioning.
 	refund uint64
@@ -135,6 +137,7 @@ func New(stateReader StateReader) *IntraBlockState {
 		stateObjectsDirty: map[common.Address]struct{}{},
 		nilAccounts:       map[common.Address]struct{}{},
 		deletedAccounts:   map[common.Address]struct{}{},
+		selfdestructedAccounts: map[common.Address]struct{}{},
 		logs:              []types.Logs{},
 		journal:           newJournal(),
 		accessList:        newAccessList(),
@@ -202,6 +205,12 @@ func (sdb *IntraBlockState) Copy() *IntraBlockState {
 		state.deletedAccounts = make(map[common.Address]struct{}, len(sdb.deletedAccounts))
 		for addr := range sdb.deletedAccounts {
 			state.deletedAccounts[addr] = struct{}{}
+		}
+	}
+	if len(sdb.selfdestructedAccounts) > 0 {
+		state.selfdestructedAccounts = make(map[common.Address]struct{}, len(sdb.selfdestructedAccounts))
+		for addr := range sdb.selfdestructedAccounts {
+			state.selfdestructedAccounts[addr] = struct{}{}
 		}
 	}
 
@@ -299,6 +308,7 @@ func (sdb *IntraBlockState) Reset() {
 	sdb.stateObjects = map[common.Address]*stateObject{}
 	sdb.stateObjectsDirty = map[common.Address]struct{}{}
 	sdb.deletedAccounts = map[common.Address]struct{}{}
+	sdb.selfdestructedAccounts = map[common.Address]struct{}{}
 	for i := range sdb.logs {
 		clear(sdb.logs[i]) // free p¬ointers
 		sdb.logs[i] = sdb.logs[i][:0]
@@ -1072,6 +1082,9 @@ func (sdb *IntraBlockState) Selfdestruct(addr common.Address) (bool, error) {
 	}
 
 	stateObject.markSelfdestructed()
+	if sdb.selfdestructedAccounts != nil {
+		sdb.selfdestructedAccounts[addr] = struct{}{}
+	}
 	sdb.arbExtraData.unexpectedBalanceDelta.Sub(sdb.arbExtraData.unexpectedBalanceDelta, &stateObject.data.Balance)
 	if bi, exist := sdb.balanceInc[addr]; exist && bi.isEscrow {
 		// TODO arbitrum remove log
@@ -1546,8 +1559,32 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 	if isZombie {
 		emptyRemoval = false
 	}
+	keepEmpty := shouldKeepEmptyAccount(addr)
+	if keepEmpty {
+		if isBadRootAccount(addr) {
+			blockNum := uint64(0)
+			txIndex := 0
+			version := 0
+			if stateObject.db != nil {
+				blockNum = stateObject.db.blockNum
+				txIndex = stateObject.db.txIndex
+				version = stateObject.db.version
+			}
+			log.Warn("state keep-empty account",
+				"block", blockNum,
+				"tx_index", txIndex,
+				"version", version,
+				"addr", addr.Hex(),
+				"dirty", isDirty,
+				"empty", stateObject.empty(),
+				"zombie", isZombie,
+				"selfdestructed", stateObject.selfdestructed,
+			)
+		}
+		emptyRemoval = false
+	}
 	// If this account originated from a missing read (nilAccount) and is still empty, allow removal.
-	if stateObject.db != nil && stateObject.empty() && !isZombie {
+	if stateObject.db != nil && stateObject.empty() && !isZombie && !keepEmpty {
 		if _, fromNil := stateObject.db.nilAccounts[addr]; fromNil {
 			emptyRemoval = true
 		}

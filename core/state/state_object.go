@@ -261,11 +261,36 @@ func (so *stateObject) SetState(key common.Hash, value uint256.Int, force bool) 
 			return value, nil
 		})
 
+	// Ensure blockOriginStorage is initialized for this key so storage writes
+	// can be correctly skipped/committed based on original (pre-block) value.
+	if _, ok := so.blockOriginStorage[key]; !ok {
+		if v, ok := so.originStorage[key]; ok {
+			so.blockOriginStorage[key] = v
+		} else {
+			if so.createdContract {
+				so.blockOriginStorage[key] = *u256.N0
+			} else {
+				var committed uint256.Int
+				if err := so.GetCommittedState(key, &committed); err != nil {
+					log.Warn("state: failed to read committed storage", "addr", so.address, "key", key.Hex(), "err", err)
+				}
+			}
+		}
+	}
+
 	if !force && prev == value {
-		return false
+		if origin, ok := so.blockOriginStorage[key]; ok && origin == value {
+			if isBadRootAccount(so.address) {
+				log.Info("badroot SetState skip", "addr", so.address, "key", key.Hex(), "prev", prev.Hex(), "value", value.Hex(), "origin", origin.Hex(), "committed", commited)
+			}
+			return false
+		}
 	}
 
 	// New value is different, update and journal the change
+	if isBadRootAccount(so.address) {
+		log.Info("badroot SetState apply", "addr", so.address, "key", key.Hex(), "prev", prev.Hex(), "value", value.Hex(), "force", force, "committed", commited)
+	}
 	so.db.journal.append(storageChange{
 		account:     &so.address,
 		key:         key,

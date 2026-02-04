@@ -381,7 +381,7 @@ func (w *DomainBufferedWriter) PutWithPrev(k, v []byte, txNum uint64, preval []b
 	if w.diff != nil {
 		w.diff.DomainUpdate(k, step, preval, prevStep)
 	}
-	return w.addValue(k, v, step)
+	return w.addValue(k, v, step, txNum)
 }
 
 func (w *DomainBufferedWriter) DeleteWithPrev(k []byte, txNum uint64, prev []byte, prevStep kv.Step) (err error) {
@@ -406,7 +406,7 @@ func (w *DomainBufferedWriter) DeleteWithPrev(k []byte, txNum uint64, prev []byt
 	if w.diff != nil {
 		w.diff.DomainUpdate(k, step, prev, prevStep)
 	}
-	return w.addValue(k, nil, step)
+	return w.addValue(k, nil, step, txNum)
 }
 
 func (w *DomainBufferedWriter) SetDiff(diff *kv.DomainDiff) { w.diff = diff }
@@ -437,8 +437,10 @@ type DomainBufferedWriter struct {
 	largeVals bool
 
 	stepBytes [8]byte // current inverted step representation
+	txNumBytes [8]byte // tx number representation for stable ordering within a step
 	aux       []byte  // auxilary buffer for key1 + key2
 	aux2      []byte  // auxilary buffer for step + val
+	aux3      []byte  // auxilary buffer for on-disk step + val (txNum stripped)
 	diff      *kv.DomainDiff
 
 	h *historyBufferedWriter
@@ -491,7 +493,16 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	}
 
 	if w.largeVals {
-		if err := w.values.Load(tx, w.valsTable, loadFunc, etl.TransformArgs{Quit: ctx.Done(), EmptyVals: true}); err != nil {
+		// For large values, order by txNum within the same step by prefixing txNum in the collector,
+		// then strip it before writing to the table.
+		if err := w.values.Load(tx, w.valsTable, func(k, v []byte, _ etl.CurrentTableReader, next etl.LoadNextFunc) error {
+			// v = txNum(8) + value
+			if len(v) < 8 {
+				return next(k, k, v)
+			}
+			vOnDisk := append(w.aux3[:0], v[8:]...)
+			return next(k, k, vOnDisk)
+		}, etl.TransformArgs{Quit: ctx.Done(), EmptyVals: true}); err != nil {
 			return err
 		}
 		w.Close()
@@ -504,6 +515,13 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	}
 	defer valuesCursor.Close()
 	if err := w.values.Load(tx, w.valsTable, func(k, v []byte, table etl.CurrentTableReader, next etl.LoadNextFunc) error {
+		// v = invStep(8) + txNum(8) + value
+		if len(v) < 16 {
+			// Should not happen, but fall back to old format if it does.
+			return next(k, k, v)
+		}
+		vOnDisk := append(w.aux3[:0], v[:8]...)
+		vOnDisk = append(vOnDisk, v[16:]...)
 		if bytes.Equal(k, escrowTraceAddrBytes) && len(v) >= 8 {
 			invStep := binary.BigEndian.Uint64(v[:8])
 			log.Info("escrow trace flush_load",
@@ -513,15 +531,15 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 				"key", fmt.Sprintf("0x%x", k),
 				"inv_step", fmt.Sprintf("0x%x", v[:8]),
 				"step", ^invStep,
-				"val_len", len(v)-8,
+				"val_len", len(vOnDisk)-8,
 			)
 		}
-		foundVal, err := valuesCursor.SeekBothRange(k, v[:8])
+		foundVal, err := valuesCursor.SeekBothRange(k, vOnDisk[:8])
 		if err != nil {
 			return err
 		}
-		if len(foundVal) == 0 || !bytes.Equal(foundVal[:8], v[:8]) {
-			if err := valuesCursor.Put(k, v); err != nil {
+		if len(foundVal) == 0 || !bytes.Equal(foundVal[:8], vOnDisk[:8]) {
+			if err := valuesCursor.Put(k, vOnDisk); err != nil {
 				return err
 			}
 			return nil
@@ -529,7 +547,7 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 		if err := valuesCursor.DeleteCurrent(); err != nil {
 			return err
 		}
-		if err := valuesCursor.Put(k, v); err != nil {
+		if err := valuesCursor.Put(k, vOnDisk); err != nil {
 			return err
 		}
 		return nil
@@ -565,11 +583,12 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	return nil
 }
 
-func (w *DomainBufferedWriter) addValue(k, value []byte, step kv.Step) error {
+func (w *DomainBufferedWriter) addValue(k, value []byte, step kv.Step, txNum uint64) error {
 	if w.discard {
 		return nil
 	}
 	binary.BigEndian.PutUint64(w.stepBytes[:], ^uint64(step))
+	binary.BigEndian.PutUint64(w.txNumBytes[:], txNum)
 
 	if w.largeVals {
 		kl := len(k)
@@ -582,13 +601,16 @@ func (w *DomainBufferedWriter) addValue(k, value []byte, step kv.Step) error {
 			}
 		}
 
-		if err := w.values.Collect(fullkey, value); err != nil {
+		// Prefix txNum for stable ordering within the same step, strip on load.
+		w.aux2 = append(append(w.aux2[:0], w.txNumBytes[:]...), value...)
+		if err := w.values.Collect(fullkey, w.aux2); err != nil {
 			return err
 		}
 		return nil
 	}
 
-	w.aux2 = append(append(w.aux2[:0], w.stepBytes[:]...), value...)
+	// Store invStep + txNum + value in collector for deterministic ordering
+	w.aux2 = append(append(append(w.aux2[:0], w.stepBytes[:]...), w.txNumBytes[:]...), value...)
 
 	if asserts {
 		seeStep := kv.Step(^binary.BigEndian.Uint64(w.stepBytes[:]))
