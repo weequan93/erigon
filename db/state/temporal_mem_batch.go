@@ -114,20 +114,27 @@ func (sd *TemporalMemBatch) putHistory(domain kv.Domain, k, v []byte, txNum uint
 func (sd *TemporalMemBatch) putLatest(domain kv.Domain, key string, val []byte, txNum uint64) {
 	sd.latestStateLock.Lock()
 	defer sd.latestStateLock.Unlock()
-	valWithPrevStep := dataWithPrevStep{data: val, prevStep: kv.Step(txNum / sd.stepSize)}
+	// Keep latest cache immutable against caller buffer reuse.
+	// Execution paths reuse backing buffers aggressively; storing references here
+	// can make "latest" drift from what was actually written for this tx.
+	var valCopy []byte
+	if val != nil {
+		valCopy = common.Copy(val)
+	}
+	valWithPrevStep := dataWithPrevStep{data: valCopy, prevStep: kv.Step(txNum / sd.stepSize)}
 	if domain == kv.StorageDomain {
 		if old, ok := sd.storage.Set(key, valWithPrevStep); ok {
-			sd.estSize += len(val) - len(old.data)
+			sd.estSize += len(valCopy) - len(old.data)
 		} else {
-			sd.estSize += len(key) + len(val)
+			sd.estSize += len(key) + len(valCopy)
 		}
 		return
 	}
 
 	if old, ok := sd.domains[domain][key]; ok {
-		sd.estSize += len(val) - len(old.data)
+		sd.estSize += len(valCopy) - len(old.data)
 	} else {
-		sd.estSize += len(key) + len(val)
+		sd.estSize += len(key) + len(valCopy)
 	}
 	sd.domains[domain][key] = valWithPrevStep
 }

@@ -3,11 +3,13 @@ package commitmentdb
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -54,6 +56,96 @@ type SharedDomainsCommitmentContext struct {
 }
 
 var debugDumpTouchedAccounts = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
+var debugBadRootCommitmentProbe = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var debugBadRootProbeStorageKey = common.FromHex(dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", ""))
+
+func commitmentHexPreview(v []byte, max int) string {
+	if len(v) == 0 {
+		return "0x"
+	}
+	if max <= 0 || len(v) <= max {
+		return fmt.Sprintf("0x%x", v)
+	}
+	return fmt.Sprintf("0x%x...(+%d bytes)", v[:max], len(v)-max)
+}
+
+// debugUpdatesValueDigest returns a stable digest over current update keys and
+// the values resolved from trie read context (accounts/storage/code), to help
+// compare builder vs exec3 commitment inputs when keys-only digests match.
+func (sdc *SharedDomainsCommitmentContext) debugUpdatesValueDigest(maxSamples int) (count uint64, digest string, samples []string) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.updates == nil {
+		return 0, "", nil
+	}
+	if maxSamples < 0 {
+		maxSamples = 0
+	}
+
+	keys := sdc.updates.DebugPlainKeys()
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
+
+	h := sha256.New()
+	writeLen := func(n int) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(n))
+		_, _ = h.Write(b[:])
+	}
+	appendSample := func(s string) {
+		if len(samples) < maxSamples {
+			samples = append(samples, s)
+		}
+	}
+
+	for _, key := range keys {
+		count++
+
+		domain := kv.AccountsDomain
+		if len(key) > 20 {
+			domain = kv.StorageDomain
+		}
+		val, step, readErr := sdc.mainTtx.readDomain(domain, key)
+		if domain == kv.AccountsDomain {
+			// If account read is empty, attempt code domain as a debug fallback.
+			codeVal, codeStep, codeErr := sdc.mainTtx.readDomain(kv.CodeDomain, key)
+			if codeErr == nil && len(codeVal) > 0 {
+				domain = kv.CodeDomain
+				val = codeVal
+				step = codeStep
+				readErr = nil
+			}
+		}
+
+		writeLen(len(key))
+		_, _ = h.Write(key)
+		domainName := domain.String()
+		writeLen(len(domainName))
+		_, _ = h.Write([]byte(domainName))
+
+		var stepBuf [8]byte
+		binary.BigEndian.PutUint64(stepBuf[:], uint64(step))
+		_, _ = h.Write(stepBuf[:])
+
+		if readErr != nil {
+			errText := readErr.Error()
+			writeLen(len(errText))
+			_, _ = h.Write([]byte(errText))
+			appendSample(fmt.Sprintf("key=%x domain=%s step=%d err=%s", key, domainName, step, errText))
+			continue
+		}
+
+		writeLen(len(val))
+		_, _ = h.Write(val)
+		appendSample(fmt.Sprintf(
+			"key=%x domain=%s step=%d val_len=%d val=%s",
+			key,
+			domainName,
+			step,
+			len(val),
+			commitmentHexPreview(val, 24),
+		))
+	}
+
+	return count, fmt.Sprintf("%x", h.Sum(nil)), samples
+}
 
 func (sdc *SharedDomainsCommitmentContext) SetTrace(enable bool) {
 	sdc.trace = enable
@@ -145,6 +237,111 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 	defer func(s time.Time) { mxCommitmentTook.ObserveDuration(s) }(time.Now())
 
 	updateCount := sdc.updates.Size()
+	if debugBadRootCommitmentProbe && blockNum >= 33 {
+		var (
+			hasTrieCtx            bool
+			ctxTxNum              uint64
+			ctxLimitReadAsOfTxNum uint64
+			ctxWithHistory        bool
+			probeDomain           string
+			probeKeyHex           string
+			probeValLen           int
+			probeValPreview       string
+			probeStep             kv.Step
+			probeReadErr          error
+			probeAsOfOK           bool
+			probeAsOfLen          int
+			probeAsOfPreview      string
+			probeAsOfErr          error
+			probeLatestLen        int
+			probeLatestPreview    string
+			probeLatestStep       kv.Step
+			probeLatestErr        error
+			updatesDigestCount    uint64
+			updatesDigest         string
+			updatesDigestSamples  []string
+			updatesValueCount     uint64
+			updatesValueDigest    string
+			updatesValueSamples   []string
+		)
+
+		ctxTxNum, ctxLimitReadAsOfTxNum, ctxWithHistory, hasTrieCtx = sdc.DebugReadContext()
+		updatesDigestCount, updatesDigest, updatesDigestSamples = sdc.updates.DebugDigest(64)
+		updatesValueCount, updatesValueDigest, updatesValueSamples = sdc.debugUpdatesValueDigest(64)
+		if hasTrieCtx {
+			accountKey, storageKey := probePlainKeys(sdc.updates.DebugPlainKeys())
+			targetDomain := kv.AccountsDomain
+			var targetKey []byte
+			targetChosen := false
+			switch {
+			case len(debugBadRootProbeStorageKey) > 0:
+				targetDomain = kv.StorageDomain
+				targetKey = debugBadRootProbeStorageKey
+				targetChosen = true
+			case updateCount > 0 && len(storageKey) > 0:
+				targetDomain = kv.StorageDomain
+				targetKey = storageKey
+				targetChosen = true
+			case updateCount > 0 && len(accountKey) > 0:
+				targetDomain = kv.AccountsDomain
+				targetKey = accountKey
+				targetChosen = true
+			}
+			if targetChosen && len(targetKey) > 0 {
+				probeDomain = targetDomain.String()
+				probeKeyHex = hex.EncodeToString(targetKey)
+				probeVal, step, readErr := sdc.mainTtx.readDomain(targetDomain, targetKey)
+				probeStep = step
+				probeReadErr = readErr
+				probeValLen = len(probeVal)
+				probeValPreview = commitmentHexPreview(probeVal, 32)
+				if sdc.mainTtx.roTtx != nil {
+					asOfVal, asOfOK, asOfErr := sdc.mainTtx.roTtx.GetAsOf(targetDomain, targetKey, txNum)
+					probeAsOfOK = asOfOK
+					probeAsOfErr = asOfErr
+					probeAsOfLen = len(asOfVal)
+					probeAsOfPreview = commitmentHexPreview(asOfVal, 32)
+
+					latestVal, latestStep, latestErr := sdc.mainTtx.roTtx.GetLatest(targetDomain, targetKey)
+					probeLatestErr = latestErr
+					probeLatestStep = latestStep
+					probeLatestLen = len(latestVal)
+					probeLatestPreview = commitmentHexPreview(latestVal, 32)
+				}
+			}
+		}
+
+		log.Warn("commitment compute context",
+			"block", blockNum,
+			"tx_num_arg", txNum,
+			"log_prefix", logPrefix,
+			"update_count", updateCount,
+			"ctx_has_trie", hasTrieCtx,
+			"ctx_txnum", ctxTxNum,
+			"ctx_limit_read_as_of_txnum", ctxLimitReadAsOfTxNum,
+			"ctx_with_history", ctxWithHistory,
+			"probe_domain", probeDomain,
+			"probe_key", probeKeyHex,
+			"probe_step", probeStep,
+			"probe_val_len", probeValLen,
+			"probe_val_preview", probeValPreview,
+			"probe_read_err", probeReadErr,
+			"probe_asof_ok", probeAsOfOK,
+			"probe_asof_len", probeAsOfLen,
+			"probe_asof_preview", probeAsOfPreview,
+			"probe_asof_err", probeAsOfErr,
+			"probe_latest_step", probeLatestStep,
+			"probe_latest_len", probeLatestLen,
+			"probe_latest_preview", probeLatestPreview,
+			"probe_latest_err", probeLatestErr,
+			"updates_digest_count", updatesDigestCount,
+			"updates_digest", updatesDigest,
+			"updates_digest_samples", updatesDigestSamples,
+			"updates_value_count", updatesValueCount,
+			"updates_value_digest", updatesValueDigest,
+			"updates_value_samples", updatesValueSamples,
+		)
+	}
 	if sdc.trace {
 		start := time.Now()
 		defer func() {
@@ -258,6 +455,118 @@ func (sdc *SharedDomainsCommitmentContext) DebugLastPlainKeys() [][]byte {
 		return v.([][]byte)
 	}
 	return nil
+}
+
+// DebugReadContext returns current trie read context details used by commitment reads.
+func (sdc *SharedDomainsCommitmentContext) DebugReadContext() (txNum uint64, limitReadAsOfTxNum uint64, withHistory bool, ok bool) {
+	if sdc == nil || sdc.mainTtx == nil {
+		return 0, 0, false, false
+	}
+	return sdc.mainTtx.txNum, sdc.mainTtx.limitReadAsOfTxNum, sdc.mainTtx.withHistory, true
+}
+
+// DebugCurrentRootHash returns the trie root for the current in-memory trie state.
+func (sdc *SharedDomainsCommitmentContext) DebugCurrentRootHash() ([]byte, error) {
+	if sdc == nil || sdc.patriciaTrie == nil {
+		return nil, errors.New("commitment context is not initialized")
+	}
+	return sdc.patriciaTrie.RootHash()
+}
+
+// RestoreLatestCommitmentState restores trie state from the latest encoded
+// commitment state available in the commitment domain (including in-memory writes).
+// Returns restored block/tx numbers when a state exists.
+func (sdc *SharedDomainsCommitmentContext) RestoreLatestCommitmentState() (blockNum uint64, txNum uint64, restored bool, err error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return 0, 0, false, errors.New("commitment context is not initialized")
+	}
+	state, _, err := sdc.mainTtx.Branch(KeyCommitmentState)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if len(state) == 0 {
+		return 0, 0, false, nil
+	}
+	blockNum, txNum, err = sdc.restorePatriciaState(state)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	return blockNum, txNum, true, nil
+}
+
+// RestoreLatestCommitmentStateFromTx restores trie state from the latest
+// commitment state available in the provided temporal tx (raw DB view, without
+// SharedDomains RAM overlay). Returns restored block/tx numbers and root hash.
+func (sdc *SharedDomainsCommitmentContext) RestoreLatestCommitmentStateFromTx(tx kv.TemporalTx) (blockNum uint64, txNum uint64, rootHash []byte, restored bool, err error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return 0, 0, nil, false, errors.New("commitment context is not initialized")
+	}
+	if tx == nil {
+		return 0, 0, nil, false, errors.New("restore commitment state: temporal tx is nil")
+	}
+	state, _, err := tx.GetLatest(kv.CommitmentDomain, KeyCommitmentState)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	if len(state) == 0 {
+		return 0, 0, nil, false, nil
+	}
+	blockNum, txNum, err = sdc.restorePatriciaState(state)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	rootHash, err = sdc.patriciaTrie.RootHash()
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	return blockNum, txNum, rootHash, true, nil
+}
+
+// DebugStateRootFromEncoded decodes a persisted commitment state payload and returns
+// the corresponding trie root, restoring the previous in-memory trie state afterward.
+func (sdc *SharedDomainsCommitmentContext) DebugStateRootFromEncoded(value []byte) (blockNum uint64, txNum uint64, rootHash []byte, err error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return 0, 0, nil, errors.New("commitment context is not initialized")
+	}
+
+	prevJustRestored := sdc.justRestored.Load()
+	prevState, err := sdc.encodeCommitmentState(0, sdc.mainTtx.txNum)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+
+	defer func() {
+		_, _, restoreErr := sdc.restorePatriciaState(prevState)
+		sdc.justRestored.Store(prevJustRestored)
+		if err == nil && restoreErr != nil {
+			err = fmt.Errorf("restore previous trie state: %w", restoreErr)
+		}
+	}()
+
+	blockNum, txNum, err = sdc.restorePatriciaState(value)
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	rootHash, err = sdc.patriciaTrie.RootHash()
+	if err != nil {
+		return 0, 0, nil, err
+	}
+	return blockNum, txNum, rootHash, nil
+}
+
+func probePlainKeys(plainKeys [][]byte) (accountKey []byte, storageKey []byte) {
+	for _, key := range plainKeys {
+		if len(key) == 20 && len(accountKey) == 0 {
+			accountKey = append([]byte(nil), key...)
+		}
+		if len(key) > 20 && len(storageKey) == 0 {
+			storageKey = append([]byte(nil), key...)
+		}
+		if len(accountKey) > 0 && len(storageKey) > 0 {
+			break
+		}
+	}
+	return accountKey, storageKey
 }
 
 // by that key stored latest root hash and tree state

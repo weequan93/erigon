@@ -132,21 +132,21 @@ type IntraBlockState struct {
 // Create a new state from a given trie
 func New(stateReader StateReader) *IntraBlockState {
 	return &IntraBlockState{
-		stateReader:       stateReader,
-		stateObjects:      map[common.Address]*stateObject{},
-		stateObjectsDirty: map[common.Address]struct{}{},
-		nilAccounts:       map[common.Address]struct{}{},
-		deletedAccounts:   map[common.Address]struct{}{},
+		stateReader:            stateReader,
+		stateObjects:           map[common.Address]*stateObject{},
+		stateObjectsDirty:      map[common.Address]struct{}{},
+		nilAccounts:            map[common.Address]struct{}{},
+		deletedAccounts:        map[common.Address]struct{}{},
 		selfdestructedAccounts: map[common.Address]struct{}{},
-		logs:              []types.Logs{},
-		journal:           newJournal(),
-		accessList:        newAccessList(),
-		transientStorage:  newTransientStorage(),
-		balanceInc:        map[common.Address]*BalanceIncrease{},
-		escrowTouched:     map[common.Address]struct{}{},
-		txIndex:           0,
-		trace:             false,
-		dep:               -1,
+		logs:                   []types.Logs{},
+		journal:                newJournal(),
+		accessList:             newAccessList(),
+		transientStorage:       newTransientStorage(),
+		balanceInc:             map[common.Address]*BalanceIncrease{},
+		escrowTouched:          map[common.Address]struct{}{},
+		txIndex:                0,
+		trace:                  false,
+		dep:                    -1,
 		arbExtraData: &ArbitrumExtraData{
 			unexpectedBalanceDelta: uint256.NewInt(0),
 			userWasms:              UserWasms{},
@@ -1584,10 +1584,41 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 		emptyRemoval = false
 	}
 	// If this account originated from a missing read (nilAccount) and is still empty, allow removal.
+	fromNilAccount := false
 	if stateObject.db != nil && stateObject.empty() && !isZombie && !keepEmpty {
 		if _, fromNil := stateObject.db.nilAccounts[addr]; fromNil {
+			fromNilAccount = true
 			emptyRemoval = true
 		}
+	}
+	if shouldTraceApplyAccount(addr) {
+		blockNum := uint64(0)
+		txIndex := 0
+		version := 0
+		if stateObject.db != nil {
+			blockNum = stateObject.db.blockNum
+			txIndex = stateObject.db.txIndex
+			version = stateObject.db.version
+		}
+		log.Warn("state updateAccount decision",
+			"block", blockNum,
+			"tx_index", txIndex,
+			"version", version,
+			"addr", addr.Hex(),
+			"dirty", isDirty,
+			"zombie", isZombie,
+			"keep_empty", keepEmpty,
+			"from_nil_account", fromNilAccount,
+			"empty", stateObject.empty(),
+			"empty_removal", emptyRemoval,
+			"selfdestructed", stateObject.selfdestructed,
+			"newly_created", stateObject.newlyCreated,
+			"created_contract", stateObject.createdContract,
+			"escrow", isEscrow,
+			"nonce", stateObject.data.Nonce,
+			"balance", stateObject.data.Balance.String(),
+			"code_hash", stateObject.data.CodeHash.Hex(),
+		)
 	}
 	if traceAccount(addr) {
 		blockNum := uint64(0)
@@ -1906,6 +1937,20 @@ func (sdb *IntraBlockState) EscrowTouchedSnapshot() map[common.Address]struct{} 
 		out[addr] = struct{}{}
 	}
 	return out
+}
+
+// DebugDirtySummary returns internal counters that help diagnose whether tx changes
+// are captured in journal/state-object dirty sets before write-set materialization.
+func (sdb *IntraBlockState) DebugDirtySummary(addr common.Address) (journalEntries int, journalDirties int, journalDirtyForAddr int, stateObjects int, stateObjectsDirty int, balanceIncreases int, hasStateObject bool, stateObjectDirty bool) {
+	journalEntries = len(sdb.journal.entries)
+	journalDirties = len(sdb.journal.dirties)
+	journalDirtyForAddr = sdb.journal.dirties[addr]
+	stateObjects = len(sdb.stateObjects)
+	stateObjectsDirty = len(sdb.stateObjectsDirty)
+	balanceIncreases = len(sdb.balanceInc)
+	_, hasStateObject = sdb.stateObjects[addr]
+	_, stateObjectDirty = sdb.stateObjectsDirty[addr]
+	return
 }
 
 // RestoreEscrowTouched seeds the escrow-touched set from a snapshot.

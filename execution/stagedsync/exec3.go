@@ -19,7 +19,9 @@ package stagedsync
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"runtime"
@@ -246,6 +248,10 @@ func ExecV3(ctx context.Context,
 
 	chainReader := NewChainReaderImpl(cfg.chainConfig, applyTx, blockReader, logger)
 	agg := cfg.db.(dbstate.HasAgg).Agg().(*dbstate.Aggregator)
+	if ERIGON_STOP_AT_BLOCK > 0 && maxBlockNum > ERIGON_STOP_AT_BLOCK {
+		logger.Warn("Execution stop block enabled", "stop_block", ERIGON_STOP_AT_BLOCK, "max_block", maxBlockNum)
+		maxBlockNum = ERIGON_STOP_AT_BLOCK
+	}
 	if !inMemExec && !isMining {
 		if initialCycle {
 			agg.SetCollateAndBuildWorkers(min(2, estimate.StateV3Collate.Workers()))
@@ -461,6 +467,11 @@ func ExecV3(ctx context.Context,
 
 Loop:
 	for ; blockNum <= maxBlockNum; blockNum++ {
+		if ERIGON_STOP_AT_BLOCK > 0 && blockNum > ERIGON_STOP_AT_BLOCK {
+			errExhausted = &ErrLoopExhausted{From: startBlockNum, To: blockNum - 1, Reason: "stop block reached"}
+			logger.Warn("Execution stop block reached", "stop_block", ERIGON_STOP_AT_BLOCK, "last_block", blockNum-1)
+			break
+		}
 		shouldGenerateChangesets := shouldGenerateChangeSets(cfg, blockNum, maxBlockNum, initialCycle)
 		changeSet := &changeset2.StateChangeSet{}
 		if shouldGenerateChangesets && blockNum > 0 {
@@ -588,7 +599,10 @@ Loop:
 				txTask.Config = cfg.genesis.Config
 			}
 
-			if txTask.TxNum <= txNumInDB && txTask.TxNum > 0 && !cfg.blockProduction {
+			// When resuming from the middle of a block, we must replay the skipped prefix
+			// in history mode. If we short-circuit by txNum here, we can end up executing
+			// only the final synthetic task, which diverges state/receipts.
+			if offsetFromBlockBeginning == 0 && txTask.TxNum <= txNumInDB && txTask.TxNum > 0 && !cfg.blockProduction {
 				inputTxNum++
 				skipPostEvaluation = true
 				continue
@@ -611,6 +625,33 @@ Loop:
 			txTasks = append(txTasks, txTask)
 			stageProgress = blockNum
 			inputTxNum++
+		}
+		if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+			plan := make([]string, 0, len(txTasks))
+			for _, task := range txTasks {
+				if task == nil {
+					continue
+				}
+				taskKind := "real"
+				if task.TxIndex < 0 {
+					taskKind = "pre"
+				} else if task.TxIndex >= len(txs) {
+					taskKind = "final"
+				}
+				txHash := "nil"
+				if task.Tx != nil {
+					txHash = task.Tx.Hash().Hex()
+				}
+				plan = append(plan, fmt.Sprintf("%s[idx=%d txnum=%d hist=%t tx=%s]", taskKind, task.TxIndex, task.TxNum, task.HistoryExecution, txHash))
+			}
+			logger.Warn("exec3: block task plan",
+				"block", blockNum,
+				"txs", len(txs),
+				"tasks", len(txTasks),
+				"input_txnum_after_plan", inputTxNum,
+				"domains_txnum_after_plan", executor.domains().TxNum(),
+				"plan", strings.Join(plan, " "),
+			)
 		}
 
 		// check for consecutive RIP-7560 sequence
@@ -686,7 +727,206 @@ Loop:
 			} else {
 				executor.domains().GetCommitmentContext().Trie().SetTrace(false)
 			}
-			rh, err := executor.domains().ComputeCommitment(ctx, true, blockNum, inputTxNum, execStage.LogPrefix())
+			commitTxNum := inputTxNum
+			if commitTxNum > 0 {
+				// Fallback: anchor at last emitted task txnum.
+				commitTxNum--
+			}
+			realTxCount := 0
+			realTxMin := uint64(0)
+			realTxMax := uint64(0)
+			for _, task := range txTasks {
+				if task == nil || task.TxIndex < 0 || task.TxIndex >= len(txs) {
+					continue
+				}
+				if realTxCount == 0 {
+					realTxMin = task.TxNum
+					realTxMax = task.TxNum
+				} else {
+					if task.TxNum < realTxMin {
+						realTxMin = task.TxNum
+					}
+					if task.TxNum > realTxMax {
+						realTxMax = task.TxNum
+					}
+				}
+				realTxCount++
+			}
+			if realTxCount > 0 {
+				// Commitment must use the last real tx in the block, not synthetic
+				// pre/final tasks (tx_index=-1 / tx_index=len(txs)).
+				commitTxNum = realTxMax
+			}
+			commitmentCtx := executor.domains().GetCommitmentContext()
+			restoredState := false
+			restoredStateBlock := uint64(0)
+			restoredStateTxNum := uint64(0)
+			restoredStateRoot := common.Hash{}
+			if commitmentCtx != nil {
+				if temporalTx, ok := executor.tx().(kv.TemporalTx); ok {
+					restoredBlock, restoredTxNum, restoredRoot, restored, restoreErr := commitmentCtx.RestoreLatestCommitmentStateFromTx(temporalTx)
+					if restoreErr != nil {
+						return fmt.Errorf("restore latest commitment state from tx: %w", restoreErr)
+					}
+					restoredState = restored
+					restoredStateBlock = restoredBlock
+					restoredStateTxNum = restoredTxNum
+					if len(restoredRoot) > 0 {
+						restoredStateRoot = common.BytesToHash(restoredRoot)
+					}
+				} else {
+					restoredBlock, restoredTxNum, restored, restoreErr := commitmentCtx.RestoreLatestCommitmentState()
+					if restoreErr != nil {
+						return fmt.Errorf("restore latest commitment state: %w", restoreErr)
+					}
+					restoredState = restored
+					restoredStateBlock = restoredBlock
+					restoredStateTxNum = restoredTxNum
+				}
+			}
+			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+				logger.Warn("exec3: per-block commitment txnum",
+					"block", blockNum,
+					"input_txnum", inputTxNum,
+					"commit_txnum", commitTxNum,
+					"domains_txnum", executor.domains().TxNum(),
+					"real_tx_count", realTxCount,
+					"real_tx_min", realTxMin,
+					"real_tx_max", realTxMax,
+					"state_restored", restoredState,
+					"state_restored_block", restoredStateBlock,
+					"state_restored_txnum", restoredStateTxNum,
+					"state_restored_root", restoredStateRoot,
+				)
+			}
+			domsTxNumBefore := executor.domains().TxNum()
+			ctxTxNumBefore := uint64(0)
+			ctxLimitReadAsOfTxNum := uint64(0)
+			ctxWithHistory := false
+			ctxReadable := false
+			if commitmentCtx != nil {
+				ctxTxNumBefore, ctxLimitReadAsOfTxNum, ctxWithHistory, ctxReadable = commitmentCtx.DebugReadContext()
+			}
+			ctxAdjusted := false
+			if ctxReadable && commitmentCtx != nil && ctxTxNumBefore != commitTxNum {
+				commitmentCtx.SetTxNum(commitTxNum)
+				ctxAdjusted = true
+			}
+			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+				logger.Warn("exec3: commitment ctx align",
+					"block", blockNum,
+					"commit_txnum", commitTxNum,
+					"ctx_readable", ctxReadable,
+					"ctx_txnum_before", ctxTxNumBefore,
+					"ctx_limit_read_as_of_txnum", ctxLimitReadAsOfTxNum,
+					"ctx_with_history", ctxWithHistory,
+					"ctx_adjusted", ctxAdjusted,
+					"domains_txnum_before", domsTxNumBefore,
+				)
+			}
+			domsAdjusted := false
+			if domsTxNumBefore != commitTxNum {
+				executor.domains().SetTxNum(commitTxNum)
+				domsAdjusted = true
+			}
+			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+				logger.Warn("exec3: commitment domains align",
+					"block", blockNum,
+					"commit_txnum", commitTxNum,
+					"domains_txnum_before", domsTxNumBefore,
+					"domains_adjusted", domsAdjusted,
+					"domains_txnum_after", executor.domains().TxNum(),
+				)
+			}
+			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 && commitmentCtx != nil {
+				ctxTxBeforeProbe := ctxTxNumBefore
+				if !ctxReadable {
+					if txNum, _, _, ok := commitmentCtx.DebugReadContext(); ok {
+						ctxTxBeforeProbe = txNum
+					}
+				}
+				probeFrom := uint64(0)
+				if commitTxNum > 3 {
+					probeFrom = commitTxNum - 3
+				}
+				for probeTx := probeFrom; probeTx <= commitTxNum; probeTx++ {
+					commitmentCtx.SetTxNum(probeTx)
+					probeRoot, probeErr := commitmentCtx.DebugRootHash(ctx, execStage.LogPrefix())
+					if probeErr != nil {
+						logger.Warn("exec3: commitment txnum probe",
+							"block", blockNum,
+							"probe_txnum", probeTx,
+							"err", probeErr,
+						)
+						continue
+					}
+					logger.Warn("exec3: commitment txnum probe",
+						"block", blockNum,
+						"probe_txnum", probeTx,
+						"root", common.BytesToHash(probeRoot),
+					)
+				}
+				// Re-restore state after debug probes. DebugRootHash is intended to be
+				// non-mutating, but in practice this keeps the live trie anchored to the
+				// latest persisted commitment snapshot before the real per-block compute.
+				if temporalTx, ok := executor.tx().(kv.TemporalTx); ok {
+					restoreBlock, restoreTxNum, restoreRoot, restoreOK, restoreErr := commitmentCtx.RestoreLatestCommitmentStateFromTx(temporalTx)
+					if restoreErr != nil {
+						return fmt.Errorf("restore commitment state after probe: %w", restoreErr)
+					}
+					logger.Warn("exec3: commitment txnum probe state restore",
+						"block", blockNum,
+						"restored", restoreOK,
+						"restored_block", restoreBlock,
+						"restored_txnum", restoreTxNum,
+						"restored_root", common.BytesToHash(restoreRoot),
+					)
+				}
+				// Keep commitment context aligned with the block commitment tx.
+				// The original context tx is restored later after ComputeCommitment.
+				commitmentCtx.SetTxNum(commitTxNum)
+				logger.Warn("exec3: commitment txnum probe restore",
+					"block", blockNum,
+					"ctx_txnum_before_probe", ctxTxBeforeProbe,
+					"ctx_txnum_for_compute", commitTxNum,
+				)
+			}
+			rh, err := executor.domains().ComputeCommitment(ctx, true, blockNum, commitTxNum, execStage.LogPrefix())
+			if domsAdjusted {
+				executor.domains().SetTxNum(domsTxNumBefore)
+				if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+					logger.Warn("exec3: commitment domains restore",
+						"block", blockNum,
+						"commit_txnum", commitTxNum,
+						"domains_txnum_restored", domsTxNumBefore,
+					)
+				}
+			}
+			if ctxAdjusted && commitmentCtx != nil {
+				commitmentCtx.SetTxNum(ctxTxNumBefore)
+				if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+					logger.Warn("exec3: commitment ctx restore",
+						"block", blockNum,
+						"commit_txnum", commitTxNum,
+						"ctx_txnum_restored", ctxTxNumBefore,
+					)
+				}
+			}
+			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
+				headerRoot := common.Hash{}
+				if b != nil && b.HeaderNoCopy() != nil {
+					headerRoot = b.HeaderNoCopy().Root
+				}
+				logger.Warn("exec3: per-block commitment result",
+					"block", blockNum,
+					"commit_txnum", commitTxNum,
+					"domains_txnum", executor.domains().TxNum(),
+					"computed_root", common.BytesToHash(rh),
+					"header_root", headerRoot,
+					"matches_header", len(rh) > 0 && common.BytesToHash(rh) == headerRoot,
+				)
+				logCommitmentAnchorProbe("per_block_after_compute", blockNum, executor.domains(), executor.tx(), rh, logger)
+			}
 			if err != nil {
 				return err
 			}
@@ -860,11 +1100,14 @@ Loop:
 }
 
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
+var ERIGON_STOP_AT_BLOCK = dbg.EnvUint("ERIGON_STOP_AT_BLOCK", 0)
 var ERIGON_BAD_ROOT_DEBUG = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var ERIGON_BAD_ROOT_DUMP_STATE = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_STATE", false)
 var ERIGON_BAD_ROOT_ACCOUNTS = dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil)
 var ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
 var ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS_MAX = dbg.EnvInt("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS_MAX", 200)
+var ERIGON_BAD_ROOT_STORAGE_DIFF_TIMELINE_MAX = dbg.EnvInt("ERIGON_BAD_ROOT_STORAGE_DIFF_TIMELINE_MAX", 10)
+var ERIGON_BAD_ROOT_PROBE_STORAGE_KEY = dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", "")
 var ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT", false)
 var ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT", false)
 
@@ -982,9 +1225,69 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 			logger.Warn("Bad state root account read failed", "block", header.Number.Uint64(), "address", addr, "err", err)
 			continue
 		}
-		storageRoot, storageItems, storageErr := computeStorageRootFromDomain(temporalTx, addr, txNum)
+		storageRoot, storageItems, storageDigest, storageErr := computeStorageRootFromDomainWithDigest(temporalTx, addr, txNum)
 		if storageErr != nil {
 			logger.Warn("Bad state root storage root read failed", "block", header.Number.Uint64(), "address", addr, "tx_num", txNum, "err", storageErr)
+		}
+		latestRoot, latestItems, latestDigest, latestErr := computeStorageRootFromSharedLatestWithDigest(doms, temporalTx, addr)
+		if latestErr != nil {
+			logger.Warn("Bad state root storage latest root read failed", "block", header.Number.Uint64(), "address", addr, "tx_num", txNum, "err", latestErr)
+		}
+		if storageErr == nil && latestErr == nil {
+			rootMatch := storageRoot == latestRoot
+			itemsMatch := storageItems == latestItems
+			digestMatch := storageDigest == latestDigest
+			logger.Warn("Bad state root storage root compare",
+				"block", header.Number.Uint64(),
+				"address", addr,
+				"tx_num", txNum,
+				"asof_root", storageRoot,
+				"asof_items", storageItems,
+				"asof_digest", storageDigest,
+				"latest_root", latestRoot,
+				"latest_items", latestItems,
+				"latest_digest", latestDigest,
+				"root_match", rootMatch,
+				"items_match", itemsMatch,
+				"digest_match", digestMatch,
+			)
+			if !rootMatch || !itemsMatch || !digestMatch {
+				asOfBySlot, asOfErr := collectStorageAsOfBySlot(temporalTx, addr, txNum)
+				latestBySlot, latestMapErr := collectStorageLatestBySlot(doms, temporalTx, addr)
+				if asOfErr != nil || latestMapErr != nil {
+					logger.Warn("Bad state root storage slot diff unavailable",
+						"block", header.Number.Uint64(),
+						"address", addr,
+						"tx_num", txNum,
+						"asof_err", asOfErr,
+						"latest_err", latestMapErr,
+					)
+				} else {
+					onlyAsOf, onlyLatest, valueMismatch, samples := storageDiffSamples(asOfBySlot, latestBySlot, 10)
+					logger.Warn("Bad state root storage slot diff summary",
+						"block", header.Number.Uint64(),
+						"address", addr,
+						"tx_num", txNum,
+						"asof_slots", len(asOfBySlot),
+						"latest_slots", len(latestBySlot),
+						"only_asof", onlyAsOf,
+						"only_latest", onlyLatest,
+						"value_mismatch", valueMismatch,
+						"sample_count", len(samples),
+					)
+					for i, sample := range samples {
+						logger.Warn("Bad state root storage slot diff sample",
+							"block", header.Number.Uint64(),
+							"address", addr,
+							"tx_num", txNum,
+							"idx", i,
+							"sample", sample,
+						)
+					}
+					diffSlots := storageDiffSlots(asOfBySlot, latestBySlot, ERIGON_BAD_ROOT_STORAGE_DIFF_TIMELINE_MAX)
+					logStorageDiffTxTimeline("account_dump", header.Number.Uint64(), temporalTx, doms, addr, txNum, diffSlots, logger)
+				}
+			}
 		}
 		if len(val) == 0 {
 			logger.Warn("Bad state root account missing",
@@ -994,6 +1297,7 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 				"tx_num", txNum,
 				"storage_root", storageRoot,
 				"storage_items", storageItems,
+				"storage_digest", storageDigest,
 			)
 			continue
 		}
@@ -1014,40 +1318,310 @@ func logBadRootAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.Share
 			"tx_num", txNum,
 			"storage_root", storageRoot,
 			"storage_items", storageItems,
+			"storage_digest", storageDigest,
 		)
 	}
 }
 
-func computeStorageRootFromDomain(ttx kv.TemporalTx, addr common.Address, txNum uint64) (common.Hash, int, error) {
+func computeStorageRootFromDomainWithDigest(ttx kv.TemporalTx, addr common.Address, txNum uint64) (common.Hash, int, string, error) {
 	to, ok := kv.NextSubtree(addr[:])
 	if !ok {
 		to = nil
 	}
 	it, err := ttx.RangeAsOf(kv.StorageDomain, addr[:], to, txNum, order.Asc, kv.Unlim)
 	if err != nil {
-		return common.Hash{}, 0, err
+		return common.Hash{}, 0, "", err
 	}
 	defer it.Close()
 
 	tr := etrie.New(common.Hash{})
+	digest := sha256.New()
 	items := 0
 	for it.HasNext() {
 		k, v, err := it.Next()
 		if err != nil {
-			return common.Hash{}, items, err
+			return common.Hash{}, items, "", err
 		}
 		if len(v) == 0 {
 			continue
 		}
 		if len(k) < 20 {
-			return common.Hash{}, items, fmt.Errorf("short storage key: %d bytes", len(k))
+			return common.Hash{}, items, "", fmt.Errorf("short storage key: %d bytes", len(k))
 		}
 		slot := k[20:]
 		slotHash, _ := common.HashData(slot)
 		tr.Update(slotHash.Bytes(), common.Copy(v))
+		var lenBuf [8]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(v)))
+		digest.Write(slotHash.Bytes())
+		digest.Write(lenBuf[:])
+		digest.Write(v)
 		items++
 	}
-	return tr.Hash(), items, nil
+	return tr.Hash(), items, hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func computeStorageRootFromDomain(ttx kv.TemporalTx, addr common.Address, txNum uint64) (common.Hash, int, error) {
+	root, items, _, err := computeStorageRootFromDomainWithDigest(ttx, addr, txNum)
+	return root, items, err
+}
+
+func computeStorageRootFromSharedLatestWithDigest(doms *dbstate.SharedDomains, tx kv.Tx, addr common.Address) (common.Hash, int, string, error) {
+	if doms == nil || tx == nil {
+		return common.Hash{}, 0, "", errors.New("missing domains or tx")
+	}
+	tr := etrie.New(common.Hash{})
+	digest := sha256.New()
+	items := 0
+	err := doms.IteratePrefix(kv.StorageDomain, addr.Bytes(), tx, func(k []byte, v []byte, step kv.Step) (bool, error) {
+		if len(v) == 0 {
+			return true, nil
+		}
+		if len(k) < 20 {
+			return false, fmt.Errorf("short storage key: %d bytes", len(k))
+		}
+		slot := k[20:]
+		slotHash, _ := common.HashData(slot)
+		tr.Update(slotHash.Bytes(), common.Copy(v))
+		var lenBuf [8]byte
+		binary.BigEndian.PutUint64(lenBuf[:], uint64(len(v)))
+		digest.Write(slotHash.Bytes())
+		digest.Write(lenBuf[:])
+		digest.Write(v)
+		items++
+		return true, nil
+	})
+	if err != nil {
+		return common.Hash{}, items, "", err
+	}
+	return tr.Hash(), items, hex.EncodeToString(digest.Sum(nil)), nil
+}
+
+func collectStorageAsOfBySlot(ttx kv.TemporalTx, addr common.Address, txNum uint64) (map[string][]byte, error) {
+	to, ok := kv.NextSubtree(addr[:])
+	if !ok {
+		to = nil
+	}
+	it, err := ttx.RangeAsOf(kv.StorageDomain, addr[:], to, txNum, order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+
+	entries := make(map[string][]byte)
+	for it.HasNext() {
+		k, v, err := it.Next()
+		if err != nil {
+			return nil, err
+		}
+		if len(v) == 0 || len(k) < 20 {
+			continue
+		}
+		slotHex := hex.EncodeToString(k[20:])
+		entries[slotHex] = common.Copy(v)
+	}
+	return entries, nil
+}
+
+func collectStorageLatestBySlot(doms *dbstate.SharedDomains, tx kv.Tx, addr common.Address) (map[string][]byte, error) {
+	if doms == nil || tx == nil {
+		return nil, errors.New("missing domains or tx")
+	}
+	entries := make(map[string][]byte)
+	err := doms.IteratePrefix(kv.StorageDomain, addr[:], tx, func(k []byte, v []byte, step kv.Step) (bool, error) {
+		if len(v) == 0 || len(k) < 20 {
+			return true, nil
+		}
+		slotHex := hex.EncodeToString(k[20:])
+		entries[slotHex] = common.Copy(v)
+		return true, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
+}
+
+func storageDiffSamples(asOf, latest map[string][]byte, max int) (onlyAsOf int, onlyLatest int, valueMismatch int, samples []string) {
+	if max <= 0 {
+		max = 5
+	}
+	asOfKeys := make([]string, 0, len(asOf))
+	for k := range asOf {
+		asOfKeys = append(asOfKeys, k)
+	}
+	sort.Strings(asOfKeys)
+	for _, slot := range asOfKeys {
+		asVal := asOf[slot]
+		latestVal, ok := latest[slot]
+		if !ok {
+			onlyAsOf++
+			if len(samples) < max {
+				samples = append(samples, fmt.Sprintf("only_asof slot=0x%s asof_val=0x%x", slot, asVal))
+			}
+			continue
+		}
+		if !bytes.Equal(asVal, latestVal) {
+			valueMismatch++
+			if len(samples) < max {
+				samples = append(samples, fmt.Sprintf("value_mismatch slot=0x%s asof_val=0x%x latest_val=0x%x", slot, asVal, latestVal))
+			}
+		}
+	}
+	latestKeys := make([]string, 0, len(latest))
+	for k := range latest {
+		latestKeys = append(latestKeys, k)
+	}
+	sort.Strings(latestKeys)
+	for _, slot := range latestKeys {
+		if _, ok := asOf[slot]; ok {
+			continue
+		}
+		onlyLatest++
+		if len(samples) < max {
+			samples = append(samples, fmt.Sprintf("only_latest slot=0x%s latest_val=0x%x", slot, latest[slot]))
+		}
+	}
+	return onlyAsOf, onlyLatest, valueMismatch, samples
+}
+
+func storageDiffSlots(asOf, latest map[string][]byte, max int) []string {
+	if max <= 0 {
+		max = 10
+	}
+	out := make([]string, 0, max)
+	appendSlot := func(slot string) {
+		if len(out) >= max {
+			return
+		}
+		out = append(out, slot)
+	}
+
+	asOfKeys := make([]string, 0, len(asOf))
+	for k := range asOf {
+		asOfKeys = append(asOfKeys, k)
+	}
+	sort.Strings(asOfKeys)
+	for _, slot := range asOfKeys {
+		asVal := asOf[slot]
+		latestVal, ok := latest[slot]
+		if !ok || !bytes.Equal(asVal, latestVal) {
+			appendSlot(slot)
+		}
+	}
+
+	if len(out) >= max {
+		return out
+	}
+
+	latestKeys := make([]string, 0, len(latest))
+	for k := range latest {
+		latestKeys = append(latestKeys, k)
+	}
+	sort.Strings(latestKeys)
+	for _, slot := range latestKeys {
+		if _, ok := asOf[slot]; ok {
+			continue
+		}
+		appendSlot(slot)
+		if len(out) >= max {
+			break
+		}
+	}
+
+	return out
+}
+
+func storageValuePreview(v []byte) string {
+	if len(v) == 0 {
+		return "0x"
+	}
+	if len(v) <= 16 {
+		return fmt.Sprintf("0x%x", v)
+	}
+	return fmt.Sprintf("0x%x...(+%d bytes)", v[:16], len(v)-16)
+}
+
+func logStorageDiffTxTimeline(source string, blockNum uint64, temporalTx kv.TemporalTx, doms *dbstate.SharedDomains, addr common.Address, txNum uint64, slots []string, logger log.Logger) {
+	if len(slots) == 0 || temporalTx == nil || doms == nil || logger == nil {
+		return
+	}
+	for idx, slotHex := range slots {
+		slot, err := hex.DecodeString(slotHex)
+		if err != nil {
+			logger.Warn("Bad state root storage slot timeline decode failed",
+				"source", source,
+				"block", blockNum,
+				"address", addr,
+				"slot", slotHex,
+				"err", err,
+			)
+			continue
+		}
+		key := make([]byte, 20+len(slot))
+		copy(key[:20], addr[:])
+		copy(key[20:], slot)
+
+		var (
+			asOfPrev    []byte
+			asOfPrevOk  bool
+			asOfPrevErr error
+			prevTxNum   uint64
+		)
+		if txNum > 0 {
+			prevTxNum = txNum - 1
+			asOfPrev, asOfPrevOk, asOfPrevErr = temporalTx.GetAsOf(kv.StorageDomain, key, prevTxNum)
+		}
+		asOfNow, asOfNowOk, asOfNowErr := temporalTx.GetAsOf(kv.StorageDomain, key, txNum)
+
+		nextTxNum := txNum
+		if txNum < ^uint64(0) {
+			nextTxNum = txNum + 1
+		}
+		asOfNext, asOfNextOk, asOfNextErr := temporalTx.GetAsOf(kv.StorageDomain, key, nextTxNum)
+
+		memLatest, memStep, memOK := doms.DebugGetLatestFromMem(kv.StorageDomain, key)
+		domsLatest, domsStep, domsErr := doms.GetLatest(kv.StorageDomain, temporalTx, key)
+		dbLatest, dbStep, dbErr := temporalTx.GetLatest(kv.StorageDomain, key)
+
+		logger.Warn("Bad state root storage slot timeline",
+			"source", source,
+			"block", blockNum,
+			"address", addr,
+			"tx_num", txNum,
+			"idx", idx,
+			"slot", "0x"+slotHex,
+			"asof_prev_tx", prevTxNum,
+			"asof_prev_ok", asOfPrevOk,
+			"asof_prev_err", asOfPrevErr,
+			"asof_prev_len", len(asOfPrev),
+			"asof_prev_preview", storageValuePreview(asOfPrev),
+			"asof_now_ok", asOfNowOk,
+			"asof_now_err", asOfNowErr,
+			"asof_now_len", len(asOfNow),
+			"asof_now_preview", storageValuePreview(asOfNow),
+			"asof_next_tx", nextTxNum,
+			"asof_next_ok", asOfNextOk,
+			"asof_next_err", asOfNextErr,
+			"asof_next_len", len(asOfNext),
+			"asof_next_preview", storageValuePreview(asOfNext),
+			"mem_latest_ok", memOK,
+			"mem_latest_step", memStep,
+			"mem_latest_len", len(memLatest),
+			"mem_latest_preview", storageValuePreview(memLatest),
+			"doms_latest_step", domsStep,
+			"doms_latest_err", domsErr,
+			"doms_latest_len", len(domsLatest),
+			"doms_latest_preview", storageValuePreview(domsLatest),
+			"db_latest_step", dbStep,
+			"db_latest_err", dbErr,
+			"db_latest_len", len(dbLatest),
+			"db_latest_preview", storageValuePreview(dbLatest),
+			"doms_vs_mem_match", bytes.Equal(domsLatest, memLatest),
+			"db_vs_mem_match", bytes.Equal(dbLatest, memLatest),
+			"doms_vs_db_match", bytes.Equal(domsLatest, dbLatest),
+		)
+	}
 }
 
 func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstate.SharedDomains, touchedPlainKeys [][]byte, logger log.Logger) {
@@ -1122,10 +1696,69 @@ func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstat
 			continue
 		}
 
-		root, items, err := computeStorageRootFromDomain(temporalTx, addr, txNum)
+		root, items, digest, err := computeStorageRootFromDomainWithDigest(temporalTx, addr, txNum)
 		if err != nil {
 			logger.Warn("Bad state root touched account storage root failed", "block", header.Number.Uint64(), "address", addr, "err", err)
 			continue
+		}
+		latestRoot, latestItems, latestDigest, latestErr := computeStorageRootFromSharedLatestWithDigest(doms, temporalTx, addr)
+		if latestErr != nil {
+			logger.Warn("Bad state root touched account latest storage root failed", "block", header.Number.Uint64(), "address", addr, "err", latestErr)
+		} else {
+			rootMatch := root == latestRoot
+			itemsMatch := items == latestItems
+			digestMatch := digest == latestDigest
+			logger.Warn("Bad state root touched account storage compare",
+				"block", header.Number.Uint64(),
+				"address", addr,
+				"tx_num", txNum,
+				"asof_root", root,
+				"asof_items", items,
+				"asof_digest", digest,
+				"latest_root", latestRoot,
+				"latest_items", latestItems,
+				"latest_digest", latestDigest,
+				"root_match", rootMatch,
+				"items_match", itemsMatch,
+				"digest_match", digestMatch,
+			)
+			if !rootMatch || !itemsMatch || !digestMatch {
+				asOfBySlot, asOfErr := collectStorageAsOfBySlot(temporalTx, addr, txNum)
+				latestBySlot, latestMapErr := collectStorageLatestBySlot(doms, temporalTx, addr)
+				if asOfErr != nil || latestMapErr != nil {
+					logger.Warn("Bad state root touched account storage diff unavailable",
+						"block", header.Number.Uint64(),
+						"address", addr,
+						"tx_num", txNum,
+						"asof_err", asOfErr,
+						"latest_err", latestMapErr,
+					)
+				} else {
+					onlyAsOf, onlyLatest, valueMismatch, samples := storageDiffSamples(asOfBySlot, latestBySlot, 10)
+					logger.Warn("Bad state root touched account storage diff summary",
+						"block", header.Number.Uint64(),
+						"address", addr,
+						"tx_num", txNum,
+						"asof_slots", len(asOfBySlot),
+						"latest_slots", len(latestBySlot),
+						"only_asof", onlyAsOf,
+						"only_latest", onlyLatest,
+						"value_mismatch", valueMismatch,
+						"sample_count", len(samples),
+					)
+					for i, sample := range samples {
+						logger.Warn("Bad state root touched account storage diff sample",
+							"block", header.Number.Uint64(),
+							"address", addr,
+							"tx_num", txNum,
+							"idx", i,
+							"sample", sample,
+						)
+					}
+					diffSlots := storageDiffSlots(asOfBySlot, latestBySlot, ERIGON_BAD_ROOT_STORAGE_DIFF_TIMELINE_MAX)
+					logStorageDiffTxTimeline("touched_accounts", header.Number.Uint64(), temporalTx, doms, addr, txNum, diffSlots, logger)
+				}
+			}
 		}
 
 		if len(val) == 0 {
@@ -1134,6 +1767,7 @@ func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstat
 				"address", addr,
 				"storage_root", root,
 				"storage_items", items,
+				"storage_digest", digest,
 				"step", step,
 			)
 			continue
@@ -1154,9 +1788,341 @@ func logBadRootTouchedAccounts(header *types.Header, applyTx kv.Tx, doms *dbstat
 			"account_root", acc.Root,
 			"root", root,
 			"storage_items", items,
+			"storage_digest", digest,
 			"step", step,
 		)
 	}
+}
+
+func logBadRootTxNumScan(ctx context.Context, header *types.Header, computedRootHash []byte, applyTx kv.Tx, doms *dbstate.SharedDomains, logPrefix string, logger log.Logger) {
+	if header == nil || applyTx == nil || doms == nil || logger == nil {
+		return
+	}
+	if header.Number == nil {
+		return
+	}
+	temporalTx, ok := applyTx.(kv.TemporalTx)
+	if !ok {
+		logger.Warn("Bad state root txnum scan skipped", "reason", "non-temporal tx")
+		return
+	}
+
+	blockNum := header.Number.Uint64()
+	domsTxNum := doms.TxNum()
+	expectedRoot := header.Root
+	computedRoot := common.BytesToHash(computedRootHash)
+
+	minTxNum, minErr := rawdbv3.TxNums.Min(temporalTx, blockNum)
+	maxTxNum, maxErr := rawdbv3.TxNums.Max(temporalTx, blockNum)
+	var parentMaxTxNum uint64
+	parentMaxSet := false
+	var parentErr error
+	if blockNum > 0 {
+		parentMaxTxNum, parentErr = rawdbv3.TxNums.Max(temporalTx, blockNum-1)
+		parentMaxSet = parentErr == nil
+	}
+
+	logger.Warn("Bad state root txnum context",
+		"block", blockNum,
+		"doms_txnum", domsTxNum,
+		"txnums_min", minTxNum,
+		"txnums_max", maxTxNum,
+		"txnums_min_err", minErr,
+		"txnums_max_err", maxErr,
+		"parent_max_txnum", parentMaxTxNum,
+		"parent_max_set", parentMaxSet,
+		"parent_max_err", parentErr,
+		"expected_root", expectedRoot,
+		"computed_root", computedRoot,
+	)
+
+	candidates := make(map[uint64]struct{}, 16)
+	addCandidate := func(txNum uint64) {
+		candidates[txNum] = struct{}{}
+	}
+
+	addCandidate(domsTxNum)
+	if minErr == nil {
+		addCandidate(minTxNum)
+	}
+	if maxErr == nil {
+		addCandidate(maxTxNum)
+	}
+	if parentMaxSet {
+		addCandidate(parentMaxTxNum)
+		if parentMaxTxNum < ^uint64(0) {
+			addCandidate(parentMaxTxNum + 1)
+		}
+	}
+	for delta := uint64(1); delta <= 4; delta++ {
+		if domsTxNum >= delta {
+			addCandidate(domsTxNum - delta)
+		}
+		addCandidate(domsTxNum + delta)
+	}
+
+	ordered := make([]uint64, 0, len(candidates))
+	for txNum := range candidates {
+		ordered = append(ordered, txNum)
+	}
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+
+	for _, txNum := range ordered {
+		root, err := doms.ComputeCommitment(ctx, true, blockNum, txNum, logPrefix)
+		if err != nil {
+			logger.Warn("Bad state root txnum scan",
+				"block", blockNum,
+				"tx_num", txNum,
+				"err", err,
+			)
+			continue
+		}
+		rootHash := common.BytesToHash(root)
+		inBlockRange := minErr == nil && maxErr == nil && txNum >= minTxNum && txNum <= maxTxNum
+		logger.Warn("Bad state root txnum scan",
+			"block", blockNum,
+			"tx_num", txNum,
+			"root", rootHash,
+			"matches_expected_header", rootHash == expectedRoot,
+			"matches_computed_root", rootHash == computedRoot,
+			"in_block_txnum_range", inBlockRange,
+			"is_parent_max", parentMaxSet && txNum == parentMaxTxNum,
+			"is_first_after_parent", parentMaxSet && txNum == parentMaxTxNum+1,
+			"is_doms_txnum", txNum == domsTxNum,
+		)
+	}
+}
+
+func logCommitmentAnchorProbe(phase string, blockNum uint64, doms *dbstate.SharedDomains, applyTx kv.Tx, computedRoot []byte, logger log.Logger) {
+	if !ERIGON_BAD_ROOT_DEBUG || blockNum < 33 {
+		return
+	}
+	if logger == nil || doms == nil || applyTx == nil {
+		return
+	}
+
+	temporalTx, ok := applyTx.(kv.TemporalTx)
+	if !ok {
+		logger.Warn("commitment anchor probe skipped", "phase", phase, "block", blockNum, "reason", "non-temporal tx")
+		return
+	}
+
+	stateVal, stateStep, err := temporalTx.GetLatest(kv.CommitmentDomain, commitmentdb.KeyCommitmentState)
+	if err != nil {
+		logger.Warn("commitment anchor probe read failed", "phase", phase, "block", blockNum, "err", err)
+		return
+	}
+
+	var stateTxNum uint64
+	var stateBlockNum uint64
+	stateDecoded := false
+	if len(stateVal) >= 16 {
+		stateTxNum = binary.BigEndian.Uint64(stateVal[:8])
+		stateBlockNum = binary.BigEndian.Uint64(stateVal[8:16])
+		stateDecoded = true
+	}
+
+	lastPlainKeys := 0
+	ctxHasTrie := false
+	ctxTxNum := uint64(0)
+	ctxLimitReadAsOfTxNum := uint64(0)
+	ctxWithHistory := false
+	liveTrieRoot := common.Hash{}
+	liveTrieRootErr := ""
+	encodedStateRoot := common.Hash{}
+	encodedStateRootErr := ""
+	encodedStateBlockNum := uint64(0)
+	encodedStateTxNum := uint64(0)
+	commitCtx := doms.GetCommitmentContext()
+	if commitCtx != nil {
+		lastPlainKeys = len(commitCtx.DebugLastPlainKeys())
+		ctxTxNum, ctxLimitReadAsOfTxNum, ctxWithHistory, ctxHasTrie = commitCtx.DebugReadContext()
+		if liveRoot, err := commitCtx.DebugCurrentRootHash(); err != nil {
+			liveTrieRootErr = err.Error()
+		} else if len(liveRoot) > 0 {
+			liveTrieRoot = common.BytesToHash(liveRoot)
+		}
+		if len(stateVal) > 0 {
+			stateBlock, stateTx, stateRoot, err := commitCtx.DebugStateRootFromEncoded(stateVal)
+			if err != nil {
+				encodedStateRootErr = err.Error()
+			} else {
+				encodedStateBlockNum = stateBlock
+				encodedStateTxNum = stateTx
+				if len(stateRoot) > 0 {
+					encodedStateRoot = common.BytesToHash(stateRoot)
+				}
+			}
+		}
+	}
+
+	probeStorageKey := strings.TrimSpace(ERIGON_BAD_ROOT_PROBE_STORAGE_KEY)
+	probeStorageKeyLen := 0
+	probeStorageStep := kv.Step(0)
+	probeStorageValLen := 0
+	probeStorageVal := common.Hash{}
+	probeStorageReadErr := ""
+	probeStorageAsOfStateOk := false
+	probeStorageAsOfStateLen := 0
+	probeStorageAsOfStateVal := common.Hash{}
+	probeStorageAsOfStateErr := ""
+	probeStorageAsOfDomsOk := false
+	probeStorageAsOfDomsLen := 0
+	probeStorageAsOfDomsVal := common.Hash{}
+	probeStorageAsOfDomsErr := ""
+	probeAccountAddr := ""
+	probeAccountStep := kv.Step(0)
+	probeAccountValLen := 0
+	probeAccountVal := common.Hash{}
+	probeAccountReadErr := ""
+	probeAccountAsOfStateOk := false
+	probeAccountAsOfStateLen := 0
+	probeAccountAsOfStateVal := common.Hash{}
+	probeAccountAsOfStateErr := ""
+	probeAccountAsOfDomsOk := false
+	probeAccountAsOfDomsLen := 0
+	probeAccountAsOfDomsVal := common.Hash{}
+	probeAccountAsOfDomsErr := ""
+	if probeStorageKey != "" {
+		plainStorageKey := common.FromHex(probeStorageKey)
+		probeStorageKeyLen = len(plainStorageKey)
+		if len(plainStorageKey) == 0 {
+			probeStorageReadErr = "invalid ERIGON_BAD_ROOT_PROBE_STORAGE_KEY"
+		} else {
+			val, step, readErr := doms.GetLatest(kv.StorageDomain, temporalTx, plainStorageKey)
+			if readErr != nil {
+				probeStorageReadErr = readErr.Error()
+			} else {
+				probeStorageStep = step
+				probeStorageValLen = len(val)
+				if len(val) > 0 {
+					probeStorageVal = common.BytesToHash(val)
+				}
+			}
+
+			if stateDecoded {
+				asOfState, ok, asOfErr := temporalTx.GetAsOf(kv.StorageDomain, plainStorageKey, stateTxNum)
+				probeStorageAsOfStateOk = ok
+				if asOfErr != nil {
+					probeStorageAsOfStateErr = asOfErr.Error()
+				} else if ok {
+					probeStorageAsOfStateLen = len(asOfState)
+					if len(asOfState) > 0 {
+						probeStorageAsOfStateVal = common.BytesToHash(asOfState)
+					}
+				}
+			}
+
+			asOfDoms, okDoms, asOfDomsErr := temporalTx.GetAsOf(kv.StorageDomain, plainStorageKey, doms.TxNum())
+			probeStorageAsOfDomsOk = okDoms
+			if asOfDomsErr != nil {
+				probeStorageAsOfDomsErr = asOfDomsErr.Error()
+			} else if okDoms {
+				probeStorageAsOfDomsLen = len(asOfDoms)
+				if len(asOfDoms) > 0 {
+					probeStorageAsOfDomsVal = common.BytesToHash(asOfDoms)
+				}
+			}
+
+			if len(plainStorageKey) >= 20 {
+				accountKey := plainStorageKey[:20]
+				probeAccountAddr = common.BytesToAddress(accountKey).Hex()
+
+				accountVal, accountStep, accountErr := doms.GetLatest(kv.AccountsDomain, temporalTx, accountKey)
+				if accountErr != nil {
+					probeAccountReadErr = accountErr.Error()
+				} else {
+					probeAccountStep = accountStep
+					probeAccountValLen = len(accountVal)
+					if len(accountVal) > 0 {
+						probeAccountVal = common.BytesToHash(accountVal)
+					}
+				}
+
+				if stateDecoded {
+					accountAsOfState, ok, accountAsOfStateErr := temporalTx.GetAsOf(kv.AccountsDomain, accountKey, stateTxNum)
+					probeAccountAsOfStateOk = ok
+					if accountAsOfStateErr != nil {
+						probeAccountAsOfStateErr = accountAsOfStateErr.Error()
+					} else if ok {
+						probeAccountAsOfStateLen = len(accountAsOfState)
+						if len(accountAsOfState) > 0 {
+							probeAccountAsOfStateVal = common.BytesToHash(accountAsOfState)
+						}
+					}
+				}
+
+				accountAsOfDoms, ok, accountAsOfDomsErr := temporalTx.GetAsOf(kv.AccountsDomain, accountKey, doms.TxNum())
+				probeAccountAsOfDomsOk = ok
+				if accountAsOfDomsErr != nil {
+					probeAccountAsOfDomsErr = accountAsOfDomsErr.Error()
+				} else if ok {
+					probeAccountAsOfDomsLen = len(accountAsOfDoms)
+					if len(accountAsOfDoms) > 0 {
+						probeAccountAsOfDomsVal = common.BytesToHash(accountAsOfDoms)
+					}
+				}
+			}
+		}
+	}
+
+	computed := common.Hash{}
+	if len(computedRoot) > 0 {
+		computed = common.BytesToHash(computedRoot)
+	}
+
+	logger.Warn("commitment anchor probe",
+		"phase", phase,
+		"block", blockNum,
+		"doms_block", doms.BlockNum(),
+		"doms_txnum", doms.TxNum(),
+		"state_val_len", len(stateVal),
+		"state_step", stateStep,
+		"state_decoded", stateDecoded,
+		"state_txnum", stateTxNum,
+		"state_block", stateBlockNum,
+		"last_plain_keys", lastPlainKeys,
+		"ctx_has_trie", ctxHasTrie,
+		"ctx_txnum", ctxTxNum,
+		"ctx_limit_read_as_of_txnum", ctxLimitReadAsOfTxNum,
+		"ctx_with_history", ctxWithHistory,
+		"live_trie_root", liveTrieRoot,
+		"live_trie_root_err", liveTrieRootErr,
+		"encoded_state_root", encodedStateRoot,
+		"encoded_state_root_err", encodedStateRootErr,
+		"encoded_state_block", encodedStateBlockNum,
+		"encoded_state_txnum", encodedStateTxNum,
+		"live_matches_encoded", liveTrieRoot == encodedStateRoot && liveTrieRootErr == "" && encodedStateRootErr == "",
+		"encoded_matches_computed", len(computedRoot) > 0 && encodedStateRoot == common.BytesToHash(computedRoot) && encodedStateRootErr == "",
+		"probe_storage_key", probeStorageKey,
+		"probe_storage_key_len", probeStorageKeyLen,
+		"probe_storage_step", probeStorageStep,
+		"probe_storage_val_len", probeStorageValLen,
+		"probe_storage_val", probeStorageVal,
+		"probe_storage_read_err", probeStorageReadErr,
+		"probe_storage_asof_state_ok", probeStorageAsOfStateOk,
+		"probe_storage_asof_state_len", probeStorageAsOfStateLen,
+		"probe_storage_asof_state_val", probeStorageAsOfStateVal,
+		"probe_storage_asof_state_err", probeStorageAsOfStateErr,
+		"probe_storage_asof_doms_ok", probeStorageAsOfDomsOk,
+		"probe_storage_asof_doms_len", probeStorageAsOfDomsLen,
+		"probe_storage_asof_doms_val", probeStorageAsOfDomsVal,
+		"probe_storage_asof_doms_err", probeStorageAsOfDomsErr,
+		"probe_account_addr", probeAccountAddr,
+		"probe_account_step", probeAccountStep,
+		"probe_account_val_len", probeAccountValLen,
+		"probe_account_val", probeAccountVal,
+		"probe_account_read_err", probeAccountReadErr,
+		"probe_account_asof_state_ok", probeAccountAsOfStateOk,
+		"probe_account_asof_state_len", probeAccountAsOfStateLen,
+		"probe_account_asof_state_val", probeAccountAsOfStateVal,
+		"probe_account_asof_state_err", probeAccountAsOfStateErr,
+		"probe_account_asof_doms_ok", probeAccountAsOfDomsOk,
+		"probe_account_asof_doms_len", probeAccountAsOfDomsLen,
+		"probe_account_asof_doms_val", probeAccountAsOfDomsVal,
+		"probe_account_asof_doms_err", probeAccountAsOfDomsErr,
+		"computed_root", computed,
+	)
 }
 
 func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHash []byte, applyTx kv.Tx, doms *dbstate.SharedDomains, touchedPlainKeys [][]byte, cfg ExecuteBlockCfg, e *StageState, maxBlockNum uint64, logger log.Logger) {
@@ -1198,6 +2164,9 @@ func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHa
 		"parent_beacon_root", header.ParentBeaconBlockRoot,
 		"requests_hash", header.RequestsHash,
 	)
+	if ERIGON_BAD_ROOT_DEBUG {
+		logBadRootTxNumScan(ctx, header, computedRootHash, applyTx, doms, e.LogPrefix(), logger)
+	}
 
 	if doms != nil {
 		logger.Warn("Bad state root progress",
@@ -1289,18 +2258,163 @@ func logBadRootDetails(ctx context.Context, header *types.Header, computedRootHa
 				)
 			}
 			if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
-				receipts, err := rawdb.ReadReceiptsCacheV2(temporalTx, b, rawdbv3.TxNums)
+				txNumReader := rawdbv3.TxNums
+				if cfg.blockReader != nil {
+					txNumReader = cfg.blockReader.TxnumReader(ctx)
+				}
+				txNumMin, minErr := txNumReader.Min(temporalTx, b.NumberU64())
+				txNumMax, maxErr := txNumReader.Max(temporalTx, b.NumberU64())
+				txNumCount := uint64(0)
+				if minErr == nil && maxErr == nil && txNumMax >= txNumMin {
+					txNumCount = txNumMax - txNumMin + 1
+				}
+				logger.Warn("Bad state root receipts txnum context",
+					"source", source,
+					"block", b.NumberU64(),
+					"txs", len(txs),
+					"txnum_min", txNumMin,
+					"txnum_max", txNumMax,
+					"txnum_count", txNumCount,
+					"txnum_min_err", minErr,
+					"txnum_max_err", maxErr,
+				)
+
+				receipts, err := rawdb.ReadReceiptsCacheV2(temporalTx, b, txNumReader)
 				if err != nil {
 					logger.Warn("Bad state root receipts read failed", "source", source, "err", err)
 				} else {
 					computedReceiptRoot := types.DeriveSha(receipts)
+					receiptRootMatch := computedReceiptRoot == header.ReceiptHash
 					logger.Warn("Bad state root receipts",
 						"source", source,
 						"receipts", len(receipts),
 						"receipt_root_header", header.ReceiptHash,
 						"receipt_root_computed", computedReceiptRoot,
-						"receipt_root_match", computedReceiptRoot == header.ReceiptHash,
+						"receipt_root_match", receiptRootMatch,
 					)
+					if (!receiptRootMatch || len(receipts) != len(txs)) && minErr == nil && maxErr == nil && txNumMax >= txNumMin {
+						maxProbe := len(txs)
+						if maxProbe > 8 {
+							maxProbe = 8
+						}
+						for i := 0; i < maxProbe; i++ {
+							tx := txs[i]
+							txNum := txNumMin + uint64(i)
+							if txNum > txNumMax {
+								logger.Warn("Bad state root receipt probe out-of-range",
+									"source", source,
+									"tx_index", i,
+									"tx_hash", tx.Hash(),
+									"txnum", txNum,
+									"txnum_max", txNumMax,
+								)
+								break
+							}
+							probeReceipt := func(label string, probeTxNum uint64) {
+								receipt, ok, probeErr := rawdb.ReadReceiptCacheV2(temporalTx, rawdb.RCacheV2Query{
+									BlockNum:      b.NumberU64(),
+									BlockHash:     b.Hash(),
+									TxnHash:       tx.Hash(),
+									TxNum:         probeTxNum,
+									DontCalcBloom: true,
+								})
+								if probeErr != nil {
+									logger.Warn("Bad state root receipt probe error",
+										"source", source,
+										"tx_index", i,
+										"tx_hash", tx.Hash(),
+										"probe", label,
+										"txnum", probeTxNum,
+										"err", probeErr,
+									)
+									return
+								}
+								if !ok || receipt == nil {
+									logger.Warn("Bad state root receipt probe miss",
+										"source", source,
+										"tx_index", i,
+										"tx_hash", tx.Hash(),
+										"probe", label,
+										"txnum", probeTxNum,
+									)
+									return
+								}
+								logger.Warn("Bad state root receipt probe hit",
+									"source", source,
+									"tx_index", i,
+									"tx_hash", tx.Hash(),
+									"probe", label,
+									"txnum", probeTxNum,
+									"receipt_tx_index", receipt.TransactionIndex,
+									"status", receipt.Status,
+									"gas_used", receipt.GasUsed,
+									"logs", len(receipt.Logs),
+									"receipt_block", receipt.BlockNumber,
+									"receipt_hash", receipt.BlockHash,
+								)
+							}
+
+							probeReceipt("exact", txNum)
+							if txNum > 0 {
+								probeReceipt("minus1", txNum-1)
+							}
+							probeReceipt("plus1", txNum+1)
+
+							// When txnum assignment drifts from the naive tx-index mapping,
+							// scan the entire txnum window for this tx hash to pinpoint placement.
+							scanUpper := txNumMax
+							if scanUpper > txNumMin+63 {
+								scanUpper = txNumMin + 63
+							}
+							scanHits := 0
+							for probeTxNum := txNumMin; probeTxNum <= scanUpper; probeTxNum++ {
+								receiptAtNum, okAtNum, errAtNum := rawdb.ReadReceiptCacheV2(temporalTx, rawdb.RCacheV2Query{
+									BlockNum:      b.NumberU64(),
+									BlockHash:     b.Hash(),
+									TxnHash:       tx.Hash(),
+									TxNum:         probeTxNum,
+									DontCalcBloom: true,
+								})
+								if errAtNum != nil {
+									logger.Warn("Bad state root receipt scan error",
+										"source", source,
+										"tx_index", i,
+										"tx_hash", tx.Hash(),
+										"txnum", probeTxNum,
+										"err", errAtNum,
+									)
+									continue
+								}
+								if !okAtNum || receiptAtNum == nil {
+									continue
+								}
+								scanHits++
+								logger.Warn("Bad state root receipt scan hit",
+									"source", source,
+									"tx_index", i,
+									"tx_hash", tx.Hash(),
+									"txnum", probeTxNum,
+									"receipt_tx_index", receiptAtNum.TransactionIndex,
+									"status", receiptAtNum.Status,
+									"gas_used", receiptAtNum.GasUsed,
+									"logs", len(receiptAtNum.Logs),
+									"receipt_block", receiptAtNum.BlockNumber,
+									"receipt_hash", receiptAtNum.BlockHash,
+								)
+							}
+							if scanHits == 0 {
+								logger.Warn("Bad state root receipt scan no hits",
+									"source", source,
+									"tx_index", i,
+									"tx_hash", tx.Hash(),
+									"scan_from", txNumMin,
+									"scan_to", scanUpper,
+									"txnum_min", txNumMin,
+									"txnum_max", txNumMax,
+								)
+							}
+						}
+					}
 				}
 			} else {
 				logger.Warn("Bad state root receipts skipped", "source", source, "reason", "non-temporal tx")
@@ -1428,6 +2542,16 @@ func handleIncorrectRootHashError(header *types.Header, applyTx kv.TemporalRwTx,
 	if !ok {
 		return false, fmt.Errorf("%w: requested=%d, minAllowed=%d", ErrTooDeepUnwind, unwindTo, allowedUnwindTo)
 	}
+	logger.Warn("Bad state root unwind decision",
+		"block", header.Number.Uint64(),
+		"stage_block", e.BlockNumber,
+		"target_block", maxBlockNum,
+		"min_block", minBlockNum,
+		"unwind_limit", unwindToLimit,
+		"jump", jump,
+		"requested_unwind_to", unwindTo,
+		"allowed_unwind_to", allowedUnwindTo,
+	)
 	logger.Warn("Unwinding due to incorrect root hash", "to", unwindTo)
 	if u != nil {
 		if err := u.UnwindTo(allowedUnwindTo, BadBlock(header.Hash(), ErrInvalidStateRootHash), applyTx); err != nil {
@@ -1474,17 +2598,45 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		}
 	}
 
+	// Do not restore commitment state here: per-block execution already computes
+	// and stores the current block commitment in this same in-flight context.
+	// Restoring from persisted DB state at flush-time can move the trie back to
+	// the previous block and make the final check compare against a stale root.
+
+	logCommitmentAnchorProbe("before_compute", header.Number.Uint64(), doms, applyTx, nil, logger)
+
 	computedRootHash, err := doms.ComputeCommitment(ctx, true, header.Number.Uint64(), doms.TxNum(), e.LogPrefix())
 	times.ComputeCommitment = time.Since(start)
 	if err != nil {
 		return false, times, fmt.Errorf("ParallelExecutionState.Apply: %w", err)
 	}
+	logCommitmentAnchorProbe("after_compute", header.Number.Uint64(), doms, applyTx, computedRootHash, logger)
 
 	if cfg.blockProduction {
 		header.Root = common.BytesToHash(computedRootHash)
 		return true, times, nil
 	}
 	if !bytes.Equal(computedRootHash, header.Root.Bytes()) {
+		minTxNum, minTxErr := rawdbv3.TxNums.Min(applyTx, header.Number.Uint64())
+		maxTxNum, maxTxErr := rawdbv3.TxNums.Max(applyTx, header.Number.Uint64())
+		logger.Warn("Bad state root mismatch checkpoint",
+			"block", header.Number.Uint64(),
+			"hash", header.Hash(),
+			"parent_hash", header.ParentHash,
+			"doms_block", doms.BlockNum(),
+			"doms_txnum", doms.TxNum(),
+			"txnums_min", minTxNum,
+			"txnums_max", maxTxNum,
+			"txnums_min_err", minTxErr,
+			"txnums_max_err", maxTxErr,
+			"stage_block", e.BlockNumber,
+			"target_block", maxBlockNum,
+			"parallel", parallel,
+			"in_mem_exec", inMemExec,
+			"bad_block_halt", cfg.badBlockHalt,
+			"workers", cfg.syncCfg.ExecWorkerCount,
+			"log_prefix", e.LogPrefix(),
+		)
 		logger.Warn(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", e.LogPrefix(), header.Number.Uint64(), computedRootHash, header.Root.Bytes(), header.Hash()))
 		if ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT && !inMemExec {
 			flushStart := time.Now()
@@ -1532,6 +2684,43 @@ func blockWithSenders(ctx context.Context, db kv.RoDB, tx kv.Tx, blockReader ser
 			"uncles", len(b.Uncles()),
 			"size", b.Size(),
 		)
+	}
+	if ERIGON_BAD_ROOT_DEBUG && (!mdbxMigrateDebugBlockSet || blockNum == mdbxMigrateDebugBlock) {
+		canonicalHash, canonErr := rawdb.ReadCanonicalHash(tx, blockNum)
+		if canonErr != nil {
+			log.Warn("Bad state root canonical hash read failed", "block", blockNum, "err", canonErr)
+		} else if canonicalHash == (common.Hash{}) {
+			log.Warn("Bad state root canonical hash missing", "block", blockNum, "reader_hash", b.Hash())
+		} else {
+			canonHeader := rawdb.ReadHeader(tx, canonicalHash, blockNum)
+			if canonHeader == nil {
+				log.Warn("Bad state root canonical header missing",
+					"block", blockNum,
+					"canonical_hash", canonicalHash,
+					"reader_hash", b.Hash(),
+				)
+			} else {
+				readerHeader := b.HeaderNoCopy()
+				log.Warn("Bad state root header source compare",
+					"block", blockNum,
+					"reader_hash", b.Hash(),
+					"reader_parent_hash", readerHeader.ParentHash,
+					"reader_state_root", readerHeader.Root,
+					"reader_tx_root", readerHeader.TxHash,
+					"reader_receipt_root", readerHeader.ReceiptHash,
+					"canonical_hash", canonicalHash,
+					"canonical_parent_hash", canonHeader.ParentHash,
+					"canonical_state_root", canonHeader.Root,
+					"canonical_tx_root", canonHeader.TxHash,
+					"canonical_receipt_root", canonHeader.ReceiptHash,
+					"hash_match", b.Hash() == canonicalHash,
+					"parent_hash_match", readerHeader.ParentHash == canonHeader.ParentHash,
+					"state_root_match", readerHeader.Root == canonHeader.Root,
+					"tx_root_match", readerHeader.TxHash == canonHeader.TxHash,
+					"receipt_root_match", readerHeader.ReceiptHash == canonHeader.ReceiptHash,
+				)
+			}
+		}
 	}
 	return b, err
 }

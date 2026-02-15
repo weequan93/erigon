@@ -1229,14 +1229,7 @@ type RCacheV2Query struct {
 	DontCalcBloom bool // avoid calculating bloom (can be bottleneck)
 }
 
-func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, bool, error) {
-	v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, query.TxNum+1 /*history storing value BEFORE-change*/)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		return nil, false, nil
-	}
+func decodeReceiptCacheV2Value(v []byte, query RCacheV2Query) (*types.Receipt, bool, error) {
 	if len(v) == 0 {
 		return nil, false, nil
 	}
@@ -1251,8 +1244,31 @@ func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, 
 	return res, true, nil
 }
 
+func ReadReceiptCacheV2(tx kv.TemporalTx, query RCacheV2Query) (*types.Receipt, bool, error) {
+	v, ok, err := tx.HistorySeek(kv.RCacheDomain, receiptCacheKey, query.TxNum+1 /*history storing value BEFORE-change*/)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	return decodeReceiptCacheV2Value(v, query)
+}
+
+// ReadReceiptCacheV2Latest reads the latest in-memory/domain view (not history as-of),
+// which includes unflushed SharedDomains writes in the current tx.
+func ReadReceiptCacheV2Latest(tx kv.TemporalGetter, query RCacheV2Query) (*types.Receipt, bool, error) {
+	v, _, err := tx.GetLatest(kv.RCacheDomain, receiptCacheKey)
+	if err != nil {
+		return nil, false, err
+	}
+	return decodeReceiptCacheV2Value(v, query)
+}
+
 var (
-	mdbxMigrateReceiptsDebug = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DEBUG", false) || os.Getenv("MDBX_MIGRATE_DEBUG") != ""
+	mdbxMigrateReceiptsDebug = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DEBUG", false) ||
+		dbg.EnvBool("MDBX_MIGRATE_DEBUG", false) ||
+		dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 	mdbxMigrateReceiptsDebugBlock, mdbxMigrateReceiptsDebugBlockSet = parseEnvUintRawdbWithFallback(
 		"ERIGON_MDBX_MIGRATE_DEBUG_BLOCK",
 		"MDBX_MIGRATE_DEBUG_BLOCK",

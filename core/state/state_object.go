@@ -329,7 +329,10 @@ func (so *stateObject) setState(key common.Hash, value uint256.Int) {
 // updateStotage writes cached storage modifications into the object's storage trie.
 func (so *stateObject) updateStotage(stateWriter StateWriter) error {
 	for key, value := range so.dirtyStorage {
-		if err := stateWriter.WriteAccountStorage(so.address, so.data.GetIncarnation(), key, so.blockOriginStorage[key], value); err != nil {
+		// WriteAccountStorage deduplicates by comparing original vs new value.
+		// Use the per-tx origin snapshot, not block origin, otherwise a key that
+		// changes in tx0 and is restored in tx1 can be incorrectly skipped in tx1.
+		if err := stateWriter.WriteAccountStorage(so.address, so.data.GetIncarnation(), key, so.originStorage[key], value); err != nil {
 			return err
 		}
 		so.originStorage[key] = value

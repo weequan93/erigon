@@ -43,9 +43,8 @@ import (
 )
 
 var execTxsDone = metrics.NewCounter(`exec_txs_done`)
-var mdbxMigrateReceiptsDebug = dbg.EnvBool("MDBX_MIGRATE_DEBUG", false)
-var mdbxMigrateReceiptsDebugBlockRaw = dbg.EnvString("MDBX_MIGRATE_DEBUG_BLOCK", "")
-var mdbxMigrateReceiptsDebugBlock = dbg.EnvUint("MDBX_MIGRATE_DEBUG_BLOCK", 0)
+var mdbxMigrateReceiptsDebug = receiptDebugEnabled()
+var mdbxMigrateReceiptsDebugBlockRaw, mdbxMigrateReceiptsDebugBlock = receiptDebugBlockEnv()
 var mdbxMigrateReceiptsDebugBlockSet = mdbxMigrateReceiptsDebugBlockRaw != ""
 var mdbxMigrateDebugWriteSet = os.Getenv("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET") != "" || os.Getenv("MDBX_MIGRATE_DEBUG_WRITESET") != ""
 var mdbxMigrateKeyTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEYTRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
@@ -60,9 +59,30 @@ var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
 var mdbxMigrateFixEmptyRoot = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FIX_EMPTY_ROOT", false)
 var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
 var keepEmptyAccountsList = loadKeepEmptyAccountsList()
+var keepEmptyAccountsDefaultAddrs = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS", false)
 var mdbxMigrateSweepTombstones = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES", false)
 var mdbxMigrateSweepTombstonesBlock = dbg.EnvUint("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_BLOCK", 0)
+var mdbxMigrateApplyTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_APPLYTRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var mdbxMigrateApplyTraceMinBlock = dbg.EnvUint("ERIGON_PATH_PROBE_MIN_BLOCK", 33)
+var mdbxMigrateApplyTraceTxIndex = dbg.EnvInt("ERIGON_PATH_PROBE_TX_INDEX", -1)
+var mdbxMigrateApplyTraceAccountProbe = common.HexToAddress(dbg.EnvString("ERIGON_ACCOUNT_PROBE_ADDR", "0xA4b000000000000000000073657175656e636572"))
+var mdbxMigrateApplyTraceStorageProbeAddr = common.HexToAddress(dbg.EnvString("ERIGON_PATH_PROBE_ADDR", "0xA4b05FffffFffFFFFfFFfffFfffFFfffFfFfFFFf"))
+var mdbxMigrateApplyTraceStorageProbeSlot = common.HexToHash(dbg.EnvString("ERIGON_PATH_PROBE_SLOT", "0x3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe623"))
 var repairTombstonesOnce sync.Once
+
+func receiptDebugEnabled() bool {
+	return dbg.EnvBool("ERIGON_MDBX_MIGRATE_DEBUG", false) ||
+		dbg.EnvBool("MDBX_MIGRATE_DEBUG", false) ||
+		dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+}
+
+func receiptDebugBlockEnv() (string, uint64) {
+	if raw := dbg.EnvString("ERIGON_MDBX_MIGRATE_DEBUG_BLOCK", ""); raw != "" {
+		return raw, dbg.EnvUint("ERIGON_MDBX_MIGRATE_DEBUG_BLOCK", 0)
+	}
+	raw := dbg.EnvString("MDBX_MIGRATE_DEBUG_BLOCK", "")
+	return raw, dbg.EnvUint("MDBX_MIGRATE_DEBUG_BLOCK", 0)
+}
 
 // Keep-empty accounts list is driven by explicit env config to match Nitro state.
 // Some chains have known empty accounts that must be preserved to match the source root.
@@ -71,6 +91,9 @@ var arbosKeepEmptyAccounts = map[common.Address]struct{}{
 	common.HexToAddress("0xe5052b97618c9ff3025bdece4d9a5e9e229b64b3"): {},
 	common.HexToAddress("0x8807ed26dbaae86b62d0b663d754ce66f9d373b8"): {},
 	common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93"): {},
+	common.HexToAddress("0xA4b000000000000000000073657175656e636572"): {},
+	common.HexToAddress("0xA4b00000000000000000000000000000000000F6"): {},
+	common.HexToAddress("0xA4b05FffffFffFFFFfFFfffFfffFFfffFfFfFFFf"): {},
 }
 
 func loadKeepEmptyAccountsList() map[common.Address]struct{} {
@@ -97,8 +120,10 @@ func loadKeepEmptyAccountsList() map[common.Address]struct{} {
 }
 
 func shouldKeepEmptyAccount(addr common.Address) bool {
-	if _, ok := arbosKeepEmptyAccounts[addr]; ok {
-		return true
+	if keepEmptyAccountsDefaultAddrs {
+		if _, ok := arbosKeepEmptyAccounts[addr]; ok {
+			return true
+		}
 	}
 	if !keepEmptyAccounts && len(keepEmptyAccountsList) == 0 {
 		return false
@@ -118,6 +143,52 @@ func shouldKeepEmptyAccountBytes(key []byte) bool {
 		return false
 	}
 	return shouldKeepEmptyAccount(common.BytesToAddress(key))
+}
+
+func shouldMdbxMigrateApplyTrace(txTask *TxTask) bool {
+	if !mdbxMigrateApplyTrace || txTask == nil || txTask.TxIndex < 0 {
+		return false
+	}
+	if txTask.BlockNum < mdbxMigrateApplyTraceMinBlock {
+		return false
+	}
+	if mdbxMigrateApplyTraceTxIndex >= 0 && txTask.TxIndex != mdbxMigrateApplyTraceTxIndex {
+		return false
+	}
+	return true
+}
+
+func shouldTraceApplyAccount(addr common.Address) bool {
+	return addr == mdbxMigrateApplyTraceAccountProbe || addr == mdbxMigrateApplyTraceStorageProbeAddr
+}
+
+func readApplyTraceAccount(domains *dbstate.SharedDomains, tx kv.TemporalTx, addr common.Address, out *accounts.Account) (exists bool, enc []byte, step kv.Step, err error) {
+	enc, step, err = domains.GetLatest(kv.AccountsDomain, tx, addr.Bytes())
+	if err != nil {
+		return false, nil, 0, err
+	}
+	if len(enc) == 0 || isAccountTombstone(enc) {
+		return false, enc, step, nil
+	}
+	if out != nil {
+		out.Reset()
+		if err := accounts.DeserialiseV3(out, enc); err != nil {
+			return false, enc, step, err
+		}
+	}
+	return true, enc, step, nil
+}
+
+func spuriousDragonEnabledForTask(txTask *TxTask) bool {
+	if txTask != nil && txTask.Rules != nil {
+		return txTask.Rules.IsSpuriousDragon
+	}
+	if txTask != nil && txTask.Config != nil && txTask.Config.IsArbitrum() {
+		// Arbitrum/Nitro applies Spurious Dragon semantics from genesis.
+		// Keep EIP-161 empty-account deletion enabled even if Rules is not propagated.
+		return true
+	}
+	return false
 }
 
 func hasPendingStorageWritesForAddr(txTask *TxTask, addrBytes []byte) bool {
@@ -312,6 +383,128 @@ func logMdbxMigrateAccountTrace(op string, txNum uint64, address common.Address,
 	log.Info("mdbx-migrate accounttrace", fields...)
 }
 
+func decodeAccountV3(enc []byte) (*accounts.Account, error) {
+	if len(enc) == 0 || isAccountTombstone(enc) {
+		return nil, nil
+	}
+	var acc accounts.Account
+	acc.Reset()
+	if err := accounts.DeserialiseV3(&acc, enc); err != nil {
+		return nil, err
+	}
+	out := acc
+	return &out, nil
+}
+
+func logApplyAccountDomainSnapshot(stage string, domains *dbstate.SharedDomains, tx kv.TemporalTx, txTask *TxTask, keyBytes []byte, writeVal []byte) {
+	if len(keyBytes) != length.Addr || txTask == nil {
+		return
+	}
+	addr := common.BytesToAddress(keyBytes)
+	if !shouldTraceApplyAccount(addr) {
+		return
+	}
+
+	op := "put"
+	if writeVal == nil {
+		op = "del"
+	}
+
+	prevEnc, prevStep, prevErr := domains.GetLatest(kv.AccountsDomain, tx, keyBytes)
+	var (
+		prevAcc       *accounts.Account
+		prevDecodeErr error
+	)
+	if prevErr == nil {
+		prevAcc, prevDecodeErr = decodeAccountV3(prevEnc)
+	}
+
+	var (
+		writeAcc       *accounts.Account
+		writeDecodeErr error
+	)
+	if writeVal != nil {
+		writeAcc, writeDecodeErr = decodeAccountV3(writeVal)
+	}
+
+	hasStoragePrefix := false
+	hasStoragePrefixErr := ""
+	if txWithCursor, ok := tx.(cursorTx); ok {
+		okPrefix, err := hasStorageForAddr(txWithCursor, keyBytes)
+		if err != nil {
+			hasStoragePrefixErr = err.Error()
+		} else {
+			hasStoragePrefix = okPrefix
+		}
+	} else {
+		hasStoragePrefixErr = "tx_has_no_cursor"
+	}
+
+	storageRoot := common.Hash{}
+	storageItems := 0
+	storageRootErr := ""
+	if tx != nil {
+		root, items, err := computeStorageRootFromLatest(domains, tx, addr)
+		if err != nil {
+			storageRootErr = err.Error()
+		} else {
+			storageRoot = root
+			storageItems = items
+		}
+	} else {
+		storageRootErr = "nil_tx"
+	}
+
+	fields := []interface{}{
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"tx_num", txTask.TxNum,
+		"stage", stage,
+		"op", op,
+		"addr", addr.Hex(),
+		"write_len", len(writeVal),
+		"write_tombstone", isAccountTombstone(writeVal),
+		"write_empty_encoding", isEmptyAccountEncoding(writeVal),
+		"write_decode_err", errToString(writeDecodeErr),
+		"pre_len", len(prevEnc),
+		"pre_tombstone", isAccountTombstone(prevEnc),
+		"pre_step", prevStep,
+		"pre_read_err", errToString(prevErr),
+		"pre_decode_err", errToString(prevDecodeErr),
+		"has_storage_prefix", hasStoragePrefix,
+		"has_storage_prefix_err", hasStoragePrefixErr,
+		"storage_items", storageItems,
+		"storage_root", storageRoot.Hex(),
+		"storage_root_err", storageRootErr,
+	}
+	if prevAcc != nil {
+		fields = append(fields,
+			"pre_nonce", prevAcc.Nonce,
+			"pre_balance", prevAcc.Balance.ToBig().String(),
+			"pre_code_hash", prevAcc.CodeHash.Hex(),
+			"pre_root", prevAcc.Root.Hex(),
+			"pre_empty", prevAcc.Nonce == 0 && prevAcc.Balance.IsZero() && prevAcc.IsEmptyCodeHash(),
+		)
+	}
+	if writeAcc != nil {
+		fields = append(fields,
+			"write_nonce", writeAcc.Nonce,
+			"write_balance", writeAcc.Balance.ToBig().String(),
+			"write_code_hash", writeAcc.CodeHash.Hex(),
+			"write_root", writeAcc.Root.Hex(),
+			"write_empty", writeAcc.Nonce == 0 && writeAcc.Balance.IsZero() && writeAcc.IsEmptyCodeHash(),
+		)
+	}
+	log.Warn("state apply account snapshot", fields...)
+}
+
+func errToString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
 func logMdbxMigrateAccountDrop(reason string, txTask *TxTask, address common.Address, val []byte) {
 	if !mdbxMigrateAccountTrace || !isMdbxMigrateTraceAccount(address) {
 		return
@@ -447,11 +640,40 @@ func (rs *ParallelExecutionState) CommitTxNum(sender *common.Address, txNum uint
 func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.SharedDomains) error {
 	var acc accounts.Account
 	var fixEmptyRootAddrs map[common.Address]struct{}
+	traceApply := shouldMdbxMigrateApplyTrace(txTask)
 	if mdbxMigrateFixEmptyRoot {
 		fixEmptyRootAddrs = make(map[common.Address]struct{})
 		for addr := range badRootAccountsSet {
 			fixEmptyRootAddrs[addr] = struct{}{}
 		}
+	}
+	if traceApply {
+		accountWrites := 0
+		codeWrites := 0
+		storageWrites := 0
+		if txTask.WriteLists != nil {
+			if list := txTask.WriteLists[kv.AccountsDomain.String()]; list != nil {
+				accountWrites = len(list.Keys)
+			}
+			if list := txTask.WriteLists[kv.CodeDomain.String()]; list != nil {
+				codeWrites = len(list.Keys)
+			}
+			if list := txTask.WriteLists[kv.StorageDomain.String()]; list != nil {
+				storageWrites = len(list.Keys)
+			}
+		}
+		log.Warn("state apply start",
+			"block", txTask.BlockNum,
+			"tx_index", txTask.TxIndex,
+			"tx_num", txTask.TxNum,
+			"account_writes", accountWrites,
+			"code_writes", codeWrites,
+			"storage_writes", storageWrites,
+			"balance_increase_count", len(txTask.BalanceIncreaseSet),
+			"account_probe", mdbxMigrateApplyTraceAccountProbe.Hex(),
+			"path_probe_addr", mdbxMigrateApplyTraceStorageProbeAddr.Hex(),
+			"path_probe_slot", mdbxMigrateApplyTraceStorageProbeSlot.Hex(),
+		)
 	}
 	deletePlainAccount := func(key []byte, force bool) {
 		if rwTx, ok := rs.tx.(kv.RwTx); ok {
@@ -561,6 +783,58 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 
 			for i, key := range list.Keys {
 				keyBytes := []byte(key)
+				if traceApply {
+					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+						addr := common.BytesToAddress(keyBytes)
+						if shouldTraceApplyAccount(addr) {
+							op := "put"
+							if list.Vals[i] == nil {
+								op = "del"
+							}
+							log.Warn("state apply account write-list op",
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"tx_num", txTask.TxNum,
+								"domain", domain.String(),
+								"op", op,
+								"addr", addr.Hex(),
+								"val_len", len(list.Vals[i]),
+								"is_tombstone", isAccountTombstone(list.Vals[i]),
+								"is_empty_encoding", isEmptyAccountEncoding(list.Vals[i]),
+							)
+						}
+					}
+					if domain == kv.StorageDomain && len(keyBytes) >= length.Addr+length.Hash {
+						addr := common.BytesToAddress(keyBytes[:length.Addr])
+						if addr == mdbxMigrateApplyTraceStorageProbeAddr {
+							slotBytes := keyBytes[length.Addr : length.Addr+length.Hash]
+							slotMatchesProbe := bytes.Equal(slotBytes, mdbxMigrateApplyTraceStorageProbeSlot.Bytes())
+							prevVal, prevStep, prevErr := domains.GetLatest(kv.StorageDomain, rs.tx, keyBytes)
+							op := "put"
+							if list.Vals[i] == nil {
+								op = "del"
+							}
+							prevMatchesWrite := prevErr == nil && bytes.Equal(prevVal, list.Vals[i])
+							log.Warn("state apply storage write-list op",
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"tx_num", txTask.TxNum,
+								"domain", domain.String(),
+								"op", op,
+								"addr", addr.Hex(),
+								"slot", fmt.Sprintf("0x%x", slotBytes),
+								"slot_matches_probe", slotMatchesProbe,
+								"prev_step", prevStep,
+								"prev_len", len(prevVal),
+								"prev_preview", hexPreviewBytes(prevVal, 64),
+								"prev_err", prevErr,
+								"prev_matches_write", prevMatchesWrite,
+								"val_len", len(list.Vals[i]),
+								"val_preview", hexPreviewBytes(list.Vals[i], 64),
+							)
+						}
+					}
+				}
 				if mdbxMigrateFixEmptyRoot {
 					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
 						fixEmptyRootAddrs[common.BytesToAddress(keyBytes)] = struct{}{}
@@ -695,7 +969,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 										"addr", addr.Hex(),
 									)
 								}
-							} else if txTask.Rules != nil && txTask.Rules.IsSpuriousDragon {
+							} else if spuriousDragonEnabledForTask(txTask) {
 								logMdbxMigrateAccountDrop("empty-encoding", txTask, addr, list.Vals[i])
 								if isBadRootAccount(addr) {
 									log.Warn("state account drop empty-encoding (bad root watch)",
@@ -707,36 +981,93 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 								}
 								list.Vals[i] = nil
 							}
-						} else if txTask.Rules != nil && txTask.Rules.IsSpuriousDragon {
+						} else if spuriousDragonEnabledForTask(txTask) {
 							list.Vals[i] = nil
 						}
 					}
 				}
 
+				if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+					logApplyAccountDomainSnapshot("pre-apply", domains, rs.tx, txTask, keyBytes, list.Vals[i])
+				}
+
 				if list.Vals[i] == nil {
+					traceDelete := false
+					traceDeleteAddr := common.Address{}
+					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+						traceDeleteAddr = common.BytesToAddress(keyBytes)
+						traceDelete = shouldTraceApplyAccount(traceDeleteAddr)
+					}
 					// Guard: avoid dropping accounts that still have storage (or pending storage writes).
 					// This preserves the correct storage root even when a delete/empty encoding shows up.
 					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+						keepEmpty := shouldKeepEmptyAccount(traceDeleteAddr)
 						// If we cannot check storage, keep the account to avoid dropping a storage-backed account.
 						hasStorage := true
+						hasStorageChecked := false
 						if rs.tx != nil {
 							var err error
+							hasStorageChecked = true
 							_, _, hasStorage, err = rs.tx.HasPrefix(kv.StorageDomain, keyBytes)
 							if err != nil {
 								return err
 							}
 						}
 						hasPendingStorage := hasPendingStorageWritesForAddr(txTask, keyBytes)
+						if traceDelete {
+							log.Warn("state apply account delete guard",
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"tx_num", txTask.TxNum,
+								"addr", traceDeleteAddr.Hex(),
+								"keep_empty", keepEmpty,
+								"has_storage_checked", hasStorageChecked,
+								"has_storage", hasStorage,
+								"has_pending_storage", hasPendingStorage,
+							)
+						}
 						if hasStorage || hasPendingStorage {
-							enc, _, err := domains.GetLatest(kv.AccountsDomain, rs.tx, keyBytes)
+							enc, encStep, err := domains.GetLatest(kv.AccountsDomain, rs.tx, keyBytes)
 							if err != nil {
 								return err
 							}
 							if len(enc) > 0 && !isAccountTombstone(enc) {
+								if traceDelete {
+									log.Warn("state apply account delete decision",
+										"block", txTask.BlockNum,
+										"tx_index", txTask.TxIndex,
+										"tx_num", txTask.TxNum,
+										"addr", traceDeleteAddr.Hex(),
+										"action", "keep-put",
+										"keep_empty", keepEmpty,
+										"has_storage", hasStorage,
+										"has_pending_storage", hasPendingStorage,
+										"enc_len", len(enc),
+										"enc_step", encStep,
+										"enc_tombstone", isAccountTombstone(enc),
+									)
+								}
 								if err := domains.DomainPut(kv.AccountsDomain, rs.tx, keyBytes, enc, txTask.TxNum, nil, 0); err != nil {
 									return err
 								}
+								logApplyAccountDomainSnapshot("post-keep-put", domains, rs.tx, txTask, keyBytes, enc)
 								continue
+							}
+							if traceDelete {
+								log.Warn("state apply account delete decision",
+									"block", txTask.BlockNum,
+									"tx_index", txTask.TxIndex,
+									"tx_num", txTask.TxNum,
+									"addr", traceDeleteAddr.Hex(),
+									"action", "keep-skip",
+									"reason", "storage-present-no-prior-encoding",
+									"keep_empty", keepEmpty,
+									"has_storage", hasStorage,
+									"has_pending_storage", hasPendingStorage,
+									"enc_len", len(enc),
+									"enc_step", encStep,
+									"enc_tombstone", isAccountTombstone(enc),
+								)
 							}
 							if isBadRootAccount(common.BytesToAddress(keyBytes)) {
 								log.Warn("state account skip delete due to storage but no prior encoding (bad root watch)",
@@ -746,6 +1077,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 									"addr", common.BytesToAddress(keyBytes).Hex(),
 								)
 							}
+							logApplyAccountDomainSnapshot("post-keep-skip", domains, rs.tx, txTask, keyBytes, nil)
 							continue
 						}
 					}
@@ -767,15 +1099,87 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 							)
 						}
 					}
+					if domain == kv.AccountsDomain && traceDelete {
+						log.Warn("state apply account delete decision",
+							"block", txTask.BlockNum,
+							"tx_index", txTask.TxIndex,
+							"tx_num", txTask.TxNum,
+							"addr", traceDeleteAddr.Hex(),
+							"action", "domain-del",
+						)
+					}
 					if err := domains.DomainDel(domain, rs.tx, keyBytes, txTask.TxNum, nil, 0); err != nil {
 						return err
 					}
 					if domain == kv.AccountsDomain {
 						deletePlainAccount(keyBytes, false)
+						logApplyAccountDomainSnapshot("post-del", domains, rs.tx, txTask, keyBytes, nil)
+						if traceDelete {
+							existsAfter, encAfter, stepAfter, err := readApplyTraceAccount(domains, rs.tx, traceDeleteAddr, nil)
+							if err != nil {
+								log.Warn("state apply account delete post-check failed",
+									"block", txTask.BlockNum,
+									"tx_index", txTask.TxIndex,
+									"tx_num", txTask.TxNum,
+									"addr", traceDeleteAddr.Hex(),
+									"err", err,
+								)
+							} else {
+								log.Warn("state apply account delete post-check",
+									"block", txTask.BlockNum,
+									"tx_index", txTask.TxIndex,
+									"tx_num", txTask.TxNum,
+									"addr", traceDeleteAddr.Hex(),
+									"exists_after", existsAfter,
+									"enc_after_len", len(encAfter),
+									"step_after", stepAfter,
+								)
+							}
+						}
 					}
 				} else {
 					if err := domains.DomainPut(domain, rs.tx, keyBytes, list.Vals[i], txTask.TxNum, nil, 0); err != nil {
 						return err
+					}
+					if traceApply && domain == kv.StorageDomain && len(keyBytes) >= length.Addr+length.Hash {
+						addr := common.BytesToAddress(keyBytes[:length.Addr])
+						if addr == mdbxMigrateApplyTraceStorageProbeAddr {
+							slotBytes := keyBytes[length.Addr : length.Addr+length.Hash]
+							slotMatchesProbe := bytes.Equal(slotBytes, mdbxMigrateApplyTraceStorageProbeSlot.Bytes())
+
+							domsVal, domsStep, domsErr := domains.GetLatest(kv.StorageDomain, rs.tx, keyBytes)
+							txVal, txStep, txErr := rs.tx.GetLatest(kv.StorageDomain, keyBytes)
+
+							domsMatchesWrite := domsErr == nil && bytes.Equal(domsVal, list.Vals[i])
+							txMatchesWrite := txErr == nil && bytes.Equal(txVal, list.Vals[i])
+							domsVsTxMatch := domsErr == nil && txErr == nil && bytes.Equal(domsVal, txVal)
+
+							log.Warn("state apply storage post-put check",
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"tx_num", txTask.TxNum,
+								"domain", domain.String(),
+								"addr", addr.Hex(),
+								"slot", fmt.Sprintf("0x%x", slotBytes),
+								"slot_matches_probe", slotMatchesProbe,
+								"write_len", len(list.Vals[i]),
+								"write_preview", hexPreviewBytes(list.Vals[i], 64),
+								"doms_len", len(domsVal),
+								"doms_step", domsStep,
+								"doms_preview", hexPreviewBytes(domsVal, 64),
+								"doms_err", domsErr,
+								"doms_matches_write", domsMatchesWrite,
+								"tx_len", len(txVal),
+								"tx_step", txStep,
+								"tx_preview", hexPreviewBytes(txVal, 64),
+								"tx_err", txErr,
+								"tx_matches_write", txMatchesWrite,
+								"doms_vs_tx_match", domsVsTxMatch,
+							)
+						}
+					}
+					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
+						logApplyAccountDomainSnapshot("post-put", domains, rs.tx, txTask, keyBytes, list.Vals[i])
 					}
 				}
 			}
@@ -787,7 +1191,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 		if mdbxMigrateFixEmptyRoot {
 			fixEmptyRootAddrs[addr] = struct{}{}
 		}
-		emptyRemoval := txTask.Rules.IsSpuriousDragon && !increase.IsEscrow
+		emptyRemoval := spuriousDragonEnabledForTask(txTask) && !increase.IsEscrow
 		if shouldKeepEmptyAccount(addr) {
 			emptyRemoval = false
 		}
@@ -802,12 +1206,43 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 				return err
 			}
 		}
+		if traceApply {
+			exists := len(enc0) > 0 && !isAccountTombstone(enc0)
+			log.Warn("state apply balance increase entry",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"addr", addr.Hex(),
+				"exists", exists,
+				"enc0_len", len(enc0),
+				"step0", step0,
+				"amount", increase.Amount.ToBig().String(),
+				"is_escrow", increase.IsEscrow,
+				"empty_removal", emptyRemoval,
+				"before_nonce", acc.Nonce,
+				"before_balance", acc.Balance.ToBig().String(),
+				"before_code_hash", acc.CodeHash.Hex(),
+				"before_root", acc.Root.Hex(),
+			)
+		}
 		var origAcc *accounts.Account
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(addr) {
 			orig := acc
 			origAcc = &orig
 		}
 		acc.Balance.Add(&acc.Balance, &increase.Amount)
+		if traceApply {
+			log.Warn("state apply balance increase after add",
+				"block", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"addr", addr.Hex(),
+				"after_nonce", acc.Nonce,
+				"after_balance", acc.Balance.ToBig().String(),
+				"after_code_hash", acc.CodeHash.Hex(),
+				"after_root", acc.Root.Hex(),
+			)
+		}
 		if origAcc != nil {
 			newAcc := acc
 			logMdbxMigrateAccountTrace("balance_increase", txTask.TxNum, addr, origAcc, &newAcc)
@@ -847,6 +1282,16 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			if err := domains.DomainDel(kv.AccountsDomain, rs.tx, addrBytes, txTask.TxNum, enc0, step0); err != nil {
 				return err
 			}
+			if traceApply {
+				log.Warn("state apply balance increase domain del",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"empty_removal", emptyRemoval,
+					"is_escrow", increase.IsEscrow,
+				)
+			}
 		} else {
 			enc1 := accounts.SerialiseV3(&acc)
 			if addr == common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93") {
@@ -860,6 +1305,78 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			}
 			if err := domains.DomainPut(kv.AccountsDomain, rs.tx, addrBytes, enc1, txTask.TxNum, enc0, step0); err != nil {
 				return err
+			}
+			if traceApply {
+				log.Warn("state apply balance increase domain put",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"enc1_len", len(enc1),
+					"nonce", acc.Nonce,
+					"balance", acc.Balance.ToBig().String(),
+					"root", acc.Root.Hex(),
+				)
+			}
+		}
+	}
+	if traceApply {
+		for _, addr := range []common.Address{mdbxMigrateApplyTraceAccountProbe, mdbxMigrateApplyTraceStorageProbeAddr} {
+			var finalAcc accounts.Account
+			exists, enc, step, err := readApplyTraceAccount(domains, rs.tx, addr, &finalAcc)
+			if err != nil {
+				log.Warn("state apply final account read failed",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"err", err,
+				)
+				continue
+			}
+			if !exists {
+				log.Warn("state apply final account missing",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"enc_len", len(enc),
+					"step", step,
+				)
+			} else {
+				log.Warn("state apply final account",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"enc_len", len(enc),
+					"step", step,
+					"nonce", finalAcc.Nonce,
+					"balance", finalAcc.Balance.ToBig().String(),
+					"code_hash", finalAcc.CodeHash.Hex(),
+					"root", finalAcc.Root.Hex(),
+				)
+			}
+			if addr == mdbxMigrateApplyTraceStorageProbeAddr {
+				storageRoot, items, err := computeStorageRootFromLatest(domains, rs.tx, addr)
+				if err != nil {
+					log.Warn("state apply final storage root read failed",
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"tx_num", txTask.TxNum,
+						"addr", addr.Hex(),
+						"err", err,
+					)
+				} else {
+					log.Warn("state apply final storage root",
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"tx_num", txTask.TxNum,
+						"addr", addr.Hex(),
+						"storage_items", items,
+						"storage_root", storageRoot.Hex(),
+					)
+				}
 			}
 		}
 	}
@@ -982,6 +1499,7 @@ func (rs *ParallelExecutionState) ApplyState(ctx context.Context, txTask *TxTask
 
 func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *dbstate.SharedDomains) error {
 	shouldLogReceipts := mdbxMigrateShouldLogReceipts(txTask.BlockNum)
+	traceApply := shouldMdbxMigrateApplyTrace(txTask)
 	for addr := range txTask.TraceFroms {
 		if err := domains.IndexAdd(kv.TracesFromIdx, addr[:], txTask.TxNum); err != nil {
 			return err
@@ -1028,6 +1546,17 @@ func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *db
 		if txTask.TxIndex >= 0 && txTask.TxIndex < len(txTask.BlockReceipts) {
 			receipt = txTask.BlockReceipts[txTask.TxIndex]
 		}
+		if traceApply {
+			log.Warn("state apply receipts trace",
+				"block_number", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+				"receipt_index_valid", receiptIndexValid,
+				"receipt_nil", receipt == nil,
+				"block_receipts_len", len(txTask.BlockReceipts),
+				"logs_len", len(txTask.Logs),
+			)
+		}
 		if shouldLogReceipts {
 			logsLen := 0
 			cumGasUsed := uint64(0)
@@ -1043,7 +1572,7 @@ func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *db
 				}
 				receiptTxIndex = receipt.TransactionIndex
 			}
-			log.Info("mdbx-migrate receipts cache write",
+			log.Warn("mdbx-migrate receipts cache write attempt",
 				"block_number", txTask.BlockNum,
 				"tx_index", txTask.TxIndex,
 				"tx_num", txTask.TxNum,
@@ -1058,6 +1587,83 @@ func (rs *ParallelExecutionState) ApplyLogsAndTraces(txTask *TxTask, domains *db
 		}
 		if err := rawdb.WriteReceiptCacheV2(domains.AsPutDel(rs.tx), receipt, txTask.TxNum); err != nil {
 			return err
+		}
+		if shouldLogReceipts {
+			log.Warn("mdbx-migrate receipts cache write done",
+				"block_number", txTask.BlockNum,
+				"tx_index", txTask.TxIndex,
+				"tx_num", txTask.TxNum,
+			)
+			if txTask.Tx != nil && txTask.TxIndex >= 0 {
+				query := rawdb.RCacheV2Query{
+					BlockNum:      txTask.BlockNum,
+					BlockHash:     txTask.BlockHash,
+					TxnHash:       txTask.Tx.Hash(),
+					TxNum:         txTask.TxNum,
+					DontCalcBloom: true,
+				}
+				readBackHist, readBackHistOK, readBackHistErr := rawdb.ReadReceiptCacheV2(rs.tx, query)
+				readBackLatest, readBackLatestOK, readBackLatestErr := rawdb.ReadReceiptCacheV2Latest(domains.AsGetter(rs.tx), query)
+				readBack := readBackHist
+				readBackOK := readBackHistOK
+				readBackErr := readBackHistErr
+				if !readBackOK && readBackLatestOK {
+					readBack = readBackLatest
+					readBackOK = true
+					readBackErr = nil
+				}
+				readBackLogs := 0
+				readBackStatus := uint64(0)
+				readBackGasUsed := uint64(0)
+				readBackTxIndex := uint(0)
+				if readBack != nil {
+					readBackLogs = len(readBack.Logs)
+					readBackStatus = readBack.Status
+					readBackGasUsed = readBack.GasUsed
+					readBackTxIndex = readBack.TransactionIndex
+				}
+				expectedStatus := uint64(0)
+				expectedGasUsed := uint64(0)
+				expectedLogs := 0
+				expectedTxIndex := uint(0)
+				if receipt != nil {
+					expectedStatus = receipt.Status
+					expectedGasUsed = receipt.GasUsed
+					expectedLogs = len(receipt.Logs)
+					expectedTxIndex = receipt.TransactionIndex
+				}
+				log.Warn("mdbx-migrate receipts cache write readback",
+					"block_number", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"tx_hash", txTask.Tx.Hash(),
+					"readback_ok", readBackOK,
+					"readback_err", readBackErr,
+					"history_readback_ok", readBackHistOK,
+					"history_readback_err", readBackHistErr,
+					"history_readback_nil", readBackHist == nil,
+					"latest_readback_ok", readBackLatestOK,
+					"latest_readback_err", readBackLatestErr,
+					"latest_readback_nil", readBackLatest == nil,
+					"expected_nil", receipt == nil,
+					"readback_nil", readBack == nil,
+					"expected_status", expectedStatus,
+					"readback_status", readBackStatus,
+					"expected_gas_used", expectedGasUsed,
+					"readback_gas_used", readBackGasUsed,
+					"expected_logs", expectedLogs,
+					"readback_logs", readBackLogs,
+					"expected_tx_index", expectedTxIndex,
+					"readback_tx_index", readBackTxIndex,
+				)
+			} else {
+				log.Warn("mdbx-migrate receipts cache write readback skipped",
+					"block_number", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"tx_nil", txTask.Tx == nil,
+				)
+			}
 		}
 	}
 
@@ -1101,7 +1707,7 @@ func NewStateWriterBufferedV3(rs *ParallelExecutionState, accumulator *shards.Ac
 	}
 }
 
-func (w *StateWriterBufferedV3) SetTxNum(ctx context.Context, txNum uint64) {
+func (w *StateWriterBufferedV3) SetTxNum(txNum uint64) {
 	w.txNum = txNum
 	w.rs.domains.SetTxNum(txNum)
 }
@@ -1162,6 +1768,33 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
+	if shouldTraceApplyAccount(address) {
+		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
+		_, keepListHit := keepEmptyAccountsList[address]
+		fields := []interface{}{
+			"tx_num", w.txNum,
+			"addr", address.Hex(),
+			"keep_empty", shouldKeepEmptyAccount(address),
+			"keep_empty_global", keepEmptyAccounts,
+			"keep_empty_default_addrs", keepEmptyAccountsDefaultAddrs,
+			"keep_empty_default_hit", keepDefaultHit,
+			"keep_empty_list_len", len(keepEmptyAccountsList),
+			"keep_empty_list_hit", keepListHit,
+		}
+		if original != nil {
+			fields = append(fields,
+				"orig_nonce", original.Nonce,
+				"orig_balance", original.Balance.ToBig().String(),
+				"orig_incarnation", original.Incarnation,
+				"orig_code_hash", original.CodeHash.Hex(),
+				"orig_root", original.Root.Hex(),
+				"orig_empty", original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash(),
+			)
+		} else {
+			fields = append(fields, "orig_nil", true)
+		}
+		log.Warn("state writer deleteAccount request", fields...)
+	}
 	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
 		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
@@ -1339,6 +1972,33 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
+	if shouldTraceApplyAccount(address) {
+		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
+		_, keepListHit := keepEmptyAccountsList[address]
+		fields := []interface{}{
+			"tx_num", w.txNum,
+			"addr", address.Hex(),
+			"keep_empty", shouldKeepEmptyAccount(address),
+			"keep_empty_global", keepEmptyAccounts,
+			"keep_empty_default_addrs", keepEmptyAccountsDefaultAddrs,
+			"keep_empty_default_hit", keepDefaultHit,
+			"keep_empty_list_len", len(keepEmptyAccountsList),
+			"keep_empty_list_hit", keepListHit,
+		}
+		if original != nil {
+			fields = append(fields,
+				"orig_nonce", original.Nonce,
+				"orig_balance", original.Balance.ToBig().String(),
+				"orig_incarnation", original.Incarnation,
+				"orig_code_hash", original.CodeHash.Hex(),
+				"orig_root", original.Root.Hex(),
+				"orig_empty", original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash(),
+			)
+		} else {
+			fields = append(fields, "orig_nil", true)
+		}
+		log.Warn("state writer deleteAccount request", fields...)
+	}
 	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
 		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {

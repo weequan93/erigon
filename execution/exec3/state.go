@@ -17,11 +17,13 @@
 package exec3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"sync"
 
+	"github.com/holiman/uint256"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/offchainlabs/nitro/arbos"
@@ -47,19 +49,320 @@ import (
 	"github.com/erigontech/erigon/execution/consensus"
 	"github.com/erigontech/erigon/execution/exec3/calltracer"
 	"github.com/erigontech/erigon/execution/types"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/turbo/services"
 	"github.com/erigontech/erigon/turbo/shards"
 )
 
 var (
-	arbTrace     bool
-	badRootDebug bool
+	arbTrace         bool
+	badRootDebug     bool
+	pathProbeAddr    = common.HexToAddress(dbg.EnvString("ERIGON_PATH_PROBE_ADDR", "0xA4b05FffffFffFFFFfFFfffFfffFFfffFfFfFFFf"))
+	accountProbeAddr = common.HexToAddress(dbg.EnvString("ERIGON_ACCOUNT_PROBE_ADDR", "0xA4b000000000000000000073657175656e636572"))
+	pathProbeSlot    = common.HexToHash(dbg.EnvString("ERIGON_PATH_PROBE_SLOT", "0x3c79da47f96b0f39664f73c0a1f350580be90742947dddfa21ba64d578dfe623"))
+	pathProbeMin     = dbg.EnvUint("ERIGON_PATH_PROBE_MIN_BLOCK", 33)
+	pathProbeTxi     = dbg.EnvInt("ERIGON_PATH_PROBE_TX_INDEX", -1)
 )
 
 func init() {
 	gethhook.RequireHookedGeth()
 	arbTrace = dbg.EnvBool("ARB_TRACE", false)
 	badRootDebug = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+}
+
+type pathProbeReader interface {
+	ReadAccountStorage(address common.Address, key common.Hash) (uint256.Int, bool, error)
+	ReadAccountDataForDebug(address common.Address) (*accounts.Account, error)
+}
+
+func shouldLogRuntimePathProbe(txTask *state.TxTask) bool {
+	if !badRootDebug || txTask == nil || txTask.Tx == nil || txTask.TxIndex < 0 || txTask.BlockNum < pathProbeMin {
+		return false
+	}
+	if pathProbeTxi >= 0 && txTask.TxIndex != pathProbeTxi {
+		return false
+	}
+	return true
+}
+
+func runtimeHexPreview(raw []byte, max int) string {
+	if len(raw) == 0 {
+		return "0x"
+	}
+	if max <= 0 || len(raw) <= max {
+		return fmt.Sprintf("0x%x", raw)
+	}
+	return fmt.Sprintf("0x%x...(+%d bytes)", raw[:max], len(raw)-max)
+}
+
+func runtimeDomainsTxNum(rs *state.ParallelExecutionState) uint64 {
+	if rs == nil || rs.Domains() == nil {
+		return 0
+	}
+	return rs.Domains().TxNum()
+}
+
+func logRuntimeTxBoundary(logger log.Logger, phase string, txTask *state.TxTask, reader state.ResettableStateReader, historyMode bool, domainsTxNum uint64) {
+	if logger == nil || !shouldLogRuntimePathProbe(txTask) {
+		return
+	}
+	logger.Warn(
+		"exec3: tx boundary",
+		"phase", phase,
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"history_execution", txTask.HistoryExecution,
+		"history_mode", historyMode,
+		"doms_txnum", domainsTxNum,
+		"reader", fmt.Sprintf("%T", reader),
+	)
+}
+
+func logRuntimePathProbe(logger log.Logger, phase string, txTask *state.TxTask, reader state.ResettableStateReader, _ *state.IntraBlockState, historyMode bool, domainsTxNum uint64) {
+	if logger == nil || !shouldLogRuntimePathProbe(txTask) {
+		return
+	}
+	probeReader, ok := reader.(pathProbeReader)
+	if !ok {
+		return
+	}
+
+	probeVal, probeOK, err := probeReader.ReadAccountStorage(pathProbeAddr, pathProbeSlot)
+	if err != nil {
+		logger.Warn(
+			"exec3: path probe read failed",
+			"phase", phase,
+			"block", txTask.BlockNum,
+			"txnum", txTask.TxNum,
+			"tx_index", txTask.TxIndex,
+			"tx_hash", txTask.Tx.Hash(),
+			"history_mode", historyMode,
+			"doms_txnum", domainsTxNum,
+			"reader", fmt.Sprintf("%T", reader),
+			"probe_addr", pathProbeAddr,
+			"probe_slot", pathProbeSlot,
+			"err", err,
+		)
+		return
+	}
+
+	probeValHex := "0x"
+	if probeOK {
+		probeValHex = fmt.Sprintf("0x%x", probeVal.Bytes())
+	}
+
+	logger.Warn(
+		"exec3: path probe",
+		"phase", phase,
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"history_mode", historyMode,
+		"doms_txnum", domainsTxNum,
+		"reader", fmt.Sprintf("%T", reader),
+		"probe_addr", pathProbeAddr,
+		"probe_slot", pathProbeSlot,
+		"probe_ok", probeOK,
+		"probe_val", probeValHex,
+	)
+
+	accountData, accErr := probeReader.ReadAccountDataForDebug(accountProbeAddr)
+	if accErr != nil {
+		logger.Warn(
+			"exec3: account probe read failed",
+			"phase", phase,
+			"block", txTask.BlockNum,
+			"txnum", txTask.TxNum,
+			"tx_index", txTask.TxIndex,
+			"tx_hash", txTask.Tx.Hash(),
+			"history_mode", historyMode,
+			"doms_txnum", domainsTxNum,
+			"reader", fmt.Sprintf("%T", reader),
+			"probe_addr", accountProbeAddr,
+			"err", accErr,
+		)
+		return
+	}
+
+	readerExists := accountData != nil
+	readerNonce := uint64(0)
+	readerBalance := "0"
+	readerInc := uint64(0)
+	readerCodeHash := "0x"
+	readerRoot := "0x"
+	if accountData != nil {
+		readerNonce = accountData.Nonce
+		readerBalance = accountData.Balance.ToBig().String()
+		readerInc = accountData.Incarnation
+		readerCodeHash = accountData.CodeHash.Hex()
+		readerRoot = accountData.Root.Hex()
+	}
+
+	logger.Warn(
+		"exec3: account probe",
+		"phase", phase,
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"history_mode", historyMode,
+		"doms_txnum", domainsTxNum,
+		"probe_addr", accountProbeAddr,
+		"reader_exists", readerExists,
+		"reader_nonce", readerNonce,
+		"reader_balance", readerBalance,
+		"reader_incarnation", readerInc,
+		"reader_code_hash", readerCodeHash,
+		"reader_root", readerRoot,
+	)
+}
+
+func logRuntimeBalanceIncreaseBoundary(logger log.Logger, phase string, txTask *state.TxTask, domainsTxNum uint64) {
+	if logger == nil || !shouldLogRuntimePathProbe(txTask) {
+		return
+	}
+	logger.Warn(
+		"exec3: balance increase boundary",
+		"phase", phase,
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"doms_txnum", domainsTxNum,
+		"count", len(txTask.BalanceIncreaseSet),
+	)
+	for addr, increase := range txTask.BalanceIncreaseSet {
+		logger.Warn(
+			"exec3: balance increase entry",
+			"phase", phase,
+			"block", txTask.BlockNum,
+			"txnum", txTask.TxNum,
+			"tx_index", txTask.TxIndex,
+			"tx_hash", txTask.Tx.Hash(),
+			"doms_txnum", domainsTxNum,
+			"addr", addr,
+			"amount", increase.Amount.ToBig().String(),
+			"is_escrow", increase.IsEscrow,
+		)
+	}
+}
+
+func logRuntimeWriteSetProbe(logger log.Logger, txTask *state.TxTask, domainsTxNum uint64) {
+	if logger == nil || !shouldLogRuntimePathProbe(txTask) {
+		return
+	}
+
+	accountProbeOps := 0
+	storageProbeOps := 0
+
+	accountList, hasAccountList := txTask.WriteLists[kv.AccountsDomain.String()]
+	if hasAccountList && accountList != nil {
+		for i, key := range accountList.Keys {
+			keyBytes := []byte(key)
+			if len(keyBytes) != len(accountProbeAddr) {
+				continue
+			}
+			if !bytes.Equal(keyBytes, accountProbeAddr.Bytes()) {
+				continue
+			}
+			val := accountList.Vals[i]
+			op := "put"
+			if val == nil {
+				op = "del"
+			}
+			logger.Warn(
+				"exec3: write-set account probe",
+				"block", txTask.BlockNum,
+				"txnum", txTask.TxNum,
+				"tx_index", txTask.TxIndex,
+				"tx_hash", txTask.Tx.Hash(),
+				"doms_txnum", domainsTxNum,
+				"op", op,
+				"addr", accountProbeAddr,
+				"val_len", len(val),
+			)
+			accountProbeOps++
+		}
+	}
+
+	storageList, hasStorageList := txTask.WriteLists[kv.StorageDomain.String()]
+	if hasStorageList && storageList != nil {
+		addrLen := len(pathProbeAddr)
+		slotLen := len(pathProbeSlot)
+		for i, key := range storageList.Keys {
+			keyBytes := []byte(key)
+			if len(keyBytes) < addrLen+slotLen {
+				continue
+			}
+			if !bytes.Equal(keyBytes[:addrLen], pathProbeAddr.Bytes()) {
+				continue
+			}
+			val := storageList.Vals[i]
+			op := "put"
+			if val == nil {
+				op = "del"
+			}
+			slotBytes := keyBytes[addrLen : addrLen+slotLen]
+			slotMatches := bytes.Equal(slotBytes, pathProbeSlot.Bytes())
+			logger.Warn(
+				"exec3: write-set storage probe",
+				"block", txTask.BlockNum,
+				"txnum", txTask.TxNum,
+				"tx_index", txTask.TxIndex,
+				"tx_hash", txTask.Tx.Hash(),
+				"doms_txnum", domainsTxNum,
+				"op", op,
+				"key_len", len(keyBytes),
+				"slot", fmt.Sprintf("0x%x", slotBytes),
+				"slot_matches_probe", slotMatches,
+				"val_len", len(val),
+				"val_preview", runtimeHexPreview(val, 64),
+			)
+			storageProbeOps++
+		}
+	}
+
+	logger.Warn(
+		"exec3: write-set probe summary",
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"doms_txnum", domainsTxNum,
+		"account_probe_ops", accountProbeOps,
+		"storage_probe_ops", storageProbeOps,
+		"write_lists", len(txTask.WriteLists),
+		"balance_increase_count", len(txTask.BalanceIncreaseSet),
+	)
+}
+
+func logRuntimeIbsSummary(logger log.Logger, phase string, txTask *state.TxTask, ibs *state.IntraBlockState, domainsTxNum uint64) {
+	if logger == nil || ibs == nil || !shouldLogRuntimePathProbe(txTask) {
+		return
+	}
+	journalEntries, journalDirties, journalDirtyForProbe, stateObjects, stateObjectsDirty, balanceIncreases, hasStateObject, stateObjectDirty :=
+		ibs.DebugDirtySummary(accountProbeAddr)
+	logger.Warn(
+		"exec3: ibs summary",
+		"phase", phase,
+		"block", txTask.BlockNum,
+		"txnum", txTask.TxNum,
+		"tx_index", txTask.TxIndex,
+		"tx_hash", txTask.Tx.Hash(),
+		"doms_txnum", domainsTxNum,
+		"journal_entries", journalEntries,
+		"journal_dirties", journalDirties,
+		"journal_dirty_for_probe", journalDirtyForProbe,
+		"state_objects", stateObjects,
+		"state_objects_dirty", stateObjectsDirty,
+		"balance_increases", balanceIncreases,
+		"probe_has_state_object", hasStateObject,
+		"probe_state_object_dirty", stateObjectDirty,
+		"probe_addr", accountProbeAddr,
+	)
 }
 
 var noop = state.NewNoopWriter()
@@ -73,7 +376,7 @@ type Worker struct {
 	blockReader services.FullBlockReader
 	in          *state.QueueWithRetry
 	rs          *state.ParallelExecutionState
-	stateWriter *state.Writer
+	stateWriter *state.StateWriterBufferedV3
 	stateReader state.ResettableStateReader
 	historyMode bool // if true - stateReader is HistoryReaderV3, otherwise it's state reader
 	chainConfig *chain.Config
@@ -143,7 +446,7 @@ func (rw *Worker) ResetState(rs *state.ParallelExecutionState, accumulator *shar
 	} else {
 		rw.SetReader(state.NewReaderV3(rs.TemporalGetter()))
 	}
-	rw.stateWriter = state.NewWriter(rs.TemporalPutDel(), accumulator, 0)
+	rw.stateWriter = state.NewStateWriterBufferedV3(rs, accumulator)
 }
 
 func (rw *Worker) SetGaspool(gp *core.GasPool) {
@@ -239,6 +542,7 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	}
 	txTask.Error = nil
 
+	logRuntimeTxBoundary(rw.logger, "before-set-txnum", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 	rw.stateReader.SetTxNum(txTask.TxNum)
 	rw.stateWriter.SetTxNum(txTask.TxNum)
 	rw.rs.Domains().SetTxNum(txTask.TxNum)
@@ -251,6 +555,8 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	ibs, hooks, cc := rw.ibs, rw.hooks, rw.chainConfig
 	rw.ibs.SetTrace(arbTrace)
 	ibs.SetHooks(hooks)
+	logRuntimeTxBoundary(rw.logger, "after-set-txnum", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+	logRuntimePathProbe(rw.logger, "after-set-txnum", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 
 	var err error
 	rules, header := txTask.Rules, txTask.Header
@@ -417,6 +723,9 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 		if hooks != nil && hooks.OnTxStart != nil {
 			hooks.OnTxStart(rw.evm.GetVMContext(), txn, msg.From())
 		}
+		logRuntimeTxBoundary(rw.logger, "before-apply", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+		logRuntimePathProbe(rw.logger, "before-apply", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+		logRuntimeIbsSummary(rw.logger, "before-apply", txTask, ibs, runtimeDomainsTxNum(rw.rs))
 		// MA applytx
 		applyRes, err := core.ApplyMessage(rw.evm, msg, rw.taskGasPool, true /* refunds */, false /* gasBailout */, rw.engine)
 		if err != nil {
@@ -437,6 +746,8 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			txTask.GasUsed = applyRes.GasUsed
 			// Update the state with pending changes
 			ibs.SoftFinalise()
+			logRuntimePathProbe(rw.logger, "after-soft-finalise", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+			logRuntimeIbsSummary(rw.logger, "after-soft-finalise", txTask, ibs, runtimeDomainsTxNum(rw.rs))
 			if badRootDebug {
 				root := ibs.IntermediateRoot(true)
 				log.Warn("exec3 intermediate root",
@@ -451,6 +762,8 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			txTask.TraceTos = rw.callTracer.Tos()
 
 			txTask.CreateReceipt(rw.Tx())
+			logRuntimePathProbe(rw.logger, "after-receipt", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+			logRuntimeTxBoundary(rw.logger, "after-receipt", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 			if hooks != nil && hooks.OnTxEnd != nil {
 				hooks.OnTxEnd(txTask.BlockReceipts[txTask.TxIndex], nil)
 			}
@@ -473,6 +786,7 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 	// Prepare read set, write set and balanceIncrease set and send for serialisation
 	if txTask.Error == nil {
 		txTask.BalanceIncreaseSet = ibs.BalanceIncreaseSet()
+		logRuntimeBalanceIncreaseBoundary(rw.logger, "after-capture", txTask, runtimeDomainsTxNum(rw.rs))
 		if snapshot := ibs.EscrowTouchedSnapshot(); len(snapshot) > 0 {
 			if rw.escrowTouched == nil {
 				rw.escrowTouched = make(map[common.Address]struct{}, len(snapshot))
@@ -486,12 +800,35 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 				fmt.Printf("BalanceIncreaseSet [%x]=>[%d]\n", addr, &(bal.Amount))
 			}
 		}
+		logRuntimeTxBoundary(rw.logger, "before-make-write-set", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+		logRuntimePathProbe(rw.logger, "before-make-write-set", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
+		logRuntimeIbsSummary(rw.logger, "before-make-write-set", txTask, ibs, runtimeDomainsTxNum(rw.rs))
 		if err = ibs.MakeWriteSet(rules, rw.stateWriter); err != nil {
 			panic(err)
 		}
 		txTask.ReadLists = rw.stateReader.ReadSet()
 		txTask.WriteLists = rw.stateWriter.WriteSet()
 		txTask.AccountPrevs, txTask.AccountDels, txTask.StoragePrevs, txTask.CodePrevs = rw.stateWriter.PrevAndDels()
+		if shouldLogRuntimePathProbe(txTask) {
+			rw.logger.Warn(
+				"exec3: rw set boundary",
+				"phase", "after-make-write-set",
+				"block", txTask.BlockNum,
+				"txnum", txTask.TxNum,
+				"tx_index", txTask.TxIndex,
+				"tx_hash", txTask.Tx.Hash(),
+				"history_mode", rw.historyMode,
+				"doms_txnum", runtimeDomainsTxNum(rw.rs),
+				"read_lists", len(txTask.ReadLists),
+				"write_lists", len(txTask.WriteLists),
+				"account_prevs", len(txTask.AccountPrevs),
+				"account_dels", len(txTask.AccountDels),
+				"storage_prevs", len(txTask.StoragePrevs),
+				"code_prevs", len(txTask.CodePrevs),
+			)
+		}
+		logRuntimeIbsSummary(rw.logger, "after-make-write-set", txTask, ibs, runtimeDomainsTxNum(rw.rs))
+		logRuntimeWriteSetProbe(rw.logger, txTask, runtimeDomainsTxNum(rw.rs))
 	}
 }
 

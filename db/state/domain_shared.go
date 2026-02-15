@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -75,6 +76,25 @@ type SharedDomains struct {
 }
 
 var sweepAccountTombstonesInit = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_INIT", false)
+var badRootWriteTrace = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var badRootTraceGetLatest = dbg.EnvBool("ERIGON_BAD_ROOT_TRACE_GET_LATEST", false)
+var badRootWriteTraceStorageProbeKey = common.FromHex(dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", ""))
+
+var badRootWriteTraceAccounts = func() map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, raw := range dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || !common.IsHexAddress(raw) {
+			continue
+		}
+		addr := common.HexToAddress(raw)
+		out[string(addr.Bytes())] = struct{}{}
+	}
+	if len(badRootWriteTraceStorageProbeKey) >= 20 {
+		out[string(badRootWriteTraceStorageProbeKey[:20])] = struct{}{}
+	}
+	return out
+}()
 
 type HasAgg interface {
 	Agg() any
@@ -215,6 +235,32 @@ const CodeSizeTableFake = "CodeSize"
 
 var escrowTraceAddrBytes = common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93").Bytes()
 
+func badRootValuePreview(v []byte) string {
+	if len(v) == 0 {
+		return "0x"
+	}
+	if len(v) <= 16 {
+		return fmt.Sprintf("0x%x", v)
+	}
+	return fmt.Sprintf("0x%x...(+%d bytes)", v[:16], len(v)-16)
+}
+
+func shouldTraceBadRootStorageWrite(key []byte) bool {
+	if !badRootWriteTrace || len(key) < 20 {
+		return false
+	}
+	if len(badRootWriteTraceStorageProbeKey) > 0 {
+		if bytes.Equal(key, badRootWriteTraceStorageProbeKey) {
+			return true
+		}
+		if len(badRootWriteTraceStorageProbeKey) >= 20 && bytes.Equal(key[:20], badRootWriteTraceStorageProbeKey[:20]) {
+			return true
+		}
+	}
+	_, ok := badRootWriteTraceAccounts[string(key[:20])]
+	return ok
+}
+
 func (sd *SharedDomains) IndexAdd(table kv.InvertedIdx, key []byte, txNum uint64) (err error) {
 	return sd.mem.IndexAdd(table, key, txNum)
 }
@@ -313,15 +359,62 @@ func (sd *SharedDomains) Flush(ctx context.Context, tx kv.RwTx) error {
 	return sd.mem.Flush(ctx, tx)
 }
 
+func (sd *SharedDomains) DebugGetLatestFromMem(domain kv.Domain, k []byte) (v []byte, step kv.Step, ok bool) {
+	if sd == nil || sd.mem == nil {
+		return nil, 0, false
+	}
+	return sd.mem.GetLatest(domain, k)
+}
+
 // TemporalDomain satisfaction
 func (sd *SharedDomains) GetLatest(domain kv.Domain, tx kv.TemporalTx, k []byte) (v []byte, step kv.Step, err error) {
 	if tx == nil {
 		return nil, 0, errors.New("sd.GetLatest: unexpected nil tx")
 	}
+	traceGetLatest := false
+	if badRootTraceGetLatest {
+		switch domain {
+		case kv.StorageDomain:
+			traceGetLatest = shouldTraceBadRootStorageWrite(k)
+		case kv.AccountsDomain:
+			if len(k) >= 20 {
+				_, traceGetLatest = badRootWriteTraceAccounts[string(k[:20])]
+			}
+		}
+	}
 	if v, prevStep, ok := sd.mem.GetLatest(domain, k); ok {
+		if traceGetLatest {
+			log.Warn("bad root trace get latest",
+				"source", "mem",
+				"sd", fmt.Sprintf("%p", sd),
+				"mem", fmt.Sprintf("%p", sd.mem),
+				"domain", domain.String(),
+				"block_num", sd.blockNum.Load(),
+				"tx_num", sd.txNum,
+				"key", fmt.Sprintf("0x%x", k),
+				"val_len", len(v),
+				"val_preview", badRootValuePreview(v),
+				"step", prevStep,
+			)
+		}
 		return v, prevStep, nil
 	}
 	v, step, err = tx.GetLatest(domain, k)
+	if traceGetLatest {
+		log.Warn("bad root trace get latest",
+			"source", "db",
+			"sd", fmt.Sprintf("%p", sd),
+			"mem", fmt.Sprintf("%p", sd.mem),
+			"domain", domain.String(),
+			"block_num", sd.blockNum.Load(),
+			"tx_num", sd.txNum,
+			"key", fmt.Sprintf("0x%x", k),
+			"val_len", len(v),
+			"val_preview", badRootValuePreview(v),
+			"step", step,
+			"err", err,
+		)
+	}
 	if err != nil {
 		return nil, 0, fmt.Errorf("storage %x read error: %w", k, err)
 	}
@@ -361,6 +454,50 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 			"prev_equal", bytes.Equal(curVal, v),
 			"prev_step", curStep,
 		)
+	}
+	if badRootWriteTrace && sd.blockNum.Load() >= 33 {
+		switch domain {
+		case kv.StorageDomain:
+			if shouldTraceBadRootStorageWrite(k) {
+				var (
+					addrHex string
+					slotHex string
+				)
+				if len(k) >= 20 {
+					addrHex = common.BytesToAddress(k[:20]).Hex()
+					slotHex = fmt.Sprintf("0x%x", k[20:])
+				}
+				log.Warn("bad root trace storage write",
+					"sd", fmt.Sprintf("%p", sd),
+					"mem", fmt.Sprintf("%p", sd.mem),
+					"block_num", sd.blockNum.Load(),
+					"tx_num", txNum,
+					"addr", addrHex,
+					"slot", slotHex,
+					"key", fmt.Sprintf("0x%x", k),
+					"new_len", len(v),
+					"new_preview", badRootValuePreview(v),
+					"prev_len", len(curVal),
+					"prev_preview", badRootValuePreview(curVal),
+					"prev_step", curStep,
+					"unchanged", bytes.Equal(curVal, v),
+				)
+			}
+		case kv.RCacheDomain:
+			log.Warn("bad root trace receipt domain write",
+				"sd", fmt.Sprintf("%p", sd),
+				"mem", fmt.Sprintf("%p", sd.mem),
+				"block_num", sd.blockNum.Load(),
+				"tx_num", txNum,
+				"key", fmt.Sprintf("0x%x", k),
+				"new_len", len(v),
+				"new_preview", badRootValuePreview(v),
+				"prev_len", len(curVal),
+				"prev_preview", badRootValuePreview(curVal),
+				"prev_step", curStep,
+				"unchanged", bytes.Equal(curVal, v),
+			)
+		}
 	}
 	switch domain {
 	case kv.CodeDomain:

@@ -19,6 +19,7 @@ package commitment
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -1208,6 +1209,82 @@ func (t *Updates) DebugPlainKeys() [][]byte {
 		return nil
 	}
 	return out
+}
+
+// DebugDigest returns a stable hash of currently tracked updates and a short
+// sample list (first maxSamples entries in key order). Intended for debug logs.
+func (t *Updates) DebugDigest(maxSamples int) (count uint64, digest string, samples []string) {
+	if t == nil {
+		return 0, "", nil
+	}
+	if maxSamples < 0 {
+		maxSamples = 0
+	}
+	h := sha256.New()
+	writeLen := func(n int) {
+		var b [8]byte
+		binary.BigEndian.PutUint64(b[:], uint64(n))
+		_, _ = h.Write(b[:])
+	}
+	appendSample := func(s string) {
+		if len(samples) < maxSamples {
+			samples = append(samples, s)
+		}
+	}
+
+	switch t.mode {
+	case ModeDirect:
+		keys := make([]string, 0, len(t.keys))
+		for k := range t.keys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			count++
+			kb := toBytesZeroCopy(k)
+			writeLen(len(kb))
+			_, _ = h.Write(kb)
+			appendSample(fmt.Sprintf("key=%x mode=direct", kb))
+		}
+	case ModeUpdate:
+		var numBuf [10]byte
+		var encBuf [96]byte
+		t.tree.Ascend(func(item *KeyUpdate) bool {
+			if item == nil {
+				return true
+			}
+			count++
+			keyBytes := toBytesZeroCopy(item.plainKey)
+			writeLen(len(keyBytes))
+			_, _ = h.Write(keyBytes)
+
+			if item.update == nil {
+				writeLen(0)
+				appendSample(fmt.Sprintf("key=%x flags=nil", keyBytes))
+				return true
+			}
+			updateEnc := item.update.Encode(encBuf[:0], numBuf[:])
+			writeLen(len(updateEnc))
+			_, _ = h.Write(updateEnc)
+
+			appendSample(fmt.Sprintf(
+				"key=%x flags=%s nonce=%d bal=%s code=%x slen=%d sval=%x",
+				keyBytes,
+				item.update.Flags.String(),
+				item.update.Nonce,
+				item.update.Balance.String(),
+				item.update.CodeHash[:4],
+				item.update.StorageLen,
+				item.update.Storage[:min(item.update.StorageLen, 4)],
+			))
+			return true
+		})
+	default:
+		return 0, "", nil
+	}
+
+	sum := h.Sum(nil)
+	return count, fmt.Sprintf("%x", sum), samples
 }
 
 // Reset clears all updates

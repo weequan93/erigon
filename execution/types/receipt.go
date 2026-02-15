@@ -222,7 +222,16 @@ func (r *Receipt) decodeTyped(b []byte) error {
 		return errShortTypedReceipt
 	}
 	switch b[0] {
-	case DynamicFeeTxType, AccessListTxType, BlobTxType:
+	case DynamicFeeTxType,
+		AccessListTxType,
+		BlobTxType,
+		SetCodeTxType,
+		ArbitrumDepositTxType,
+		ArbitrumUnsignedTxType,
+		ArbitrumContractTxType,
+		ArbitrumRetryTxType,
+		ArbitrumSubmitRetryableTxType,
+		ArbitrumInternalTxType:
 		var data receiptRLP
 		err := rlp.DecodeBytes(b[1:], &data)
 		if err != nil {
@@ -327,7 +336,16 @@ func (r *Receipt) DecodeRLP(s *rlp.Stream) error {
 		}
 		r.Type = b[0]
 		switch r.Type {
-		case AccessListTxType, DynamicFeeTxType, BlobTxType, SetCodeTxType:
+		case AccessListTxType,
+			DynamicFeeTxType,
+			BlobTxType,
+			SetCodeTxType,
+			ArbitrumDepositTxType,
+			ArbitrumUnsignedTxType,
+			ArbitrumContractTxType,
+			ArbitrumRetryTxType,
+			ArbitrumSubmitRetryableTxType,
+			ArbitrumInternalTxType:
 			if err := r.decodePayload(s); err != nil {
 				return err
 			}
@@ -469,28 +487,21 @@ func (rs Receipts) EncodeIndex(i int, w *bytes.Buffer) {
 	r := rs[i]
 	data := &receiptRLP{r.statusEncoding(), r.CumulativeGasUsed, r.Bloom, r.Logs}
 	switch r.Type {
-	case LegacyTxType:
+	case LegacyTxType, ArbitrumLegacyTxType:
 		if err := rlp.Encode(w, data); err != nil {
 			panic(err)
 		}
-	case AccessListTxType:
-		//nolint:errcheck
-		w.WriteByte(AccessListTxType)
-		if err := rlp.Encode(w, data); err != nil {
-			panic(err)
-		}
-	case DynamicFeeTxType:
-		w.WriteByte(DynamicFeeTxType)
-		if err := rlp.Encode(w, data); err != nil {
-			panic(err)
-		}
-	case BlobTxType:
-		w.WriteByte(BlobTxType)
-		if err := rlp.Encode(w, data); err != nil {
-			panic(err)
-		}
-	case SetCodeTxType:
-		w.WriteByte(SetCodeTxType)
+	case AccessListTxType,
+		DynamicFeeTxType,
+		BlobTxType,
+		SetCodeTxType,
+		ArbitrumDepositTxType,
+		ArbitrumUnsignedTxType,
+		ArbitrumContractTxType,
+		ArbitrumRetryTxType,
+		ArbitrumSubmitRetryableTxType,
+		ArbitrumInternalTxType:
+		w.WriteByte(r.Type)
 		if err := rlp.Encode(w, data); err != nil {
 			panic(err)
 		}
