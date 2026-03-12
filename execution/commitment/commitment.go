@@ -1287,6 +1287,81 @@ func (t *Updates) DebugDigest(maxSamples int) (count uint64, digest string, samp
 	return count, fmt.Sprintf("%x", sum), samples
 }
 
+// DebugPayloadStats reports whether tracked keys carry in-memory update payloads.
+// Useful for witness diagnostics where ModeDirect keys intentionally have nil payloads.
+func (t *Updates) DebugPayloadStats(maxSamples int) (
+	mode string,
+	total uint64,
+	withPayload uint64,
+	nilPayload uint64,
+	deleteCount uint64,
+	balanceCount uint64,
+	nonceCount uint64,
+	codeCount uint64,
+	storageCount uint64,
+	samples []string,
+) {
+	if t == nil {
+		return "nil", 0, 0, 0, 0, 0, 0, 0, 0, nil
+	}
+	if maxSamples < 0 {
+		maxSamples = 0
+	}
+	appendSample := func(s string) {
+		if len(samples) < maxSamples {
+			samples = append(samples, s)
+		}
+	}
+
+	mode = t.mode.String()
+	switch t.mode {
+	case ModeDirect:
+		total = uint64(len(t.keys))
+		nilPayload = total
+		keys := make([]string, 0, len(t.keys))
+		for k := range t.keys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			appendSample(fmt.Sprintf("key=%x mode=direct payload=nil", toBytesZeroCopy(k)))
+		}
+	case ModeUpdate:
+		t.tree.Ascend(func(item *KeyUpdate) bool {
+			if item == nil {
+				return true
+			}
+			total++
+			if item.update == nil {
+				nilPayload++
+				appendSample(fmt.Sprintf("key=%x flags=nil payload=nil", toBytesZeroCopy(item.plainKey)))
+				return true
+			}
+			withPayload++
+			flags := item.update.Flags
+			if flags&DeleteUpdate != 0 {
+				deleteCount++
+			}
+			if flags&BalanceUpdate != 0 {
+				balanceCount++
+			}
+			if flags&NonceUpdate != 0 {
+				nonceCount++
+			}
+			if flags&CodeUpdate != 0 {
+				codeCount++
+			}
+			if flags&StorageUpdate != 0 {
+				storageCount++
+			}
+			appendSample(fmt.Sprintf("key=%x flags=%s payload=set", toBytesZeroCopy(item.plainKey), flags.String()))
+			return true
+		})
+	default:
+	}
+	return mode, total, withPayload, nilPayload, deleteCount, balanceCount, nonceCount, codeCount, storageCount, samples
+}
+
 // Reset clears all updates
 func (t *Updates) Reset() {
 	switch t.mode {

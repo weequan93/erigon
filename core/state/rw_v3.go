@@ -59,7 +59,15 @@ var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
 var mdbxMigrateFixEmptyRoot = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FIX_EMPTY_ROOT", false)
 var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
 var keepEmptyAccountsList = loadKeepEmptyAccountsList()
-var keepEmptyAccountsDefaultAddrs = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS", false)
+// Preserve known Arbitrum marker accounts by default during both migration and runtime execution.
+// This can be disabled explicitly via:
+//   ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
+// or:
+//   ERIGON_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
+var keepEmptyAccountsDefaultAddrs = dbg.EnvBool(
+	"ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS",
+	dbg.EnvBool("ERIGON_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS", true),
+)
 var mdbxMigrateSweepTombstones = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES", false)
 var mdbxMigrateSweepTombstonesBlock = dbg.EnvUint("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_BLOCK", 0)
 var mdbxMigrateApplyTrace = dbg.EnvBool("ERIGON_MDBX_MIGRATE_APPLYTRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
@@ -125,6 +133,14 @@ func shouldKeepEmptyAccount(addr common.Address) bool {
 			return true
 		}
 	}
+	return shouldKeepEmptyAccountExplicitOnly(addr)
+}
+
+// Runtime execution must follow canonical empty-account deletion rules unless the
+// operator explicitly forces preservation. The default migration-only address set
+// is intentionally excluded here: some ArbOS marker accounts exist at older
+// blocks but are later deleted on canonical Nitro chains.
+func shouldKeepEmptyAccountExplicitOnly(addr common.Address) bool {
 	if !keepEmptyAccounts && len(keepEmptyAccountsList) == 0 {
 		return false
 	}
@@ -159,7 +175,7 @@ func shouldMdbxMigrateApplyTrace(txTask *TxTask) bool {
 }
 
 func shouldTraceApplyAccount(addr common.Address) bool {
-	return addr == mdbxMigrateApplyTraceAccountProbe || addr == mdbxMigrateApplyTraceStorageProbeAddr
+	return addr == mdbxMigrateApplyTraceAccountProbe || addr == mdbxMigrateApplyTraceStorageProbeAddr || isBadRootAccount(addr)
 }
 
 func readApplyTraceAccount(domains *dbstate.SharedDomains, tx kv.TemporalTx, addr common.Address, out *accounts.Account) (exists bool, enc []byte, step kv.Step, err error) {
@@ -1768,6 +1784,7 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
+	keepEmptyRuntime := shouldKeepEmptyAccountExplicitOnly(address)
 	if shouldTraceApplyAccount(address) {
 		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
 		_, keepListHit := keepEmptyAccountsList[address]
@@ -1775,6 +1792,7 @@ func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *
 			"tx_num", w.txNum,
 			"addr", address.Hex(),
 			"keep_empty", shouldKeepEmptyAccount(address),
+			"keep_empty_explicit_only", keepEmptyRuntime,
 			"keep_empty_global", keepEmptyAccounts,
 			"keep_empty_default_addrs", keepEmptyAccountsDefaultAddrs,
 			"keep_empty_default_hit", keepDefaultHit,
@@ -1795,8 +1813,9 @@ func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *
 		}
 		log.Warn("state writer deleteAccount request", fields...)
 	}
-	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
-		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+	if keepEmptyRuntime && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+		// Runtime execution must stay aligned with intra_block_state.updateAccount:
+		// only explicitly configured keep-empty accounts survive deletion here.
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
 			fields := []interface{}{
 				"action", "skip_keep_empty",
@@ -1972,6 +1991,7 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
+	keepEmptyRuntime := shouldKeepEmptyAccountExplicitOnly(address)
 	if shouldTraceApplyAccount(address) {
 		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
 		_, keepListHit := keepEmptyAccountsList[address]
@@ -1979,6 +1999,7 @@ func (w *Writer) DeleteAccount(address common.Address, original *accounts.Accoun
 			"tx_num", w.txNum,
 			"addr", address.Hex(),
 			"keep_empty", shouldKeepEmptyAccount(address),
+			"keep_empty_explicit_only", keepEmptyRuntime,
 			"keep_empty_global", keepEmptyAccounts,
 			"keep_empty_default_addrs", keepEmptyAccountsDefaultAddrs,
 			"keep_empty_default_hit", keepDefaultHit,
@@ -1999,8 +2020,9 @@ func (w *Writer) DeleteAccount(address common.Address, original *accounts.Accoun
 		}
 		log.Warn("state writer deleteAccount request", fields...)
 	}
-	if shouldKeepEmptyAccount(address) && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
-		// Preserve empty marker accounts when requested (mdbx-migrate parity with Nitro state)
+	if keepEmptyRuntime && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
+		// Runtime execution must stay aligned with intra_block_state.updateAccount:
+		// only explicitly configured keep-empty accounts survive deletion here.
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
 			fields := []interface{}{
 				"action", "skip_keep_empty",

@@ -113,6 +113,8 @@ func (t *Trie) Prove(key []byte, fromLevel int, storage bool) ([][]byte, error) 
 			tn = nil
 		case HashNode:
 			return nil, fmt.Errorf("encountered hashNode unexpectedly, key %x, fromLevel %d", key, fromLevel)
+		case *HashNode:
+			return nil, fmt.Errorf("encountered hashNode unexpectedly, key %x, fromLevel %d", key, fromLevel)
 		default:
 			panic(fmt.Sprintf("%T: invalid node: %v", tn, tn))
 		}
@@ -257,6 +259,22 @@ func verifyProof(root common.Hash, key []byte, proofs map[common.Hash]Node, used
 			}
 			node, key = nt.Val, key[len(shortHex):]
 		case HashNode:
+			var ok bool
+			h := common.BytesToHash(nt.hash)
+			node, ok = proofs[h]
+			if !ok {
+				return nil, fmt.Errorf("missing hash %s", nt)
+			}
+			raw, ok := used[h]
+			if !ok {
+				return nil, fmt.Errorf("missing hash %s", nt)
+			}
+			if nextIndex != raw.index {
+				return nil, fmt.Errorf("proof elements present but not in expected order, expected %d at index %d", raw.index, nextIndex)
+			}
+			nextIndex++
+			delete(used, h)
+		case *HashNode:
 			var ok bool
 			h := common.BytesToHash(nt.hash)
 			node, ok = proofs[h]

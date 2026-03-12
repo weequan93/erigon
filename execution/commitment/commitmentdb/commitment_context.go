@@ -8,8 +8,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -42,6 +43,10 @@ type sd interface {
 	StepSize() uint64
 }
 
+type sharedDomainsMemLatestProvider interface {
+	DebugGetLatestFromMem(domain kv.Domain, key []byte) (v []byte, step kv.Step, ok bool)
+}
+
 type SharedDomainsCommitmentContext struct {
 	sharedDomains sd
 	mainTtx       *TrieContext
@@ -57,7 +62,76 @@ type SharedDomainsCommitmentContext struct {
 
 var debugDumpTouchedAccounts = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
 var debugBadRootCommitmentProbe = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var debugWitnessRetryPathMarkerOnce sync.Once
+
+// Keep latest fallback opt-in only. Falling back from as-of reads to latest can
+// hide history gaps and produce witness roots that diverge from header roots.
+var debugBadRootAsOfAccountLatestFallback = dbg.EnvBool("ERIGON_BAD_ROOT_ASOF_ACCOUNT_LATEST_FALLBACK", false)
+
+// Keep commitment-branch latest fallback opt-in. Enabling this can mix latest
+// commitment branch structure with as-of account/storage payloads.
+var debugBadRootAsOfCommitmentLatestFallback = dbg.EnvBool("ERIGON_BAD_ROOT_ASOF_COMMITMENT_LATEST_FALLBACK", false)
 var debugBadRootProbeStorageKey = common.FromHex(dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", ""))
+var debugBadRootTraceReadDomain = dbg.EnvBool("ERIGON_BAD_ROOT_TRACE_READ_DOMAIN", dbg.EnvBool("ERIGON_BAD_ROOT_TRACE_GET_LATEST", false))
+var debugBadRootTraceReadDomainMax = dbg.EnvInt("ERIGON_BAD_ROOT_TRACE_READ_DOMAIN_MAX", 4000)
+var debugBadRootTraceReadDomainCount atomic.Uint64
+
+const (
+	debugReadDomainBucketAccounts = iota
+	debugReadDomainBucketStorage
+	debugReadDomainBucketCode
+	debugReadDomainBucketCommitment
+	debugReadDomainBucketOther
+	debugReadDomainBucketCount
+)
+
+const (
+	debugReadDomainStageHistoryHit = iota
+	debugReadDomainStageHistoryMiss
+	debugReadDomainStageFilesHit
+	debugReadDomainStageFilesMiss
+	debugReadDomainStageLatestHit
+	debugReadDomainStageLatestMiss
+	debugReadDomainStageAsOfMiss
+	debugReadDomainStageReadErr
+	debugReadDomainStageCount
+)
+
+var debugReadDomainBucketNames = [debugReadDomainBucketCount]string{
+	"accounts",
+	"storage",
+	"code",
+	"commitment",
+	"other",
+}
+
+var debugReadDomainStageNames = [debugReadDomainStageCount]string{
+	"history_hit",
+	"history_miss",
+	"files_hit",
+	"files_miss",
+	"latest_hit",
+	"latest_miss",
+	"asof_miss",
+	"read_err",
+}
+
+var debugBadRootReadDomainStats [debugReadDomainBucketCount][debugReadDomainStageCount]atomic.Uint64
+var debugBadRootTraceReadDomainAccounts = func() map[string]struct{} {
+	out := make(map[string]struct{})
+	for _, raw := range dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil) {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || !common.IsHexAddress(raw) {
+			continue
+		}
+		addr := common.HexToAddress(raw)
+		out[string(addr.Bytes())] = struct{}{}
+	}
+	if len(debugBadRootProbeStorageKey) >= 20 {
+		out[string(debugBadRootProbeStorageKey[:20])] = struct{}{}
+	}
+	return out
+}()
 
 func commitmentHexPreview(v []byte, max int) string {
 	if len(v) == 0 {
@@ -67,6 +141,74 @@ func commitmentHexPreview(v []byte, max int) string {
 		return fmt.Sprintf("0x%x", v)
 	}
 	return fmt.Sprintf("0x%x...(+%d bytes)", v[:max], len(v)-max)
+}
+
+func shouldTraceBadRootReadDomain(domain kv.Domain, plainKey []byte) bool {
+	if !debugBadRootTraceReadDomain || len(plainKey) < 20 {
+		return false
+	}
+	switch domain {
+	case kv.AccountsDomain, kv.CodeDomain:
+		_, ok := debugBadRootTraceReadDomainAccounts[string(plainKey[:20])]
+		return ok
+	case kv.StorageDomain:
+		if len(debugBadRootProbeStorageKey) > 0 {
+			if bytes.Equal(plainKey, debugBadRootProbeStorageKey) {
+				return true
+			}
+			if len(debugBadRootProbeStorageKey) >= 20 && bytes.Equal(plainKey[:20], debugBadRootProbeStorageKey[:20]) {
+				return true
+			}
+		}
+		_, ok := debugBadRootTraceReadDomainAccounts[string(plainKey[:20])]
+		return ok
+	default:
+		return false
+	}
+}
+
+func shouldEmitBadRootReadDomainLog() bool {
+	if !debugBadRootTraceReadDomain {
+		return false
+	}
+	if debugBadRootTraceReadDomainMax <= 0 {
+		return true
+	}
+	return int(debugBadRootTraceReadDomainCount.Add(1)) <= debugBadRootTraceReadDomainMax
+}
+
+func debugReadDomainBucket(domain kv.Domain) int {
+	switch domain {
+	case kv.AccountsDomain:
+		return debugReadDomainBucketAccounts
+	case kv.StorageDomain:
+		return debugReadDomainBucketStorage
+	case kv.CodeDomain:
+		return debugReadDomainBucketCode
+	case kv.CommitmentDomain:
+		return debugReadDomainBucketCommitment
+	default:
+		return debugReadDomainBucketOther
+	}
+}
+
+func debugReadDomainCount(domain kv.Domain, stage int) {
+	if stage < 0 || stage >= debugReadDomainStageCount {
+		return
+	}
+	bucket := debugReadDomainBucket(domain)
+	debugBadRootReadDomainStats[bucket][stage].Add(1)
+}
+
+func debugReadDomainStatsSnapshot() map[string]uint64 {
+	out := make(map[string]uint64, debugReadDomainBucketCount*debugReadDomainStageCount)
+	for bucket := 0; bucket < debugReadDomainBucketCount; bucket++ {
+		for stage := 0; stage < debugReadDomainStageCount; stage++ {
+			key := debugReadDomainBucketNames[bucket] + "." + debugReadDomainStageNames[stage]
+			out[key] = debugBadRootReadDomainStats[bucket][stage].Load()
+		}
+	}
+	return out
 }
 
 // debugUpdatesValueDigest returns a stable digest over current update keys and
@@ -170,6 +312,9 @@ func NewSharedDomainsCommitmentContext(sd sd, tx kv.TemporalTx, mode commitment.
 
 		stepSize: sd.StepSize(),
 	}
+	if memProvider, ok := sd.(sharedDomainsMemLatestProvider); ok {
+		trieCtx.getLatestFromMem = memProvider.DebugGetLatestFromMem
+	}
 	ctx.mainTtx = trieCtx
 	ctx.patriciaTrie.ResetContext(trieCtx)
 	return ctx
@@ -187,6 +332,13 @@ func (sdc *SharedDomainsCommitmentContext) Reset() {
 func (sdc *SharedDomainsCommitmentContext) ClearRam() {
 	sdc.updates.Reset()
 	sdc.Reset()
+}
+
+// ClearUpdates drops currently tracked touched keys while keeping the current
+// trie state untouched. Useful when a temporary commitment rebuild populated
+// updates only for diagnostics and callers need a fresh witness key set.
+func (sdc *SharedDomainsCommitmentContext) ClearUpdates() {
+	sdc.updates.Reset()
 }
 
 func (sdc *SharedDomainsCommitmentContext) SetTxNum(txNum uint64) {
@@ -224,7 +376,73 @@ func (sdc *SharedDomainsCommitmentContext) TouchKey(d kv.Domain, key string, val
 func (sdc *SharedDomainsCommitmentContext) Witness(ctx context.Context, codeReads map[common.Hash]witnesstypes.CodeWithHash, expectedRoot []byte, logPrefix string) (proofTrie *trie.Trie, rootHash []byte, err error) {
 	hexPatriciaHashed, ok := sdc.Trie().(*commitment.HexPatriciaHashed)
 	if ok {
-		return hexPatriciaHashed.GenerateWitness(ctx, sdc.updates, codeReads, expectedRoot, logPrefix)
+		if debugBadRootCommitmentProbe {
+			debugWitnessRetryPathMarkerOnce.Do(func() {
+				log.Warn(
+					"witness retry path marker",
+					"version", "commitment-context-2026-03-03-3",
+					"keydiag_skip_enabled", true,
+					"retry_snapshot_enabled", true,
+				)
+			})
+		}
+		// GenerateWitness consumes update iterators (HashSort clears keyset in direct mode).
+		// Keep a debug snapshot so retry paths can run on the same touched-key set.
+		retryUpdates := sdc.updates.DebugSnapshot()
+		if retryUpdates != nil {
+			defer retryUpdates.Close()
+		}
+
+		proofTrie, rootHash, err = hexPatriciaHashed.GenerateWitness(ctx, sdc.updates, codeReads, expectedRoot, logPrefix)
+		if err == nil || sdc.mainTtx == nil || !strings.Contains(err.Error(), "empty branch data read during unfold") {
+			return proofTrie, rootHash, err
+		}
+		if strings.Contains(logPrefix, "/keydiag/") {
+			if debugBadRootCommitmentProbe {
+				log.Warn("witness retry skipped for keydiag prefix", "log_prefix", logPrefix)
+			}
+			return nil, nil, err
+		}
+		if retryUpdates == nil || retryUpdates.Size() == 0 {
+			return nil, nil, err
+		}
+
+		// Retry once with commitment-branch latest fallback enabled. This is a
+		// narrow diagnostic path for as-of witness extraction where branch rows
+		// may be missing from history/files despite a restored root.
+		if debugBadRootCommitmentProbe {
+			log.Warn(
+				"witness retry with commitment latest fallback",
+				"log_prefix", logPrefix,
+				"tx_num", sdc.mainTtx.txNum,
+				"limit_asof_txnum", sdc.mainTtx.limitReadAsOfTxNum,
+				"with_history", sdc.mainTtx.withHistory,
+				"initial_err", err,
+			)
+		}
+		sdc.mainTtx.SetCommitmentLatestFallback(true)
+		proofTrie, rootHash, retryErr := hexPatriciaHashed.GenerateWitness(ctx, retryUpdates, codeReads, expectedRoot, logPrefix+"/retry_latest_commitment")
+		sdc.mainTtx.SetCommitmentLatestFallback(false)
+		if retryErr == nil {
+			if debugBadRootCommitmentProbe {
+				log.Warn(
+					"witness retry with commitment latest fallback succeeded",
+					"log_prefix", logPrefix,
+					"root", common.BytesToHash(rootHash),
+					"expected_root", common.BytesToHash(expectedRoot),
+				)
+			}
+			return proofTrie, rootHash, nil
+		}
+		if debugBadRootCommitmentProbe {
+			log.Warn(
+				"witness retry with commitment latest fallback failed",
+				"log_prefix", logPrefix,
+				"initial_err", err,
+				"retry_err", retryErr,
+			)
+		}
+		return nil, nil, retryErr
 	}
 
 	return nil, nil, errors.New("shared domains commitment context doesn't have HexPatriciaHashed")
@@ -361,10 +579,13 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 	sdc.Reset()
 
 	rootHash, err = sdc.patriciaTrie.Process(ctx, sdc.updates, logPrefix)
+	// Once a process attempt has started, clear justRestored regardless of
+	// success. Leaving it set on errors causes future Reset() calls to no-op
+	// and can pin the trie to stale restored state.
+	sdc.justRestored.Store(false)
 	if err != nil {
 		return nil, err
 	}
-	sdc.justRestored.Store(false)
 
 	if saveState {
 		if err = sdc.encodeAndStoreCommitmentState(blockNum, txNum, rootHash); err != nil {
@@ -446,6 +667,45 @@ func (sdc *SharedDomainsCommitmentContext) DebugPlainKeys() [][]byte {
 	return snapshot.DebugPlainKeys()
 }
 
+// DebugUpdatesDigests returns stable key/value digests for currently tracked updates.
+// key digest is based on tracked plain keys and in-memory update payloads.
+// value digest is based on values resolved through the current trie read context.
+func (sdc *SharedDomainsCommitmentContext) DebugUpdatesDigests(maxSamples int) (
+	keyCount uint64,
+	keyDigest string,
+	keySamples []string,
+	valueCount uint64,
+	valueDigest string,
+	valueSamples []string,
+) {
+	if sdc == nil || sdc.updates == nil {
+		return 0, "", nil, 0, "", nil
+	}
+	keyCount, keyDigest, keySamples = sdc.updates.DebugDigest(maxSamples)
+	valueCount, valueDigest, valueSamples = sdc.debugUpdatesValueDigest(maxSamples)
+	return keyCount, keyDigest, keySamples, valueCount, valueDigest, valueSamples
+}
+
+// DebugUpdatePayloadStats summarizes whether current tracked keys include
+// in-memory update payloads (ModeUpdate) or only keys (ModeDirect).
+func (sdc *SharedDomainsCommitmentContext) DebugUpdatePayloadStats(maxSamples int) (
+	mode string,
+	total uint64,
+	withPayload uint64,
+	nilPayload uint64,
+	deleteCount uint64,
+	balanceCount uint64,
+	nonceCount uint64,
+	codeCount uint64,
+	storageCount uint64,
+	samples []string,
+) {
+	if sdc == nil || sdc.updates == nil {
+		return "nil", 0, 0, 0, 0, 0, 0, 0, 0, nil
+	}
+	return sdc.updates.DebugPayloadStats(maxSamples)
+}
+
 // DebugLastPlainKeys returns the most recent plain keys snapshot captured during ComputeCommitment.
 func (sdc *SharedDomainsCommitmentContext) DebugLastPlainKeys() [][]byte {
 	if sdc == nil {
@@ -463,6 +723,12 @@ func (sdc *SharedDomainsCommitmentContext) DebugReadContext() (txNum uint64, lim
 		return 0, 0, false, false
 	}
 	return sdc.mainTtx.txNum, sdc.mainTtx.limitReadAsOfTxNum, sdc.mainTtx.withHistory, true
+}
+
+// DebugReadDomainStatsSnapshot returns cumulative read-domain counters grouped by domain/stage.
+// Intended for debug-only deltas around witness or commitment calls.
+func (sdc *SharedDomainsCommitmentContext) DebugReadDomainStatsSnapshot() map[string]uint64 {
+	return debugReadDomainStatsSnapshot()
 }
 
 // DebugCurrentRootHash returns the trie root for the current in-memory trie state.
@@ -520,6 +786,153 @@ func (sdc *SharedDomainsCommitmentContext) RestoreLatestCommitmentStateFromTx(tx
 		return 0, 0, nil, false, err
 	}
 	return blockNum, txNum, rootHash, true, nil
+}
+
+// RestoreCommitmentStateAsOfTxNum restores trie state from commitment state as-of
+// a specific txnum. It first tries history lookup and then files-only lookup.
+func (sdc *SharedDomainsCommitmentContext) RestoreCommitmentStateAsOfTxNum(tx kv.TemporalTx, asOfTxNum uint64) (blockNum uint64, txNum uint64, rootHash []byte, restored bool, err error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return 0, 0, nil, false, errors.New("commitment context is not initialized")
+	}
+	if tx == nil {
+		return 0, 0, nil, false, errors.New("restore commitment state as-of: temporal tx is nil")
+	}
+	// Read from the provided temporal tx directly (not trie context), so as-of
+	// lookup is not polluted by in-memory batch overlays.
+	state, _, err := tx.GetAsOf(kv.CommitmentDomain, KeyCommitmentState, asOfTxNum)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	if len(state) == 0 {
+		var ok bool
+		state, ok, _, _, err = tx.Debug().GetLatestFromFiles(kv.CommitmentDomain, KeyCommitmentState, asOfTxNum)
+		if err != nil {
+			return 0, 0, nil, false, err
+		}
+		if !ok || len(state) == 0 {
+			return 0, 0, nil, false, nil
+		}
+	}
+
+	blockNum, txNum, err = sdc.restorePatriciaState(state)
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	rootHash, err = sdc.patriciaTrie.RootHash()
+	if err != nil {
+		return 0, 0, nil, false, err
+	}
+	return blockNum, txNum, rootHash, true, nil
+}
+
+// RebuildCommitmentAsOfTxNum rebuilds commitment trie for the given txnum.
+// Intended as a fallback when historical commitment snapshots are unavailable.
+func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNum(ctx context.Context, tx kv.TemporalTx, blockNum uint64, txNum uint64) ([]byte, error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return nil, errors.New("commitment context is not initialized")
+	}
+	if tx == nil {
+		return nil, errors.New("rebuild commitment as-of: temporal tx is nil")
+	}
+	return sdc.rebuildCommitment(ctx, tx, blockNum, txNum)
+}
+
+// RebuildCommitmentAsOfTxNumFullScan is a debug-oriented rebuild path that
+// touches all latest accounts/storage keys (plus history-range keys for
+// post-asof deletions) before recomputing commitment as-of txNum.
+// It is significantly more expensive than RebuildCommitmentAsOfTxNum.
+func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ctx context.Context, tx kv.TemporalTx, blockNum uint64, txNum uint64) ([]byte, error) {
+	if sdc == nil || sdc.mainTtx == nil || sdc.patriciaTrie == nil {
+		return nil, errors.New("commitment context is not initialized")
+	}
+	if tx == nil {
+		return nil, errors.New("rebuild commitment full-scan as-of: temporal tx is nil")
+	}
+
+	accLatestCount := 0
+	storageLatestCount := 0
+	accHistoryCount := 0
+	storageHistoryCount := 0
+
+	latestAccIt, err := tx.Debug().RangeLatest(kv.AccountsDomain, nil, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer latestAccIt.Close()
+	for latestAccIt.HasNext() {
+		k, _, err := latestAccIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		accLatestCount++
+		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
+	}
+
+	latestStorageIt, err := tx.Debug().RangeLatest(kv.StorageDomain, nil, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer latestStorageIt.Close()
+	for latestStorageIt.HasNext() {
+		k, _, err := latestStorageIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		storageLatestCount++
+		sdc.TouchKey(kv.StorageDomain, string(k), nil)
+	}
+
+	// Include keys changed after txNum so deletes that vanished from latest
+	// state are still part of the as-of reconstruction keyset.
+	accHistoryIt, err := tx.HistoryRange(kv.AccountsDomain, int(txNum), -1, order.Asc, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer accHistoryIt.Close()
+	for accHistoryIt.HasNext() {
+		k, _, err := accHistoryIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		accHistoryCount++
+		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
+	}
+
+	storageHistoryIt, err := tx.HistoryRange(kv.StorageDomain, int(txNum), -1, order.Asc, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer storageHistoryIt.Close()
+	for storageHistoryIt.HasNext() {
+		k, _, err := storageHistoryIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		storageHistoryCount++
+		sdc.TouchKey(kv.StorageDomain, string(k), nil)
+	}
+
+	if debugBadRootCommitmentProbe {
+		log.Warn(
+			"commitment rebuild fullscan key scan",
+			"block", blockNum,
+			"tx_num_arg", txNum,
+			"accounts_latest_count", accLatestCount,
+			"storage_latest_count", storageLatestCount,
+			"accounts_history_count", accHistoryCount,
+			"storage_history_count", storageHistoryCount,
+			"updates_count_after_touch", sdc.updates.Size(),
+			"updates_mode", sdc.updates.Mode(),
+		)
+	}
+
+	prevAllowHistoryBranchWrites := sdc.mainTtx.allowHistoryBranchWrites
+	sdc.mainTtx.SetAllowHistoryBranchWrites(true)
+	defer sdc.mainTtx.SetAllowHistoryBranchWrites(prevAllowHistoryBranchWrites)
+
+	sdc.justRestored.Store(false)
+	sdc.Reset()
+	return sdc.ComputeCommitment(ctx, true, blockNum, txNum, "rebuild commit fullscan")
 }
 
 // DebugStateRootFromEncoded decodes a persisted commitment state payload and returns
@@ -778,7 +1191,9 @@ func (sdc *SharedDomainsCommitmentContext) restorePatriciaState(value []byte) (u
 // Dummy way to rebuild commitment. Dummy because works for small state only.
 // To rebuild commitment correctly for any state size - use RebuildCommitmentFiles.
 func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context, roTx kv.TemporalTx, blockNum, txNum uint64) ([]byte, error) {
-	it, err := roTx.HistoryRange(kv.StorageDomain, int(txNum), math.MaxInt64, order.Asc, -1)
+	accHistoryCount := 0
+	storageHistoryCount := 0
+	it, err := roTx.HistoryRange(kv.AccountsDomain, int(txNum), -1, order.Asc, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -788,10 +1203,11 @@ func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context
 		if err != nil {
 			return nil, err
 		}
+		accHistoryCount++
 		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
 	}
 
-	it, err = roTx.HistoryRange(kv.StorageDomain, int(txNum), math.MaxInt64, order.Asc, -1)
+	it, err = roTx.HistoryRange(kv.StorageDomain, int(txNum), -1, order.Asc, -1)
 	if err != nil {
 		return nil, err
 	}
@@ -802,9 +1218,29 @@ func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context
 		if err != nil {
 			return nil, err
 		}
+		storageHistoryCount++
 		sdc.TouchKey(kv.StorageDomain, string(k), nil)
 	}
 
+	if debugBadRootCommitmentProbe {
+		log.Warn(
+			"commitment rebuild history scan",
+			"block", blockNum,
+			"tx_num_arg", txNum,
+			"accounts_history_count", accHistoryCount,
+			"storage_history_count", storageHistoryCount,
+			"updates_count_after_touch", sdc.updates.Size(),
+			"updates_mode", sdc.updates.Mode(),
+		)
+	}
+
+	prevAllowHistoryBranchWrites := sdc.mainTtx.allowHistoryBranchWrites
+	sdc.mainTtx.SetAllowHistoryBranchWrites(true)
+	defer sdc.mainTtx.SetAllowHistoryBranchWrites(prevAllowHistoryBranchWrites)
+
+	// Rebuild must start from a clean trie even if a previous restore/process
+	// sequence failed and left justRestored=true.
+	sdc.justRestored.Store(false)
 	sdc.Reset()
 	return sdc.ComputeCommitment(ctx, true, blockNum, txNum, "rebuild commit")
 }
@@ -818,15 +1254,36 @@ type TrieContext struct {
 	limitReadAsOfTxNum uint64
 	stepSize           uint64
 	withHistory        bool // if true, do not use history reader and limit to domain files only
-	trace              bool
+	// allowCommitmentLatestFallback enables a targeted retry path for witness
+	// generation when historical commitment branches are missing for an as-of
+	// txnum. Keep false by default to avoid leaking latest commitment data into
+	// regular as-of reads.
+	allowCommitmentLatestFallback bool
+	// As-of history mode is normally read-only for commitment branches. Rebuild
+	// paths enable this flag to materialize branch rows in RAM for subsequent
+	// witness reads at the same as-of txnum.
+	allowHistoryBranchWrites bool
+	// Optional direct RAM overlay lookup for commitment domain reads. This is
+	// used to pick up freshly rebuilt branch rows before history/files fallback.
+	getLatestFromMem func(domain kv.Domain, key []byte) (v []byte, step kv.Step, ok bool)
+	trace            bool
 }
 
 func (sdc *TrieContext) Branch(pref []byte) ([]byte, kv.Step, error) {
 	return sdc.readDomain(kv.CommitmentDomain, pref)
 }
 
+func (sdc *TrieContext) SetCommitmentLatestFallback(enable bool) {
+	sdc.allowCommitmentLatestFallback = enable
+}
+
+func (sdc *TrieContext) SetAllowHistoryBranchWrites(enable bool) {
+	sdc.allowHistoryBranchWrites = enable
+}
+
 func (sdc *TrieContext) PutBranch(prefix []byte, data []byte, prevData []byte, prevStep kv.Step) error {
-	if sdc.limitReadAsOfTxNum > 0 && sdc.withHistory { // do not store branches if explicitly operate on history
+	if sdc.limitReadAsOfTxNum > 0 && sdc.withHistory && !sdc.allowHistoryBranchWrites {
+		// keep history-only reads write-free unless explicitly enabled by rebuild paths
 		return nil
 	}
 	if sdc.trace {
@@ -848,10 +1305,94 @@ func (sdc *TrieContext) readDomain(d kv.Domain, plainKey []byte) (enc []byte, st
 	//	sdc.mu.Lock()
 	//	defer sdc.mu.Unlock()
 	//}
+	traceRead := shouldTraceBadRootReadDomain(d, plainKey) && shouldEmitBadRootReadDomainLog()
+	traceStage := "init"
+	historyOK := false
+	historyLen := -1
+	historyPreview := ""
+	var historyErr error
+	filesOK := false
+	filesLen := -1
+	filesPreview := ""
+	var filesErr error
+	latestLen := -1
+	latestPreview := ""
+	var latestErr error
 
-	if sdc.limitReadAsOfTxNum > 0 {
+	asOfMode := sdc.limitReadAsOfTxNum > 0
+	if asOfMode {
+		if d == kv.CommitmentDomain && sdc.getLatestFromMem != nil {
+			memVal, memStep, memOK := sdc.getLatestFromMem(d, plainKey)
+			if memOK && len(memVal) > 0 {
+				traceStage = "mem_asof_overlay"
+				latestLen = len(memVal)
+				latestPreview = commitmentHexPreview(memVal, 32)
+				debugReadDomainCount(d, debugReadDomainStageLatestHit)
+				if traceRead {
+					log.Warn(
+						"bad root trace readDomain",
+						"domain", d.String(),
+						"key", commitmentHexPreview(plainKey, 64),
+						"asof_mode", asOfMode,
+						"with_history", sdc.withHistory,
+						"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+						"stage", traceStage,
+						"history_ok", historyOK,
+						"history_len", historyLen,
+						"history_preview", historyPreview,
+						"history_err", historyErr,
+						"files_ok", filesOK,
+						"files_len", filesLen,
+						"files_preview", filesPreview,
+						"files_err", filesErr,
+						"latest_len", latestLen,
+						"latest_preview", latestPreview,
+						"latest_err", latestErr,
+						"step", memStep,
+						"result_len", len(memVal),
+						"result_preview", commitmentHexPreview(memVal, 32),
+					)
+				}
+				return memVal, memStep, nil
+			}
+		}
 		if sdc.withHistory {
-			enc, _, err = sdc.roTtx.GetAsOf(d, plainKey, sdc.limitReadAsOfTxNum)
+			// Use GetAsOf semantics (history + safe fallback) in history mode.
+			// HistorySeek-only reads can return false negatives for keys that have
+			// no history row at/after the requested tx but do exist in mutable data.
+			var ok bool
+			enc, ok, err = sdc.roTtx.GetAsOf(d, plainKey, sdc.limitReadAsOfTxNum)
+			if err != nil {
+				if traceRead {
+					log.Warn(
+						"bad root trace readDomain",
+						"domain", d.String(),
+						"key", commitmentHexPreview(plainKey, 64),
+						"asof_mode", asOfMode,
+						"with_history", sdc.withHistory,
+						"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+						"stage", "history_error",
+						"err", err,
+					)
+				}
+				return nil, 0, fmt.Errorf("readDomain %q: (limitTxNum=%d): %w", d, sdc.limitReadAsOfTxNum, err)
+			}
+			historyOK = ok
+			historyLen = len(enc)
+			historyPreview = commitmentHexPreview(enc, 32)
+			if ok && len(enc) > 0 {
+				debugReadDomainCount(d, debugReadDomainStageHistoryHit)
+			} else {
+				debugReadDomainCount(d, debugReadDomainStageHistoryMiss)
+			}
+			if !ok {
+				enc = nil
+			}
+			// Treat empty/tombstone payloads as missing key.
+			if len(enc) == 0 {
+				enc = nil
+			}
+			traceStage = "history"
 		}
 
 		if enc == nil {
@@ -859,21 +1400,205 @@ func (sdc *TrieContext) readDomain(d kv.Domain, plainKey []byte) (enc []byte, st
 			// reading from domain files this way will dereference domain key correctly,
 			// rotx.GetAsOf itself does not dereference keys in commitment domain values
 			enc, ok, _, _, err = sdc.roTtx.Debug().GetLatestFromFiles(d, plainKey, sdc.limitReadAsOfTxNum)
+			filesOK = ok
+			filesLen = len(enc)
+			filesPreview = commitmentHexPreview(enc, 32)
+			filesErr = err
+			if ok && len(enc) > 0 {
+				debugReadDomainCount(d, debugReadDomainStageFilesHit)
+			} else {
+				debugReadDomainCount(d, debugReadDomainStageFilesMiss)
+			}
 			if !ok {
 				enc = nil
 			}
+			traceStage = "files"
 		}
 		if err != nil {
+			debugReadDomainCount(d, debugReadDomainStageReadErr)
+			if traceRead {
+				log.Warn(
+					"bad root trace readDomain",
+					"domain", d.String(),
+					"key", commitmentHexPreview(plainKey, 64),
+					"asof_mode", asOfMode,
+					"with_history", sdc.withHistory,
+					"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+					"stage", "files_error",
+					"history_ok", historyOK,
+					"history_len", historyLen,
+					"history_preview", historyPreview,
+					"files_ok", filesOK,
+					"files_len", filesLen,
+					"files_preview", filesPreview,
+					"err", err,
+				)
+			}
 			return nil, 0, fmt.Errorf("readDomain %q: (limitTxNum=%d): %w", d, sdc.limitReadAsOfTxNum, err)
+		}
+
+		// In as-of mode, missing value means the key does not exist at the
+		// requested tx. Never fall back to latest by default, otherwise
+		// future-state values leak into witness/commitment reconstruction.
+		if enc == nil {
+			// Optional exception for commitment domain, controlled by env.
+			if d == kv.CommitmentDomain && (debugBadRootAsOfCommitmentLatestFallback || sdc.allowCommitmentLatestFallback) {
+				enc, step, err = sdc.getter.GetLatest(d, plainKey)
+				if err != nil {
+					debugReadDomainCount(d, debugReadDomainStageReadErr)
+				} else if len(enc) > 0 {
+					debugReadDomainCount(d, debugReadDomainStageLatestHit)
+				} else {
+					debugReadDomainCount(d, debugReadDomainStageLatestMiss)
+				}
+				if err != nil {
+					if traceRead {
+						log.Warn(
+							"bad root trace readDomain",
+							"domain", d.String(),
+							"key", commitmentHexPreview(plainKey, 64),
+							"asof_mode", asOfMode,
+							"with_history", sdc.withHistory,
+							"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+							"stage", "latest_commitment_error",
+							"history_ok", historyOK,
+							"history_len", historyLen,
+							"history_preview", historyPreview,
+							"files_ok", filesOK,
+							"files_len", filesLen,
+							"files_preview", filesPreview,
+							"err", err,
+						)
+					}
+					return nil, 0, fmt.Errorf("readDomain %q: %w", d, err)
+				}
+				latestLen = len(enc)
+				latestPreview = commitmentHexPreview(enc, 32)
+				traceStage = "latest_commitment"
+				if enc != nil {
+					if traceRead {
+						log.Warn(
+							"bad root trace readDomain",
+							"domain", d.String(),
+							"key", commitmentHexPreview(plainKey, 64),
+							"asof_mode", asOfMode,
+							"with_history", sdc.withHistory,
+							"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+							"stage", traceStage,
+							"history_ok", historyOK,
+							"history_len", historyLen,
+							"history_preview", historyPreview,
+							"history_err", historyErr,
+							"files_ok", filesOK,
+							"files_len", filesLen,
+							"files_preview", filesPreview,
+							"files_err", filesErr,
+							"latest_len", latestLen,
+							"latest_preview", latestPreview,
+							"latest_err", latestErr,
+							"step", step,
+							"result_len", len(enc),
+							"result_preview", commitmentHexPreview(enc, 32),
+						)
+					}
+					return enc, step, nil
+				}
+			}
+			if traceRead {
+				log.Warn(
+					"bad root trace readDomain",
+					"domain", d.String(),
+					"key", commitmentHexPreview(plainKey, 64),
+					"asof_mode", asOfMode,
+					"with_history", sdc.withHistory,
+					"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+					"stage", "asof_miss",
+					"history_ok", historyOK,
+					"history_len", historyLen,
+					"history_preview", historyPreview,
+					"history_err", historyErr,
+					"files_ok", filesOK,
+					"files_len", filesLen,
+					"files_preview", filesPreview,
+					"files_err", filesErr,
+					"latest_len", latestLen,
+					"latest_preview", latestPreview,
+					"latest_err", latestErr,
+					"step", step,
+					"result_len", 0,
+					"result_preview", "0x",
+				)
+			}
+			debugReadDomainCount(d, debugReadDomainStageAsOfMiss)
+			return nil, 0, nil
 		}
 	}
 
-	if enc == nil {
+	if !asOfMode && enc == nil {
 		enc, step, err = sdc.getter.GetLatest(d, plainKey)
+		latestLen = len(enc)
+		latestPreview = commitmentHexPreview(enc, 32)
+		latestErr = err
+		traceStage = "latest"
+		if err != nil {
+			debugReadDomainCount(d, debugReadDomainStageReadErr)
+		} else if len(enc) > 0 {
+			debugReadDomainCount(d, debugReadDomainStageLatestHit)
+		} else {
+			debugReadDomainCount(d, debugReadDomainStageLatestMiss)
+		}
 	}
 
 	if err != nil {
+		if traceRead {
+			log.Warn(
+				"bad root trace readDomain",
+				"domain", d.String(),
+				"key", commitmentHexPreview(plainKey, 64),
+				"asof_mode", asOfMode,
+				"with_history", sdc.withHistory,
+				"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+				"stage", traceStage,
+				"history_ok", historyOK,
+				"history_len", historyLen,
+				"history_preview", historyPreview,
+				"history_err", historyErr,
+				"files_ok", filesOK,
+				"files_len", filesLen,
+				"files_preview", filesPreview,
+				"files_err", filesErr,
+				"latest_len", latestLen,
+				"latest_preview", latestPreview,
+				"latest_err", latestErr,
+				"err", err,
+			)
+		}
 		return nil, 0, fmt.Errorf("readDomain %q: %w", d, err)
+	}
+	if traceRead {
+		log.Warn(
+			"bad root trace readDomain",
+			"domain", d.String(),
+			"key", commitmentHexPreview(plainKey, 64),
+			"asof_mode", asOfMode,
+			"with_history", sdc.withHistory,
+			"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+			"stage", traceStage,
+			"history_ok", historyOK,
+			"history_len", historyLen,
+			"history_preview", historyPreview,
+			"history_err", historyErr,
+			"files_ok", filesOK,
+			"files_len", filesLen,
+			"files_preview", filesPreview,
+			"files_err", filesErr,
+			"latest_len", latestLen,
+			"latest_preview", latestPreview,
+			"latest_err", latestErr,
+			"step", step,
+			"result_len", len(enc),
+			"result_preview", commitmentHexPreview(enc, 32),
+		)
 	}
 	return enc, step, nil
 }
@@ -882,6 +1607,29 @@ func (sdc *TrieContext) Account(plainKey []byte) (u *commitment.Update, err erro
 	encAccount, _, err := sdc.readDomain(kv.AccountsDomain, plainKey)
 	if err != nil {
 		return nil, err
+	}
+
+	// In as-of witness/debug mode, account history can occasionally miss values
+	// that are still required to reconstruct canonical branch commitments.
+	// Allow an explicit latest fallback so witness generation can proceed while
+	// we continue investigating history gaps.
+	if len(encAccount) == 0 && sdc.limitReadAsOfTxNum > 0 && debugBadRootAsOfAccountLatestFallback {
+		latestEnc, _, latestErr := sdc.getter.GetLatest(kv.AccountsDomain, plainKey)
+		if latestErr != nil {
+			return nil, latestErr
+		}
+		if len(latestEnc) >= 4 && latestEnc[0] != 0xff {
+			encAccount = latestEnc
+			if debugBadRootCommitmentProbe {
+				log.Warn(
+					"bad root account asof miss fallback latest",
+					"key", commitmentHexPreview(plainKey, 64),
+					"limit_asof_txnum", sdc.limitReadAsOfTxNum,
+					"latest_len", len(latestEnc),
+					"latest_preview", commitmentHexPreview(latestEnc, 32),
+				)
+			}
+		}
 	}
 
 	// Defensive: treat history tombstones/short markers as deletions.
@@ -904,6 +1652,11 @@ func (sdc *TrieContext) Account(plainKey []byte) (u *commitment.Update, err erro
 	if err = accounts.DeserialiseV3(acc, encAccount); err != nil {
 		return nil, err
 	}
+
+	// Preserve account storage root for witness/account leaf construction.
+	// Keep it out of flags so regular state-update semantics stay unchanged.
+	u.StorageLen = len(acc.Root[:])
+	copy(u.Storage[:], acc.Root[:])
 
 	u.Flags |= commitment.NonceUpdate
 	u.Nonce = acc.Nonce
@@ -945,6 +1698,35 @@ func (sdc *TrieContext) Storage(plainKey []byte) (u *commitment.Update, err erro
 	if u.StorageLen > 0 {
 		u.Flags = commitment.StorageUpdate
 		copy(u.Storage[:u.StorageLen], enc)
+	}
+
+	return u, nil
+}
+
+// StorageLatest bypasses as-of limits and returns the latest storage-domain value.
+// Witness diagnostics use this as a fallback only when as-of payloads cannot
+// materialize the branch child hash already present in commitment cells.
+func (sdc *TrieContext) StorageLatest(plainKey []byte) (u *commitment.Update, err error) {
+	var enc []byte
+	if sdc.roTtx != nil {
+		enc, _, err = sdc.roTtx.GetLatest(kv.StorageDomain, plainKey)
+	} else {
+		enc, _, err = sdc.getter.GetLatest(kv.StorageDomain, plainKey)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	u = &commitment.Update{
+		Flags:      commitment.DeleteUpdate,
+		StorageLen: len(enc),
+	}
+	if u.StorageLen > len(u.Storage) {
+		u.StorageLen = len(u.Storage)
+	}
+	if u.StorageLen > 0 {
+		u.Flags = commitment.StorageUpdate
+		copy(u.Storage[:u.StorageLen], enc[:u.StorageLen])
 	}
 
 	return u, nil

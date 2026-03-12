@@ -1559,7 +1559,11 @@ func updateAccount(EIP161Enabled bool, isAura bool, stateWriter StateWriter, add
 	if isZombie {
 		emptyRemoval = false
 	}
-	keepEmpty := shouldKeepEmptyAccount(addr)
+	// Runtime execution must not inherit the migration default keep-empty set.
+	// Direct block-57 comparison against the original Nitro DB shows
+	// 0xA4b...00F6 is absent canonically while the runtime divergence kept it
+	// alive. Only explicitly-forced keep-empty addresses should survive here.
+	keepEmpty := shouldKeepEmptyAccountExplicitOnly(addr)
 	if keepEmpty {
 		if isBadRootAccount(addr) {
 			blockNum := uint64(0)

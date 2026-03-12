@@ -98,11 +98,18 @@ func (n *DuoNode) print(w io.Writer) {
 }
 
 func (n *ShortNode) fstring(ind string) string {
+	if n.Val == nil {
+		return fmt.Sprintf("{%x: <nil>} ", n.Key)
+	}
 	return fmt.Sprintf("{%x: %v} ", n.Key, n.Val.fstring(ind+"  "))
 }
 func (n *ShortNode) print(w io.Writer) {
 	fmt.Fprintf(w, "s(%x:", n.Key)
-	n.Val.print(w)
+	if n.Val != nil {
+		n.Val.print(w)
+	} else {
+		fmt.Fprintf(w, "<nil>")
+	}
 	fmt.Fprintf(w, ")")
 }
 

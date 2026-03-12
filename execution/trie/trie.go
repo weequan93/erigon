@@ -23,9 +23,10 @@ package trie
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"fmt"
+	"os"
 	"reflect"
+	"strings"
 
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/crypto"
@@ -39,6 +40,22 @@ var (
 
 	// emptyState is the known hash of an empty state trie entry.
 	emptyState = crypto.Keccak256Hash(nil)
+
+	// Keep merge relaxations opt-in. Enabling them implicitly via generic debug
+	// flags can silently mutate witness shape and hide preimage gaps.
+	mergeAllowHashnodeMismatch = strings.EqualFold(os.Getenv("ERIGON_TRIE_MERGE_ALLOW_HASHNODE_MISMATCH"), "true")
+	mergePreferRhsOnHashnodeMismatch = !strings.EqualFold(os.Getenv("ERIGON_TRIE_MERGE_HASHNODE_POLICY"), "lhs")
+	// Some witness reads can disagree on whether a ShortNode key carries the
+	// terminal nibble (0x10) while still describing the same subtree. Allow
+	// normalizing that representation mismatch when explicitly requested.
+	mergeAllowShortTerminatorMismatch = strings.EqualFold(os.Getenv("ERIGON_TRIE_MERGE_ALLOW_SHORT_TERMINATOR_MISMATCH"), "true")
+	// Witness materialization can also differ on whether a branch segment is
+	// represented as FullNode or ShortNode; normalize only when requested.
+	mergeAllowShortFullTypeNormalization = strings.EqualFold(os.Getenv("ERIGON_TRIE_MERGE_ALLOW_SHORT_FULL_NORMALIZATION"), "true")
+	// Partial witness tries for different touched keys can legitimately diverge
+	// inside compressed short-node segments. Allow normalizing this only when
+	// explicitly requested by env flag.
+	mergeAllowShortKeyDivergence = strings.EqualFold(os.Getenv("ERIGON_TRIE_MERGE_ALLOW_SHORT_KEY_DIVERGENCE"), "true")
 )
 
 // Trie is a Merkle Patricia Trie.
@@ -94,76 +111,328 @@ func NewInMemoryTrieRLPEncoded(root Node) *Trie {
 // this will merge node2 into node1, returns a boolean mergeNecessary, if it was necessary to replace a child.
 // If not, then the two full nodes are the same so no replacement was necessary
 // This function also performs certain sanity checks which can result in an error if they fail
-func merge2FullNodes(node1, node2 *FullNode) (bool, error) {
+func mergePathAppend(path []byte, nibble byte) []byte {
+	next := make([]byte, len(path)+1)
+	copy(next, path)
+	next[len(path)] = nibble
+	return next
+}
+
+func mergePathAppendKey(path []byte, key []byte) []byte {
+	next := make([]byte, len(path)+len(key))
+	copy(next, path)
+	copy(next[len(path):], key)
+	return next
+}
+
+func formatMergePath(path []byte) string {
+	if len(path) == 0 {
+		return "<root>"
+	}
+	const hexChars = "0123456789abcdef"
+	formatted := make([]byte, 0, len(path))
+	for _, nibble := range path {
+		if nibble < 16 {
+			formatted = append(formatted, hexChars[nibble])
+			continue
+		}
+		if nibble == 16 {
+			formatted = append(formatted, '|')
+			continue
+		}
+		formatted = append(formatted, '?')
+	}
+	return fmt.Sprintf("%s(raw=%x)", string(formatted), path)
+}
+
+func merge2FullNodes(node1, node2 *FullNode, path []byte) (bool, error) {
 	furtherMergingNeeded := false
 	for i := 0; i < len(node1.Children); i++ {
-		// either both children are hashnodes, or only one of them is, or none of them is.
-		// if both of the two children (of trie1 and trie2) at a certain index are not hashnodes
-		// they must be the same type (e.g. both a FullNode, or both a ShortNode, or both nil) . If this is true for all children then no merge takes place at this level.
 		child1 := node1.Children[i]
 		child2 := node2.Children[i]
-		if hashNode1, ok1 := child1.(*HashNode); ok1 { // child1 is a hashnode
-			if hashNode2, ok2 := child2.(*HashNode); ok2 { //child2 is a hashnode
-				// both are hashnodes
-				if !bytes.Equal(hashNode1.hash, hashNode2.hash) { // sanity check
-					return false, fmt.Errorf("children hashnodes have different hashes: hash1(%x)!=hash2(%x)", hashNode1.hash, hashNode2.hash)
-				}
-			} else if child2 == nil {
-				return false, fmt.Errorf("child of tr2 should not be nil, because child of tr1 is a hashnode")
-			} else { // child2 is not a hashnode, in this case replace the hashnode in tree 1 by child2 which has the expanded node type
+		// nil means "no information for this branch" in one partial trie. Keep/merge
+		// whichever side has data.
+		if child1 == nil {
+			if child2 != nil {
 				node1.Children[i] = child2
 			}
-		} else if child1 == nil {
-			if child2 != nil {
-				// sanity check
-				return false, fmt.Errorf("child of first node is nil , but corresponding child of second node is non-nil")
+			continue
+		}
+		if child2 == nil {
+			continue
+		}
+
+		hashNode1, ok1 := child1.(*HashNode)
+		hashNode2, ok2 := child2.(*HashNode)
+		switch {
+		case ok1 && ok2:
+			// both are hash nodes
+			if !bytes.Equal(hashNode1.hash, hashNode2.hash) {
+				return false, fmt.Errorf(
+					"children hashnodes have different hashes at path=%s nibble=%x hash1(%x)!=hash2(%x) parent1=%s parent2=%s child1=%s child2=%s",
+					formatMergePath(path),
+					i,
+					hashNode1.hash,
+					hashNode2.hash,
+					describeFullNodeForMerge(node1),
+					describeFullNodeForMerge(node2),
+					describeNodeForMerge(node1.Children[i]),
+					describeNodeForMerge(node2.Children[i]),
+				)
 			}
-		} else { // child1 is not nil and not a hashnode
-			if _, ok2 := child2.(*HashNode); !ok2 { // if child2 is not hashnode, now they are expected to have the same type , if child2 is a hashnode then no changes are necessary to node1
-				if reflect.TypeOf(child1) != reflect.TypeOf(child2) { // sanity check
-					return false, fmt.Errorf("children have different types: %T != %T", child1, child2)
-				} else { // further merging will be needed at the next level
-					furtherMergingNeeded = true
-				}
+		case ok1 && !ok2:
+			// child2 has the expanded node, prefer it
+			node1.Children[i] = child2
+		case !ok1 && ok2:
+			// child1 is already expanded, keep it
+		default:
+			// both are expanded nodes: types must match and then recurse
+			if reflect.TypeOf(child1) != reflect.TypeOf(child2) {
+				return false, fmt.Errorf(
+					"children have different types at path=%s index=%d: %T != %T child1=%s child2=%s",
+					formatMergePath(path),
+					i,
+					child1,
+					child2,
+					describeNodeForMerge(child1),
+					describeNodeForMerge(child2),
+				)
 			}
+			furtherMergingNeeded = true
 		}
 	}
 	return furtherMergingNeeded, nil
 }
 
-func merge2ShortNodes(node1, node2 *ShortNode) (bool, error) {
+func merge2ShortNodes(node1, node2 *ShortNode, path []byte) (bool, error) {
 	furtherMergingNeeded := false
 	if !bytes.Equal(node1.Key, node2.Key) { // sanity check
-		return false, fmt.Errorf("mismatch in the short node keys node1.Key(%x)!=node2.Key(%x)", node1.Key, node2.Key)
-	}
-	if hashNode1, ok1 := node1.Val.(*HashNode); ok1 { // node1.Val is a HashNode
-		if hashNode2, ok2 := node2.Val.(*HashNode); ok2 { // node2.Val is a HashNode
-			// both are hashnodes
-			if !bytes.Equal(hashNode1.hash, hashNode2.hash) { // sanity check
-				return false, fmt.Errorf("hashnodes have different hashes: hash1(%x) != hash2(%x)", hashNode1.hash, hashNode2.hash)
+		if canonical, ok := normalizeShortKeyMismatchForMerge(node1.Key, node2.Key); ok && mergeAllowShortTerminatorMismatch {
+			node1.Key = canonical
+			node2.Key = append([]byte(nil), canonical...)
+		} else if mergeAllowShortKeyDivergence {
+			expanded1 := expandShortNodeForMerge(node1)
+			expanded2 := expandShortNodeForMerge(node2)
+			merged, err := mergeNodesRecursive(expanded1, expanded2, path)
+			if err != nil {
+				return false, err
 			}
-		} else if node2.Val == nil {
-			return false, fmt.Errorf("node2.Val should not be nil, because node1.Val is a hashnode")
-		} else { // in this case node2.Val is not a HashNode, while node1.Val is a hash node, so replace node1.Val by node2.Val, and the merging is complete
+			switch mergedNode := merged.(type) {
+			case *ShortNode:
+				node1.Key = append(node1.Key[:0], mergedNode.Key...)
+				node1.Val = mergedNode.Val
+				return false, nil
+			default:
+				// Caller should replace this node with the returned merged node.
+				return true, nil
+			}
+		} else {
+			return false, fmt.Errorf(
+				"mismatch in the short node keys at path=%s node1.Key(%x)!=node2.Key(%x)",
+				formatMergePath(path),
+				node1.Key,
+				node2.Key,
+			)
+		}
+	}
+	node1.Val = normalizeMergeNode(node1.Val)
+	node2.Val = normalizeMergeNode(node2.Val)
+
+	if node1.Val == nil {
+		if node2.Val != nil {
 			node1.Val = node2.Val
 		}
-	} else { // node1.Val is not a hashnode
-		// if node2.Val is not  a hashnode, node2.Val is expected to have the same type as node1.Val, otherwise if it is a hashnode no action is necessary (just ignore the hashnode)
-		if _, ok2 := node2.Val.(*HashNode); !ok2 {
-			if reflect.TypeOf(node1.Val) != reflect.TypeOf(node2.Val) { // sanity check
-				return false, fmt.Errorf("node1.Val and node2.Val have different types: %T != %T ", node1.Val, node2.Val)
-			} else {
-				furtherMergingNeeded = true
-			}
+		return false, nil
+	}
+	if node2.Val == nil {
+		return false, nil
+	}
+
+	hashNode1, ok1 := node1.Val.(*HashNode)
+	hashNode2, ok2 := node2.Val.(*HashNode)
+	switch {
+	case ok1 && ok2:
+		if !bytes.Equal(hashNode1.hash, hashNode2.hash) {
+			return false, fmt.Errorf(
+				"hashnodes have different hashes at path=%s short_key=%x hash1(%x) != hash2(%x)",
+				formatMergePath(path),
+				node1.Key,
+				hashNode1.hash,
+				hashNode2.hash,
+			)
 		}
+	case ok1 && !ok2:
+		node1.Val = node2.Val
+	case !ok1 && ok2:
+		// node1.Val already expanded, keep it
+	default:
+		if reflect.TypeOf(node1.Val) != reflect.TypeOf(node2.Val) {
+			return false, fmt.Errorf(
+				"node1.Val and node2.Val have different types at path=%s: %T != %T short_key=%x node1_val=%s node2_val=%s",
+				formatMergePath(path),
+				node1.Val,
+				node2.Val,
+				node1.Key,
+				describeNodeForMerge(node1.Val),
+				describeNodeForMerge(node2.Val),
+			)
+		}
+		furtherMergingNeeded = true
 	}
 	return furtherMergingNeeded, nil
+}
+
+func stripShortTerminatorForMerge(key []byte) []byte {
+	if hasTerm(key) {
+		return key[:len(key)-1]
+	}
+	return key
+}
+
+func normalizeShortKeyMismatchForMerge(key1, key2 []byte) (canonical []byte, ok bool) {
+	base1 := stripShortTerminatorForMerge(key1)
+	base2 := stripShortTerminatorForMerge(key2)
+	if !bytes.Equal(base1, base2) {
+		return nil, false
+	}
+	// Require an actual representation mismatch where one side carries 0x10 and
+	// the other doesn't, then normalize both to the shared non-terminating key.
+	hasTerm1 := hasTerm(key1)
+	hasTerm2 := hasTerm(key2)
+	if hasTerm1 == hasTerm2 {
+		return nil, false
+	}
+	return append([]byte(nil), base1...), true
+}
+
+func expandShortNodeForMerge(sn *ShortNode) Node {
+	if sn == nil {
+		return nil
+	}
+	if len(sn.Key) == 0 {
+		return sn.Val
+	}
+	idx := sn.Key[0]
+	rest := sn.Key[1:]
+	full := &FullNode{}
+	if len(rest) == 0 {
+		full.Children[idx] = sn.Val
+		return full
+	}
+	full.Children[idx] = &ShortNode{Key: append([]byte(nil), rest...), Val: sn.Val}
+	return full
+}
+
+func normalizeMergeNode(n Node) Node {
+	// Some trie variants wrap account/value leaves in a terminal ShortNode {key=0x10,val=*AccountNode}.
+	// For merge-equivalence we can unwrap these wrappers.
+	for {
+		sn, ok := n.(*ShortNode)
+		if !ok || sn == nil {
+			return n
+		}
+		if len(sn.Key) == 1 && sn.Key[0] == 16 && sn.Val != nil {
+			n = sn.Val
+			continue
+		}
+		return n
+	}
+}
+
+// Some witness construction variants materialize storage continuation directly as
+// FullNode while others keep the AccountNode wrapper and attach the same storage
+// subtree under AccountNode.Storage. Merge these representations by preserving
+// account payload and recursively merging the storage trie.
+func mergeAccountWithFullNode(accountNode *AccountNode, fullNode *FullNode, path []byte) (Node, error) {
+	if accountNode == nil {
+		return nil, fmt.Errorf("mergeAccountWithFullNode: nil account node at path=%s", formatMergePath(path))
+	}
+	if fullNode == nil {
+		return accountNode, nil
+	}
+
+	storageNode := normalizeMergeNode(accountNode.Storage)
+	if storageNode == nil {
+		accountNode.Storage = fullNode
+		return accountNode, nil
+	}
+
+	mergedStorage, err := mergeNodesRecursive(storageNode, fullNode, mergePathAppend(path, 16))
+	if err != nil {
+		return nil, err
+	}
+	accountNode.Storage = mergedStorage
+	return accountNode, nil
+}
+
+func describeNodeForMerge(n Node) string {
+	switch v := n.(type) {
+	case nil:
+		return "nil"
+	case *HashNode:
+		return fmt.Sprintf("HashNode(hash=%x)", v.hash)
+	case *ShortNode:
+		valType := "<nil>"
+		if v.Val != nil {
+			valType = fmt.Sprintf("%T", v.Val)
+		}
+		return fmt.Sprintf("ShortNode(key=%x,valType=%s)", v.Key, valType)
+	case *FullNode:
+		nonNil := 0
+		for _, child := range v.Children {
+			if child != nil {
+				nonNil++
+			}
+		}
+		return fmt.Sprintf("FullNode(nonNilChildren=%d)", nonNil)
+	case *AccountNode:
+		storageType := "<nil>"
+		if v.Storage != nil {
+			storageType = fmt.Sprintf("%T", v.Storage)
+		}
+		return fmt.Sprintf(
+			"AccountNode(nonce=%d,balance=%s,root=%x,codeHash=%x,storageType=%s)",
+			v.Nonce,
+			v.Balance.String(),
+			v.Root,
+			v.CodeHash,
+			storageType,
+		)
+	case ValueNode:
+		return fmt.Sprintf("ValueNode(len=%d,val=%x)", len(v), v)
+	default:
+		return fmt.Sprintf("%T", n)
+	}
+}
+
+func describeFullNodeForMerge(node *FullNode) string {
+	if node == nil {
+		return "FullNode(nil)"
+	}
+	nonNil := 0
+	sample := make([]string, 0, 6)
+	for idx, child := range node.Children {
+		if child == nil {
+			continue
+		}
+		nonNil++
+		if len(sample) < cap(sample) {
+			sample = append(sample, fmt.Sprintf("%x:%s", idx, describeNodeForMerge(child)))
+		}
+	}
+	return fmt.Sprintf("FullNode(nonNilChildren=%d,sample=%v)", nonNil, sample)
 }
 
 func merge2AccountNodes(node1, node2 *AccountNode) (furtherMergingNeeded bool) {
 	storage1 := node1.Storage
 	storage2 := node2.Storage
-	if storage1 == nil || storage2 == nil { // in this case do nothing, we can use the storage tree of node 1
+	if storage1 == nil {
+		if storage2 != nil {
+			node1.Storage = storage2
+		}
+		return false
+	}
+	if storage2 == nil {
 		return false
 	}
 	_, isHashNode1 := storage1.(*HashNode) // check if storage1 is a hashnode
@@ -180,80 +449,246 @@ func merge2AccountNodes(node1, node2 *AccountNode) (furtherMergingNeeded bool) {
 }
 
 func merge2Tries(tr1 *Trie, tr2 *Trie) (*Trie, error) {
-	// starting from the roots merge each level
-	rootNode1 := tr1.RootNode
-	rootNode2 := tr2.RootNode
-	mergeComplete := false
-
-	for !mergeComplete {
-		switch node1 := (rootNode1).(type) {
-		case nil:
-			// sanity checks might be good later on
-			return nil, nil
-		case *ShortNode:
-			node2, ok := rootNode2.(*ShortNode)
-			if !ok {
-				return nil, fmt.Errorf("expected *trie.ShortNode in trie 2, but got %T", rootNode2)
+	merged, err := mergeNodesRecursive(tr1.RootNode, tr2.RootNode, nil)
+	if err != nil {
+		root1 := common.Hash{}
+		root2 := common.Hash{}
+		node1 := "<nil>"
+		node2 := "<nil>"
+		if tr1 != nil {
+			node1 = describeNodeForMerge(tr1.RootNode)
+			if tr1.RootNode != nil {
+				root1 = common.BytesToHash(tr1.Root())
 			}
-			furtherMergingNeeded, err := merge2ShortNodes(node1, node2)
-			if err != nil {
-				return nil, err
-			}
-			if furtherMergingNeeded {
-				rootNode1 = node1.Val
-				rootNode2 = node2.Val
-			} else {
-				mergeComplete = true
-			}
-		case *FullNode:
-			node2, ok := rootNode2.(*FullNode)
-			if !ok {
-				return nil, fmt.Errorf("expected *trie.FullNode in trie 2, but got %T", rootNode2)
-			}
-			furthedMergingNeeded, err := merge2FullNodes(node1, node2)
-			if err != nil {
-				return nil, err
-			}
-			if furthedMergingNeeded { // find the next nodes to merge
-				nextRootsFound := false
-				for i := 0; i < len(node1.Children); i++ { // it is guaranteed that we will find a non-nil, non-hashnode
-					childNode1 := node1.Children[i]
-					childNode2 := node2.Children[i]
-					if _, isHashNode := childNode2.(*HashNode); childNode2 != nil && !isHashNode {
-						// update rootNode1, and rootNode2 to merge at the next level at the next iteration
-						rootNode1 = childNode1
-						rootNode2 = childNode2
-						nextRootsFound = true
-						break
-					}
-				}
-				if !nextRootsFound {
-					return nil, errors.New("could not find next node pair to merge")
-				}
-			} else {
-				mergeComplete = true
-			}
-		case *HashNode:
-			return tr2, nil
-		case ValueNode:
-			return tr1, nil
-		case *AccountNode:
-			node2, ok := rootNode2.(*AccountNode)
-			if !ok {
-				return nil, fmt.Errorf("expected *trie.AccountNode in trie 2, but got %T", rootNode2)
-			}
-			furthedMergingNeeded := merge2AccountNodes(node1, node2)
-			if !furthedMergingNeeded {
-				return tr1, nil
-			} else {
-				// need to merge storage trees
-				rootNode1 = node1.Storage
-				rootNode2 = node2.Storage
-			}
-
 		}
+		if tr2 != nil {
+			node2 = describeNodeForMerge(tr2.RootNode)
+			if tr2.RootNode != nil {
+				root2 = common.BytesToHash(tr2.Root())
+			}
+		}
+		return nil, fmt.Errorf(
+			"merge2Tries root1=%x root2=%x node1=%s node2=%s: %w",
+			root1,
+			root2,
+			node1,
+			node2,
+			err,
+		)
 	}
+	tr1.RootNode = merged
 	return tr1, nil
+}
+
+// mergeNodesRecursive merges node2 into node1 and returns the merged subtree.
+// This fully traverses every conflicting expanded branch instead of following
+// only a single path, which is required when partial witness tries overlap in
+// multiple siblings at the same depth.
+func mergeNodesRecursive(node1 Node, node2 Node, path []byte) (Node, error) {
+	if node1 == nil {
+		return node2, nil
+	}
+	if node2 == nil {
+		return node1, nil
+	}
+
+	hashNode1, ok1 := node1.(*HashNode)
+	hashNode2, ok2 := node2.(*HashNode)
+	switch {
+	case ok1 && ok2:
+		if !bytes.Equal(hashNode1.hash, hashNode2.hash) {
+			if mergeAllowHashnodeMismatch {
+				if mergePreferRhsOnHashnodeMismatch {
+					return node2, nil
+				}
+				return node1, nil
+			}
+			return nil, fmt.Errorf(
+				"children hashnodes have different hashes at path=%s hash1(%x)!=hash2(%x) node1=%s node2=%s",
+				formatMergePath(path),
+				hashNode1.hash,
+				hashNode2.hash,
+				describeNodeForMerge(node1),
+				describeNodeForMerge(node2),
+			)
+		}
+		return node1, nil
+	case ok1 && !ok2:
+		return node2, nil
+	case !ok1 && ok2:
+		return node1, nil
+	}
+
+	// Merge-equivalent normalization: unwrap terminal short wrappers so
+	// AccountNode/value leaves compare consistently across witness variants.
+	node1 = normalizeMergeNode(node1)
+	node2 = normalizeMergeNode(node2)
+
+	switch n1 := node1.(type) {
+	case *FullNode:
+		n2, ok := node2.(*FullNode)
+		if !ok {
+			if shortNode, shortOk := node2.(*ShortNode); shortOk && (mergeAllowShortFullTypeNormalization || mergeAllowShortKeyDivergence) {
+				expanded := expandShortNodeForMerge(shortNode)
+				if expanded == nil {
+					return n1, nil
+				}
+				return mergeNodesRecursive(n1, expanded, path)
+			}
+			if accNode, accOk := node2.(*AccountNode); accOk {
+				return mergeAccountWithFullNode(accNode, n1, path)
+			}
+			return nil, fmt.Errorf(
+				"children have different types at path=%s: %T != %T child1=%s child2=%s",
+				formatMergePath(path),
+				node1,
+				node2,
+				describeNodeForMerge(node1),
+				describeNodeForMerge(node2),
+			)
+		}
+		for i := 0; i < len(n1.Children); i++ {
+			mergedChild, err := mergeNodesRecursive(
+				n1.Children[i],
+				n2.Children[i],
+				mergePathAppend(path, byte(i)),
+			)
+			if err != nil {
+				return nil, err
+			}
+			n1.Children[i] = mergedChild
+		}
+		return n1, nil
+
+	case *ShortNode:
+		n2, ok := node2.(*ShortNode)
+		if !ok {
+			if fullNode, fullOk := node2.(*FullNode); fullOk && (mergeAllowShortFullTypeNormalization || mergeAllowShortKeyDivergence) {
+				expanded := expandShortNodeForMerge(n1)
+				if expanded == nil {
+					return fullNode, nil
+				}
+				return mergeNodesRecursive(expanded, fullNode, path)
+			}
+			return nil, fmt.Errorf(
+				"children have different types at path=%s: %T != %T child1=%s child2=%s",
+				formatMergePath(path),
+				node1,
+				node2,
+				describeNodeForMerge(node1),
+				describeNodeForMerge(node2),
+			)
+		}
+		if !bytes.Equal(n1.Key, n2.Key) {
+			if canonical, ok := normalizeShortKeyMismatchForMerge(n1.Key, n2.Key); ok && mergeAllowShortTerminatorMismatch {
+				n1.Key = canonical
+				n2.Key = append([]byte(nil), canonical...)
+			} else if mergeAllowShortKeyDivergence {
+				expanded1 := expandShortNodeForMerge(n1)
+				expanded2 := expandShortNodeForMerge(n2)
+				return mergeNodesRecursive(expanded1, expanded2, path)
+			} else {
+				return nil, fmt.Errorf(
+					"mismatch in the short node keys at path=%s node1.Key(%x)!=node2.Key(%x) node1_val=%s node2_val=%s",
+					formatMergePath(path),
+					n1.Key,
+					n2.Key,
+					describeNodeForMerge(n1.Val),
+					describeNodeForMerge(n2.Val),
+				)
+			}
+		}
+
+		mergedVal, err := mergeNodesRecursive(
+			normalizeMergeNode(n1.Val),
+			normalizeMergeNode(n2.Val),
+			mergePathAppendKey(path, n1.Key),
+		)
+		if err != nil {
+			return nil, err
+		}
+		n1.Val = mergedVal
+		return n1, nil
+
+	case *AccountNode:
+		n2, ok := node2.(*AccountNode)
+		if !ok {
+			if fullNode, fullOk := node2.(*FullNode); fullOk {
+				return mergeAccountWithFullNode(n1, fullNode, path)
+			}
+			return nil, fmt.Errorf(
+				"children have different types at path=%s: %T != %T child1=%s child2=%s",
+				formatMergePath(path),
+				node1,
+				node2,
+				describeNodeForMerge(node1),
+				describeNodeForMerge(node2),
+			)
+		}
+		storage1 := n1.Storage
+		storage2 := n2.Storage
+		if storage1 == nil {
+			n1.Storage = storage2
+			return n1, nil
+		}
+		if storage2 == nil {
+			return n1, nil
+		}
+		_, storageIsHash1 := storage1.(*HashNode)
+		_, storageIsHash2 := storage2.(*HashNode)
+		switch {
+		case storageIsHash1 && !storageIsHash2:
+			n1.Storage = storage2
+		case !storageIsHash1 && storageIsHash2:
+			// Keep expanded storage in node1.
+		case !storageIsHash1 && !storageIsHash2:
+			mergedStorage, err := mergeNodesRecursive(
+				storage1,
+				storage2,
+				mergePathAppend(path, 16),
+			)
+			if err != nil {
+				return nil, err
+			}
+			n1.Storage = mergedStorage
+		}
+		return n1, nil
+
+	case ValueNode:
+		n2, ok := node2.(ValueNode)
+		if !ok {
+			return nil, fmt.Errorf(
+				"children have different types at path=%s: %T != %T child1=%s child2=%s",
+				formatMergePath(path),
+				node1,
+				node2,
+				describeNodeForMerge(node1),
+				describeNodeForMerge(node2),
+			)
+		}
+		if !bytes.Equal(n1, n2) {
+			return nil, fmt.Errorf(
+				"value nodes differ at path=%s value1(%x)!=value2(%x)",
+				formatMergePath(path),
+				[]byte(n1),
+				[]byte(n2),
+			)
+		}
+		return n1, nil
+	}
+
+	if reflect.TypeOf(node1) != reflect.TypeOf(node2) {
+		return nil, fmt.Errorf(
+			"children have different types at path=%s: %T != %T child1=%s child2=%s",
+			formatMergePath(path),
+			node1,
+			node2,
+			describeNodeForMerge(node1),
+			describeNodeForMerge(node2),
+		)
+	}
+
+	return node1, nil
 }
 func MergeTries(tries []*Trie) (*Trie, error) {
 	if len(tries) == 0 {
