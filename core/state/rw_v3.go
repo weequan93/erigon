@@ -59,11 +59,15 @@ var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
 var mdbxMigrateFixEmptyRoot = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FIX_EMPTY_ROOT", false)
 var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
 var keepEmptyAccountsList = loadKeepEmptyAccountsList()
+
 // Preserve known Arbitrum marker accounts by default during both migration and runtime execution.
 // This can be disabled explicitly via:
-//   ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
+//
+//	ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
+//
 // or:
-//   ERIGON_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
+//
+//	ERIGON_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS=false
 var keepEmptyAccountsDefaultAddrs = dbg.EnvBool(
 	"ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS",
 	dbg.EnvBool("ERIGON_KEEP_EMPTY_ACCOUNTS_DEFAULT_ADDRS", true),
@@ -655,6 +659,12 @@ func (rs *ParallelExecutionState) CommitTxNum(sender *common.Address, txNum uint
 
 func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.SharedDomains) error {
 	var acc accounts.Account
+	type touchedContractState struct {
+		codeTouched    bool
+		storageTouched bool
+		codeWriteVal   []byte
+	}
+	touchedContractStates := make(map[common.Address]touchedContractState)
 	var fixEmptyRootAddrs map[common.Address]struct{}
 	traceApply := shouldMdbxMigrateApplyTrace(txTask)
 	if mdbxMigrateFixEmptyRoot {
@@ -799,6 +809,20 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 
 			for i, key := range list.Keys {
 				keyBytes := []byte(key)
+				if len(keyBytes) >= length.Addr {
+					addr := common.BytesToAddress(keyBytes[:length.Addr])
+					state := touchedContractStates[addr]
+					if domain == kv.CodeDomain {
+						state.codeTouched = true
+						if val := list.Vals[i]; len(val) > 0 {
+							state.codeWriteVal = append(state.codeWriteVal[:0], val...)
+						}
+					}
+					if domain == kv.StorageDomain {
+						state.storageTouched = true
+					}
+					touchedContractStates[addr] = state
+				}
 				if traceApply {
 					if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
 						addr := common.BytesToAddress(keyBytes)
@@ -1336,6 +1360,94 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			}
 		}
 	}
+	// Safety net: if code/storage changed for an address but account encoding is absent,
+	// synthesize a minimal account so commitment computation includes the contract leaf.
+	for addr, touched := range touchedContractStates {
+		if !touched.codeTouched && !touched.storageTouched {
+			continue
+		}
+		addrBytes := addr.Bytes()
+		enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
+		if err != nil {
+			return err
+		}
+		exists := len(enc0) > 0 && !isAccountTombstone(enc0)
+		var nextAcc accounts.Account
+		nextAcc.Reset()
+		if exists {
+			if err := accounts.DeserialiseV3(&nextAcc, enc0); err != nil {
+				return err
+			}
+		}
+
+		needsPut := false
+		if touched.codeTouched {
+			codeVal, _, err := domains.GetLatest(kv.CodeDomain, rs.tx, addrBytes)
+			if err != nil {
+				return err
+			}
+			if len(codeVal) == 0 && len(touched.codeWriteVal) > 0 {
+				prevCode, prevCodeStep, err := domains.GetLatest(kv.CodeDomain, rs.tx, addrBytes)
+				if err != nil {
+					return err
+				}
+				if err := domains.DomainPut(kv.CodeDomain, rs.tx, addrBytes, touched.codeWriteVal, txTask.TxNum, prevCode, prevCodeStep); err != nil {
+					return err
+				}
+				codeVal = touched.codeWriteVal
+				if traceApply {
+					log.Warn("state apply restored code from write-list fallback",
+						"block", txTask.BlockNum,
+						"tx_index", txTask.TxIndex,
+						"tx_num", txTask.TxNum,
+						"addr", addr.Hex(),
+						"code_len", len(codeVal),
+					)
+				}
+			}
+			if len(codeVal) > 0 {
+				codeHash, err := common.HashData(codeVal)
+				if err != nil {
+					return err
+				}
+				if nextAcc.CodeHash != codeHash {
+					nextAcc.CodeHash = codeHash
+					needsPut = true
+				}
+				// EVM-created contracts start at nonce=1; recover this when account encoding is absent
+				// or was persisted as a touched-empty placeholder.
+				if nextAcc.Nonce == 0 {
+					nextAcc.Nonce = 1
+					needsPut = true
+				}
+			}
+		}
+		if !exists && !needsPut {
+			continue
+		}
+		if needsPut {
+			enc1 := accounts.SerialiseV3(&nextAcc)
+			if err := domains.DomainPut(kv.AccountsDomain, rs.tx, addrBytes, enc1, txTask.TxNum, enc0, step0); err != nil {
+				return err
+			}
+			if traceApply || isBadRootAccount(addr) {
+				log.Warn("state apply synthesized account for touched contract state",
+					"block", txTask.BlockNum,
+					"tx_index", txTask.TxIndex,
+					"tx_num", txTask.TxNum,
+					"addr", addr.Hex(),
+					"account_previously_present", exists,
+					"code_touched", touched.codeTouched,
+					"storage_touched", touched.storageTouched,
+					"nonce", nextAcc.Nonce,
+					"balance", nextAcc.Balance.ToBig().String(),
+					"code_hash", nextAcc.CodeHash.Hex(),
+					"root", nextAcc.Root.Hex(),
+				)
+			}
+		}
+	}
+
 	if traceApply {
 		for _, addr := range []common.Address{mdbxMigrateApplyTraceAccountProbe, mdbxMigrateApplyTraceStorageProbeAddr} {
 			var finalAcc accounts.Account
@@ -1784,7 +1896,7 @@ func (w *StateWriterBufferedV3) UpdateAccountCode(address common.Address, incarn
 }
 
 func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *accounts.Account) error {
-	keepEmptyRuntime := shouldKeepEmptyAccountExplicitOnly(address)
+	keepEmptyRuntime := shouldKeepEmptyAccount(address)
 	if shouldTraceApplyAccount(address) {
 		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
 		_, keepListHit := keepEmptyAccountsList[address]
@@ -1814,13 +1926,21 @@ func (w *StateWriterBufferedV3) DeleteAccount(address common.Address, original *
 		log.Warn("state writer deleteAccount request", fields...)
 	}
 	if keepEmptyRuntime && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
-		// Runtime execution must stay aligned with intra_block_state.updateAccount:
-		// only explicitly configured keep-empty accounts survive deletion here.
+		// Keep-empty behavior follows runtime + migration keep-empty configuration.
+		// Important: when the account did not previously exist, a no-op here would keep it
+		// absent and diverge from Nitro on chains that require touched-empty marker accounts.
+		// Persist canonical empty-account encoding instead of dropping to nil.
+		keepVal := common.Copy(emptyAccountEncoding)
+		if w.accumulator != nil {
+			w.accumulator.ChangeAccount(address, 0, keepVal)
+		}
+		w.writeLists[kv.AccountsDomain.String()].Push(string(address[:]), keepVal)
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
 			fields := []interface{}{
-				"action", "skip_keep_empty",
+				"action", "put_keep_empty",
 				"tx_num", w.txNum,
 				"addr", address.Hex(),
+				"val_len", len(keepVal),
 			}
 			if original != nil {
 				fields = append(fields,
@@ -1891,15 +2011,19 @@ func (w *StateWriterBufferedV3) CreateContract(address common.Address) error {
 	if w.trace {
 		fmt.Printf("create contract: %x\n", address)
 	}
-
-	//seems don't need delete code here - tests starting fail
-	//err := w.rs.domains.IteratePrefix(kv.StorageDomain, address[:], func(k, v []byte) error {
-	//	w.writeLists[string(kv.StorageDomain)].Push(string(k), nil)
-	//	return nil
-	//})
-	//if err != nil {
-	//	return err
-	//}
+	if fastCreate {
+		return nil
+	}
+	// Keep buffered writer semantics aligned with Writer.CreateContract():
+	// contract creation must start from clean storage/code even if dangling rows
+	// exist without a corresponding account record.
+	if err := w.rs.domains.IteratePrefix(kv.StorageDomain, address[:], w.rs.tx, func(k, v []byte, step kv.Step) (bool, error) {
+		w.writeLists[kv.StorageDomain.String()].Push(string(common.Copy(k)), nil)
+		return true, nil
+	}); err != nil {
+		return err
+	}
+	w.writeLists[kv.CodeDomain.String()].Push(string(address[:]), nil)
 	return nil
 }
 
@@ -1991,7 +2115,7 @@ func (w *Writer) UpdateAccountCode(address common.Address, incarnation uint64, c
 }
 
 func (w *Writer) DeleteAccount(address common.Address, original *accounts.Account) error {
-	keepEmptyRuntime := shouldKeepEmptyAccountExplicitOnly(address)
+	keepEmptyRuntime := shouldKeepEmptyAccount(address)
 	if shouldTraceApplyAccount(address) {
 		_, keepDefaultHit := arbosKeepEmptyAccounts[address]
 		_, keepListHit := keepEmptyAccountsList[address]
@@ -2021,13 +2145,26 @@ func (w *Writer) DeleteAccount(address common.Address, original *accounts.Accoun
 		log.Warn("state writer deleteAccount request", fields...)
 	}
 	if keepEmptyRuntime && (original == nil || (original.Nonce == 0 && original.Balance.IsZero() && original.IsEmptyCodeHash())) {
-		// Runtime execution must stay aligned with intra_block_state.updateAccount:
-		// only explicitly configured keep-empty accounts survive deletion here.
+		// Keep-empty behavior follows runtime + migration keep-empty configuration.
+		// Important: when the account did not previously exist, a no-op here would keep it
+		// absent and diverge from Nitro on chains that require touched-empty marker accounts.
+		// Persist canonical empty-account encoding instead of deleting.
+		keepVal := common.Copy(emptyAccountEncoding)
+		if err := w.tx.DomainPut(kv.AccountsDomain, address[:], keepVal, w.txNum, nil, 0); err != nil {
+			return err
+		}
+		if w.writeLists != nil {
+			w.writeLists[kv.AccountsDomain.String()].Push(string(address[:]), keepVal)
+		}
+		if w.accumulator != nil {
+			w.accumulator.ChangeAccount(address, 0, keepVal)
+		}
 		if mdbxMigrateAccountTrace && isMdbxMigrateTraceAccount(address) {
 			fields := []interface{}{
-				"action", "skip_keep_empty",
+				"action", "put_keep_empty",
 				"tx_num", w.txNum,
 				"addr", address.Hex(),
+				"val_len", len(keepVal),
 			}
 			if original != nil {
 				fields = append(fields,

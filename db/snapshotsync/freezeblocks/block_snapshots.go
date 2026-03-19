@@ -22,9 +22,11 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -276,13 +278,35 @@ func (br *BlockRetire) retireBlocks(ctx context.Context, minBlockNum uint64, max
 
 	notifier, logger, blockReader, tmpDir, db, workers := br.notifier, br.logger, br.blockReader, br.tmpDir, br.db, br.workers.Load()
 	snapshots := br.snapshots()
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
 
 	blockFrom, blockTo, ok := CanRetire(maxBlockNum, minBlockNum, snaptype.Unknown, br.chainConfig)
+	if debugSnapshotBuild && !ok {
+		logger.Info(
+			"[snapshots] retire gate",
+			"reason", "insufficient_block_range",
+			"min_block_num", minBlockNum,
+			"max_block_num", maxBlockNum,
+			"candidate_from", blockFrom,
+			"candidate_to", blockTo,
+			"required_min_span", 1000,
+		)
+	}
 
 	if ok {
 		if has, err := br.dbHasEnoughDataForBlocksRetire(ctx); err != nil {
 			return false, err
 		} else if !has {
+			if debugSnapshotBuild {
+				logger.Info(
+					"[snapshots] retire gate",
+					"reason", "db_gap_prevents_retire",
+					"min_block_num", minBlockNum,
+					"max_block_num", maxBlockNum,
+					"candidate_from", blockFrom,
+					"candidate_to", blockTo,
+				)
+			}
 			return false, nil
 		}
 		logger.Log(lvl, "[snapshots] Retire Blocks", "range",

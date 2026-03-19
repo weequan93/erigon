@@ -63,6 +63,34 @@ type SharedDomainsCommitmentContext struct {
 var debugDumpTouchedAccounts = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
 var debugBadRootCommitmentProbe = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var debugWitnessRetryPathMarkerOnce sync.Once
+var debugCommitmentCompareContexts = dbg.EnvBool("ERIGON_BAD_ROOT_COMPARE_CONTEXTS", false)
+var debugCommitmentCompareContextsBlock = dbg.EnvUint("ERIGON_BAD_ROOT_COMPARE_CONTEXTS_BLOCK", 0)
+var debugCommitmentCompareContextsMaxKeys = dbg.EnvInt("ERIGON_BAD_ROOT_COMPARE_CONTEXTS_MAX_KEYS", 0)
+var debugCommitmentCompareContextsMaxMismatches = dbg.EnvInt("ERIGON_BAD_ROOT_COMPARE_CONTEXTS_MAX_MISMATCHES", 8)
+
+type debugCommitmentResolvedValue struct {
+	domain string
+	step   uint64
+	value  string
+}
+
+type debugCommitmentContextSnapshot struct {
+	source      string
+	blockNum    uint64
+	txNum       uint64
+	updateCount uint64
+	keyDigest   string
+	valueDigest string
+	values      map[string]debugCommitmentResolvedValue
+	truncated   bool
+}
+
+var debugCommitmentCompareSnapshots = struct {
+	sync.Mutex
+	builderByBlock map[uint64]*debugCommitmentContextSnapshot
+}{
+	builderByBlock: make(map[uint64]*debugCommitmentContextSnapshot),
+}
 
 // Keep latest fallback opt-in only. Falling back from as-of reads to latest can
 // hide history gaps and produce witness roots that diverge from header roots.
@@ -141,6 +169,30 @@ func commitmentHexPreview(v []byte, max int) string {
 		return fmt.Sprintf("0x%x", v)
 	}
 	return fmt.Sprintf("0x%x...(+%d bytes)", v[:max], len(v)-max)
+}
+
+func shouldDebugCompareCommitmentContexts(blockNum uint64) bool {
+	if !debugCommitmentCompareContexts {
+		return false
+	}
+	if debugCommitmentCompareContextsBlock > 0 && blockNum != debugCommitmentCompareContextsBlock {
+		return false
+	}
+	return true
+}
+
+func debugCommitmentValuePreview(v string) string {
+	if strings.HasPrefix(v, "ERR:") {
+		const maxErr = 200
+		if len(v) <= maxErr {
+			return v
+		}
+		return v[:maxErr] + "...(truncated)"
+	}
+	if len(v) <= 66 {
+		return v
+	}
+	return v[:66] + "...(truncated)"
 }
 
 func shouldTraceBadRootReadDomain(domain kv.Domain, plainKey []byte) bool {
@@ -287,6 +339,198 @@ func (sdc *SharedDomainsCommitmentContext) debugUpdatesValueDigest(maxSamples in
 	}
 
 	return count, fmt.Sprintf("%x", h.Sum(nil)), samples
+}
+
+func (sdc *SharedDomainsCommitmentContext) debugResolvedValues(maxKeys int) (map[string]debugCommitmentResolvedValue, bool) {
+	out := make(map[string]debugCommitmentResolvedValue)
+	if sdc == nil || sdc.mainTtx == nil || sdc.updates == nil {
+		return out, false
+	}
+
+	keys := sdc.updates.DebugPlainKeys()
+	sort.Slice(keys, func(i, j int) bool { return bytes.Compare(keys[i], keys[j]) < 0 })
+	truncated := false
+	if maxKeys > 0 && len(keys) > maxKeys {
+		keys = keys[:maxKeys]
+		truncated = true
+	}
+
+	for _, key := range keys {
+		domain := kv.AccountsDomain
+		if len(key) > 20 {
+			domain = kv.StorageDomain
+		}
+		val, step, readErr := sdc.mainTtx.readDomain(domain, key)
+		if domain == kv.AccountsDomain {
+			// If account read is empty, attempt code domain as a debug fallback.
+			codeVal, codeStep, codeErr := sdc.mainTtx.readDomain(kv.CodeDomain, key)
+			if codeErr == nil && len(codeVal) > 0 {
+				domain = kv.CodeDomain
+				val = codeVal
+				step = codeStep
+				readErr = nil
+			}
+		}
+
+		keyHex := hex.EncodeToString(key)
+		domainName := domain.String()
+		if readErr != nil {
+			out[keyHex] = debugCommitmentResolvedValue{
+				domain: domainName,
+				step:   uint64(step),
+				value:  "ERR:" + readErr.Error(),
+			}
+			continue
+		}
+		out[keyHex] = debugCommitmentResolvedValue{
+			domain: domainName,
+			step:   uint64(step),
+			value:  "0x" + hex.EncodeToString(val),
+		}
+	}
+
+	return out, truncated
+}
+
+func debugCommitmentCompareMismatches(
+	baseline *debugCommitmentContextSnapshot,
+	current *debugCommitmentContextSnapshot,
+	maxMismatches int,
+) []string {
+	if maxMismatches <= 0 {
+		maxMismatches = 1
+	}
+	if baseline == nil || current == nil {
+		return nil
+	}
+
+	keySet := make(map[string]struct{}, len(baseline.values)+len(current.values))
+	for key := range baseline.values {
+		keySet[key] = struct{}{}
+	}
+	for key := range current.values {
+		keySet[key] = struct{}{}
+	}
+	keys := make([]string, 0, len(keySet))
+	for key := range keySet {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	mismatches := make([]string, 0, maxMismatches)
+	for _, key := range keys {
+		bv, bok := baseline.values[key]
+		cv, cok := current.values[key]
+		if !bok {
+			mismatches = append(mismatches, fmt.Sprintf("key=%s missing_in_builder current(domain=%s step=%d val=%s)", key, cv.domain, cv.step, debugCommitmentValuePreview(cv.value)))
+		} else if !cok {
+			mismatches = append(mismatches, fmt.Sprintf("key=%s missing_in_current builder(domain=%s step=%d val=%s)", key, bv.domain, bv.step, debugCommitmentValuePreview(bv.value)))
+		} else if bv.domain != cv.domain || bv.step != cv.step || bv.value != cv.value {
+			mismatches = append(mismatches, fmt.Sprintf(
+				"key=%s builder(domain=%s step=%d val=%s) current(domain=%s step=%d val=%s)",
+				key,
+				bv.domain,
+				bv.step,
+				debugCommitmentValuePreview(bv.value),
+				cv.domain,
+				cv.step,
+				debugCommitmentValuePreview(cv.value),
+			))
+		}
+		if len(mismatches) >= maxMismatches {
+			break
+		}
+	}
+	return mismatches
+}
+
+func debugCommitmentCompareAndLog(snapshot *debugCommitmentContextSnapshot) {
+	if snapshot == nil {
+		return
+	}
+	source := strings.TrimSpace(snapshot.source)
+	isBuilderSource := source == "erigonexec"
+
+	if isBuilderSource {
+		debugCommitmentCompareSnapshots.Lock()
+		debugCommitmentCompareSnapshots.builderByBlock[snapshot.blockNum] = snapshot
+		debugCommitmentCompareSnapshots.Unlock()
+		log.Warn(
+			"commitment context compare baseline stored",
+			"block", snapshot.blockNum,
+			"source", source,
+			"tx_num_arg", snapshot.txNum,
+			"update_count", snapshot.updateCount,
+			"key_digest", snapshot.keyDigest,
+			"value_digest", snapshot.valueDigest,
+			"entries", len(snapshot.values),
+			"truncated", snapshot.truncated,
+		)
+		return
+	}
+
+	var baseline *debugCommitmentContextSnapshot
+	debugCommitmentCompareSnapshots.Lock()
+	baseline = debugCommitmentCompareSnapshots.builderByBlock[snapshot.blockNum]
+	delete(debugCommitmentCompareSnapshots.builderByBlock, snapshot.blockNum)
+	debugCommitmentCompareSnapshots.Unlock()
+
+	if baseline == nil {
+		log.Warn(
+			"commitment context compare skipped (missing builder baseline)",
+			"block", snapshot.blockNum,
+			"source", source,
+			"tx_num_arg", snapshot.txNum,
+			"update_count", snapshot.updateCount,
+			"key_digest", snapshot.keyDigest,
+			"value_digest", snapshot.valueDigest,
+			"entries", len(snapshot.values),
+			"truncated", snapshot.truncated,
+		)
+		return
+	}
+
+	mismatches := debugCommitmentCompareMismatches(baseline, snapshot, debugCommitmentCompareContextsMaxMismatches)
+	if len(mismatches) == 0 {
+		log.Warn(
+			"commitment context compare match",
+			"block", snapshot.blockNum,
+			"source", source,
+			"tx_num_arg", snapshot.txNum,
+			"baseline_tx_num_arg", baseline.txNum,
+			"update_count", snapshot.updateCount,
+			"baseline_update_count", baseline.updateCount,
+			"key_digest", snapshot.keyDigest,
+			"baseline_key_digest", baseline.keyDigest,
+			"value_digest", snapshot.valueDigest,
+			"baseline_value_digest", baseline.valueDigest,
+			"entries", len(snapshot.values),
+			"baseline_entries", len(baseline.values),
+			"truncated", snapshot.truncated,
+			"baseline_truncated", baseline.truncated,
+		)
+		return
+	}
+
+	log.Warn(
+		"commitment context compare mismatch",
+		"block", snapshot.blockNum,
+		"source", source,
+		"tx_num_arg", snapshot.txNum,
+		"baseline_tx_num_arg", baseline.txNum,
+		"update_count", snapshot.updateCount,
+		"baseline_update_count", baseline.updateCount,
+		"key_digest", snapshot.keyDigest,
+		"baseline_key_digest", baseline.keyDigest,
+		"value_digest", snapshot.valueDigest,
+		"baseline_value_digest", baseline.valueDigest,
+		"entries", len(snapshot.values),
+		"baseline_entries", len(baseline.values),
+		"truncated", snapshot.truncated,
+		"baseline_truncated", baseline.truncated,
+		"mismatch_count", len(mismatches),
+		"mismatches", mismatches,
+	)
 }
 
 func (sdc *SharedDomainsCommitmentContext) SetTrace(enable bool) {
@@ -481,11 +725,25 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 			updatesValueCount     uint64
 			updatesValueDigest    string
 			updatesValueSamples   []string
+			compareSnapshot       *debugCommitmentContextSnapshot
 		)
 
 		ctxTxNum, ctxLimitReadAsOfTxNum, ctxWithHistory, hasTrieCtx = sdc.DebugReadContext()
 		updatesDigestCount, updatesDigest, updatesDigestSamples = sdc.updates.DebugDigest(64)
 		updatesValueCount, updatesValueDigest, updatesValueSamples = sdc.debugUpdatesValueDigest(64)
+		if shouldDebugCompareCommitmentContexts(blockNum) && updateCount > 0 {
+			resolvedValues, truncated := sdc.debugResolvedValues(debugCommitmentCompareContextsMaxKeys)
+			compareSnapshot = &debugCommitmentContextSnapshot{
+				source:      strings.TrimSpace(logPrefix),
+				blockNum:    blockNum,
+				txNum:       txNum,
+				updateCount: updateCount,
+				keyDigest:   updatesDigest,
+				valueDigest: updatesValueDigest,
+				values:      resolvedValues,
+				truncated:   truncated,
+			}
+		}
 		if hasTrieCtx {
 			accountKey, storageKey := probePlainKeys(sdc.updates.DebugPlainKeys())
 			targetDomain := kv.AccountsDomain
@@ -559,6 +817,9 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 			"updates_value_digest", updatesValueDigest,
 			"updates_value_samples", updatesValueSamples,
 		)
+		if compareSnapshot != nil {
+			debugCommitmentCompareAndLog(compareSnapshot)
+		}
 	}
 	if sdc.trace {
 		start := time.Now()
@@ -1041,7 +1302,35 @@ func (sdc *SharedDomainsCommitmentContext) SeekCommitment(ctx context.Context, t
 				return 0, 0, false, err
 			}
 			if lastBn < blockNum {
-				return 0, 0, false, fmt.Errorf("%w: TxNums index is at block %d and behind commitment %d", ErrBehindCommitment, lastBn, blockNum)
+				asOfTxNum, err := rawdbv3.TxNums.Max(tx, lastBn)
+				if err != nil {
+					return 0, 0, false, err
+				}
+				restoredBlock, restoredTxNum, _, restored, restoreErr := sdc.RestoreCommitmentStateAsOfTxNum(tx, asOfTxNum)
+				if restoreErr == nil && restored && restoredBlock <= lastBn {
+					log.Warn(
+						"commitment context recovered from ahead-of-txnums state",
+						"commitment_block", blockNum,
+						"commitment_txnum", txNum,
+						"txnums_last_block", lastBn,
+						"txnums_asof_txnum", asOfTxNum,
+						"restored_block", restoredBlock,
+						"restored_txnum", restoredTxNum,
+					)
+					blockNum = restoredBlock
+					txNum = restoredTxNum
+				} else {
+					if restoreErr != nil {
+						return 0, 0, false, fmt.Errorf(
+							"%w: TxNums index is at block %d and behind commitment %d (as-of restore failed: %v)",
+							ErrBehindCommitment,
+							lastBn,
+							blockNum,
+							restoreErr,
+						)
+					}
+					return 0, 0, false, fmt.Errorf("%w: TxNums index is at block %d and behind commitment %d", ErrBehindCommitment, lastBn, blockNum)
+				}
 			}
 		}
 		sdc.sharedDomains.SetBlockNum(blockNum)

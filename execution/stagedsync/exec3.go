@@ -728,8 +728,9 @@ Loop:
 				executor.domains().GetCommitmentContext().Trie().SetTrace(false)
 			}
 			commitTxNum := inputTxNum
+			commitTxNumSource := "stage_cursor_minus_one"
 			if commitTxNum > 0 {
-				// Fallback: anchor at last emitted task txnum.
+				// Anchor to the stage cursor (last txnum in the block range).
 				commitTxNum--
 			}
 			realTxCount := 0
@@ -752,47 +753,40 @@ Loop:
 				}
 				realTxCount++
 			}
+			// Arbitrum exec tasks include synthetic pre/final tasks. State root in
+			// the canonical header is anchored to the last real tx, not the final
+			// synthetic task txnum.
 			if realTxCount > 0 {
-				// Commitment must use the last real tx in the block, not synthetic
-				// pre/final tasks (tx_index=-1 / tx_index=len(txs)).
 				commitTxNum = realTxMax
+				commitTxNumSource = "last_real_tx"
 			}
+
 			commitmentCtx := executor.domains().GetCommitmentContext()
 			restoredState := false
 			restoredStateBlock := uint64(0)
 			restoredStateTxNum := uint64(0)
 			restoredStateRoot := common.Hash{}
+			restoreSkipped := true
+			restoreSkipReason := "disabled to preserve current block commitment updates"
+			preRestoreCtxTxNum := uint64(0)
+			preRestoreCtxReadable := false
 			if commitmentCtx != nil {
-				if temporalTx, ok := executor.tx().(kv.TemporalTx); ok {
-					restoredBlock, restoredTxNum, restoredRoot, restored, restoreErr := commitmentCtx.RestoreLatestCommitmentStateFromTx(temporalTx)
-					if restoreErr != nil {
-						return fmt.Errorf("restore latest commitment state from tx: %w", restoreErr)
-					}
-					restoredState = restored
-					restoredStateBlock = restoredBlock
-					restoredStateTxNum = restoredTxNum
-					if len(restoredRoot) > 0 {
-						restoredStateRoot = common.BytesToHash(restoredRoot)
-					}
-				} else {
-					restoredBlock, restoredTxNum, restored, restoreErr := commitmentCtx.RestoreLatestCommitmentState()
-					if restoreErr != nil {
-						return fmt.Errorf("restore latest commitment state: %w", restoreErr)
-					}
-					restoredState = restored
-					restoredStateBlock = restoredBlock
-					restoredStateTxNum = restoredTxNum
-				}
+				preRestoreCtxTxNum, _, _, preRestoreCtxReadable = commitmentCtx.DebugReadContext()
 			}
 			if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
 				logger.Warn("exec3: per-block commitment txnum",
 					"block", blockNum,
 					"input_txnum", inputTxNum,
 					"commit_txnum", commitTxNum,
+					"commit_txnum_source", commitTxNumSource,
 					"domains_txnum", executor.domains().TxNum(),
 					"real_tx_count", realTxCount,
 					"real_tx_min", realTxMin,
 					"real_tx_max", realTxMax,
+					"restore_skipped", restoreSkipped,
+					"restore_skip_reason", restoreSkipReason,
+					"ctx_txnum_before_restore", preRestoreCtxTxNum,
+					"ctx_readable_before_restore", preRestoreCtxReadable,
 					"state_restored", restoredState,
 					"state_restored_block", restoredStateBlock,
 					"state_restored_txnum", restoredStateTxNum,
@@ -845,50 +839,12 @@ Loop:
 						ctxTxBeforeProbe = txNum
 					}
 				}
-				probeFrom := uint64(0)
-				if commitTxNum > 3 {
-					probeFrom = commitTxNum - 3
-				}
-				for probeTx := probeFrom; probeTx <= commitTxNum; probeTx++ {
-					commitmentCtx.SetTxNum(probeTx)
-					probeRoot, probeErr := commitmentCtx.DebugRootHash(ctx, execStage.LogPrefix())
-					if probeErr != nil {
-						logger.Warn("exec3: commitment txnum probe",
-							"block", blockNum,
-							"probe_txnum", probeTx,
-							"err", probeErr,
-						)
-						continue
-					}
-					logger.Warn("exec3: commitment txnum probe",
-						"block", blockNum,
-						"probe_txnum", probeTx,
-						"root", common.BytesToHash(probeRoot),
-					)
-				}
-				// Re-restore state after debug probes. DebugRootHash is intended to be
-				// non-mutating, but in practice this keeps the live trie anchored to the
-				// latest persisted commitment snapshot before the real per-block compute.
-				if temporalTx, ok := executor.tx().(kv.TemporalTx); ok {
-					restoreBlock, restoreTxNum, restoreRoot, restoreOK, restoreErr := commitmentCtx.RestoreLatestCommitmentStateFromTx(temporalTx)
-					if restoreErr != nil {
-						return fmt.Errorf("restore commitment state after probe: %w", restoreErr)
-					}
-					logger.Warn("exec3: commitment txnum probe state restore",
-						"block", blockNum,
-						"restored", restoreOK,
-						"restored_block", restoreBlock,
-						"restored_txnum", restoreTxNum,
-						"restored_root", common.BytesToHash(restoreRoot),
-					)
-				}
-				// Keep commitment context aligned with the block commitment tx.
-				// The original context tx is restored later after ComputeCommitment.
-				commitmentCtx.SetTxNum(commitTxNum)
 				logger.Warn("exec3: commitment txnum probe restore",
 					"block", blockNum,
 					"ctx_txnum_before_probe", ctxTxBeforeProbe,
 					"ctx_txnum_for_compute", commitTxNum,
+					"state_restore_after_probe_skipped", true,
+					"probe_disabled_reason", "avoid mutating commitment context before compute",
 				)
 			}
 			rh, err := executor.domains().ComputeCommitment(ctx, true, blockNum, commitTxNum, execStage.LogPrefix())
@@ -2617,6 +2573,49 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		return true, times, nil
 	}
 	if !bytes.Equal(computedRootHash, header.Root.Bytes()) {
+		// Fallback for fast-path commitment divergence:
+		// rebuild as-of current txnum from touched keys and full latest scan.
+		// If fallback matches header root, treat it as authoritative and proceed.
+		fallbackTried := false
+		fallbackMatched := false
+		var fallbackErr error
+		var fallbackRootHash []byte
+		if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
+			if commitmentCtx := doms.GetCommitmentContext(); commitmentCtx != nil {
+				fallbackTried = true
+				fallbackRootHash, fallbackErr = commitmentCtx.RebuildCommitmentAsOfTxNumFullScan(ctx, temporalTx, header.Number.Uint64(), doms.TxNum())
+				if fallbackErr == nil {
+					fallbackMatched = bytes.Equal(fallbackRootHash, header.Root.Bytes())
+					if fallbackMatched {
+						computedRootHash = fallbackRootHash
+					}
+				}
+				logger.Warn("Bad state root fallback rebuild",
+					"block", header.Number.Uint64(),
+					"doms_txnum", doms.TxNum(),
+					"fallback_err", fallbackErr,
+					"fallback_root", common.BytesToHash(fallbackRootHash),
+					"header_root", header.Root,
+					"matches_header", fallbackMatched,
+				)
+			}
+		}
+		if fallbackTried && fallbackMatched {
+			logger.Warn("Bad state root resolved by fallback rebuild",
+				"block", header.Number.Uint64(),
+				"root", common.BytesToHash(computedRootHash),
+				"txnum", doms.TxNum(),
+			)
+			if !inMemExec {
+				flushStart := time.Now()
+				if err := doms.Flush(ctx, applyTx); err != nil {
+					return false, times, err
+				}
+				times.Flush = time.Since(flushStart)
+			}
+			return true, times, nil
+		}
+
 		minTxNum, minTxErr := rawdbv3.TxNums.Min(applyTx, header.Number.Uint64())
 		maxTxNum, maxTxErr := rawdbv3.TxNums.Max(applyTx, header.Number.Uint64())
 		logger.Warn("Bad state root mismatch checkpoint",

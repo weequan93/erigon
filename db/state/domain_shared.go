@@ -78,6 +78,10 @@ type SharedDomains struct {
 var sweepAccountTombstonesInit = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_INIT", false)
 var badRootWriteTrace = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var badRootTraceGetLatest = dbg.EnvBool("ERIGON_BAD_ROOT_TRACE_GET_LATEST", false)
+// ERIGON_COMMITMENT_MODE_UPDATE forces commitment tracking to carry update payloads
+// instead of direct key-only touches. Useful for diagnosing/avoiding divergence
+// when direct-mode value resolution differs between builder and replay contexts.
+var erigonCommitmentModeUpdate = dbg.EnvBool("ERIGON_COMMITMENT_MODE_UPDATE", false)
 var badRootWriteTraceStorageProbeKey = common.FromHex(dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", ""))
 
 var badRootWriteTraceAccounts = func() map[string]struct{} {
@@ -117,7 +121,17 @@ func NewSharedDomains(tx kv.TemporalTx, logger log.Logger) (*SharedDomains, erro
 		tv = commitment.VariantConcurrentHexPatricia
 	}
 
-	sd.sdCtx = commitmentdb.NewSharedDomainsCommitmentContext(sd, tx, commitment.ModeDirect, tv, tx.Debug().Dirs().Tmp)
+	commitmentMode := commitment.ModeDirect
+	if erigonCommitmentModeUpdate {
+		commitmentMode = commitment.ModeUpdate
+	}
+	sd.sdCtx = commitmentdb.NewSharedDomainsCommitmentContext(sd, tx, commitmentMode, tv, tx.Debug().Dirs().Tmp)
+	if erigonCommitmentModeUpdate {
+		log.Warn("shared domains commitment mode override",
+			"mode", commitmentMode.String(),
+			"env", "ERIGON_COMMITMENT_MODE_UPDATE=true",
+		)
+	}
 
 	if err := sd.SeekCommitment(context.Background(), tx); err != nil {
 		return nil, err
@@ -521,7 +535,6 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 //   - if `val == nil` it will call DomainDel
 func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte, txNum uint64, prevVal []byte, prevStep kv.Step) error {
 	ks := string(k)
-	sd.sdCtx.TouchKey(domain, ks, nil)
 	curVal := prevVal
 	curStep := prevStep
 	if curVal == nil {
@@ -531,24 +544,38 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 			return err
 		}
 	}
-	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
 
 	switch domain {
 	case kv.AccountsDomain:
+		// Always clear descendant storage/code first in case of dangling rows.
 		if err := sd.DomainDelPrefix(kv.StorageDomain, tx, k, txNum); err != nil {
 			return err
 		}
 		if err := sd.DomainDel(kv.CodeDomain, tx, k, txNum, nil, 0); err != nil {
 			return err
 		}
-		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, orig.data, orig.prevStep)
-	case kv.CodeDomain:
-		if curVal == nil {
+
+		// Deleting a non-existent account is a no-op. Do not touch commitment
+		// keys for this path, because it may introduce spurious trie updates.
+		if len(curVal) == 0 {
 			return nil
 		}
+
+		sd.sdCtx.TouchKey(domain, ks, nil)
+		orig, _ := sd.origPrev(domain, ks, curVal, curStep)
+		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, orig.data, orig.prevStep)
+	case kv.CodeDomain:
+		if len(curVal) == 0 {
+			return nil
+		}
+		sd.sdCtx.TouchKey(domain, ks, nil)
 	default:
-		//noop
+		if len(curVal) == 0 {
+			return nil
+		}
+		sd.sdCtx.TouchKey(domain, ks, nil)
 	}
+	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
 	return sd.mem.DomainDel(domain, ks, txNum, orig.data, orig.prevStep)
 }
 

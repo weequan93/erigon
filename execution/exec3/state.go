@@ -95,6 +95,18 @@ func runtimeHexPreview(raw []byte, max int) string {
 	return fmt.Sprintf("0x%x...(+%d bytes)", raw[:max], len(raw)-max)
 }
 
+func runtimeDecodeAccountPayload(raw []byte) (nonce uint64, balance string, codeHash string, decodeErr string) {
+	if len(raw) == 0 {
+		return 0, "0", "0x", ""
+	}
+	var acc accounts.Account
+	acc.Reset()
+	if err := accounts.DeserialiseV3(&acc, raw); err != nil {
+		return 0, "0", "0x", err.Error()
+	}
+	return acc.Nonce, acc.Balance.ToBig().String(), acc.CodeHash.Hex(), ""
+}
+
 func runtimeDomainsTxNum(rs *state.ParallelExecutionState) uint64 {
 	if rs == nil || rs.Domains() == nil {
 		return 0
@@ -273,6 +285,7 @@ func logRuntimeWriteSetProbe(logger log.Logger, txTask *state.TxTask, domainsTxN
 			if val == nil {
 				op = "del"
 			}
+			nonce, balance, codeHash, decodeErr := runtimeDecodeAccountPayload(val)
 			logger.Warn(
 				"exec3: write-set account probe",
 				"block", txTask.BlockNum,
@@ -283,6 +296,11 @@ func logRuntimeWriteSetProbe(logger log.Logger, txTask *state.TxTask, domainsTxN
 				"op", op,
 				"addr", accountProbeAddr,
 				"val_len", len(val),
+				"val_preview", runtimeHexPreview(val, 64),
+				"val_nonce", nonce,
+				"val_balance", balance,
+				"val_code_hash", codeHash,
+				"val_decode_err", decodeErr,
 			)
 			accountProbeOps++
 		}
@@ -744,7 +762,6 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 		} else {
 			txTask.Failed = applyRes.Failed()
 			txTask.GasUsed = applyRes.GasUsed
-			// Update the state with pending changes
 			ibs.SoftFinalise()
 			logRuntimePathProbe(rw.logger, "after-soft-finalise", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 			logRuntimeIbsSummary(rw.logger, "after-soft-finalise", txTask, ibs, runtimeDomainsTxNum(rw.rs))
@@ -756,7 +773,6 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 					"root", root,
 				)
 			}
-			//txTask.Error = ibs.FinalizeTx(rules, noop)
 			txTask.Logs = ibs.GetRawLogs(txTask.TxIndex)
 			txTask.TraceFroms = rw.callTracer.Froms()
 			txTask.TraceTos = rw.callTracer.Tos()

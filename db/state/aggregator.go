@@ -1560,23 +1560,59 @@ func (a *Aggregator) SetProduceMod(produce bool) {
 // Returns channel which is closed when aggregation is done
 func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 	fin := make(chan struct{})
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
+	visibleMinimax := a.visibleFilesMinimaxTxNum.Load()
+	needsTxNumGt := visibleMinimax + a.stepSize
 
 	if !a.produce {
+		if debugSnapshotBuild {
+			a.logger.Info(
+				"[snapshots] build gate",
+				"reason", "produce_disabled",
+				"txnum", txNum,
+				"visible_minimax_txnum", visibleMinimax,
+				"step_size", a.stepSize,
+				"needs_txnum_gt", needsTxNumGt,
+				"building_files", a.buildingFiles.Load(),
+			)
+		}
 		close(fin)
 		return fin
 	}
 
-	if (txNum + 1) <= a.visibleFilesMinimaxTxNum.Load()+a.stepSize {
+	if (txNum + 1) <= needsTxNumGt {
+		if debugSnapshotBuild {
+			a.logger.Info(
+				"[snapshots] build gate",
+				"reason", "below_threshold",
+				"txnum", txNum,
+				"visible_minimax_txnum", visibleMinimax,
+				"step_size", a.stepSize,
+				"needs_txnum_gt", needsTxNumGt,
+				"building_files", a.buildingFiles.Load(),
+			)
+		}
 		close(fin)
 		return fin
 	}
 
 	if ok := a.buildingFiles.CompareAndSwap(false, true); !ok {
+		if debugSnapshotBuild {
+			a.logger.Info(
+				"[snapshots] build gate",
+				"reason", "already_building",
+				"txnum", txNum,
+				"visible_minimax_txnum", visibleMinimax,
+				"step_size", a.stepSize,
+				"needs_txnum_gt", needsTxNumGt,
+				"building_files", a.buildingFiles.Load(),
+			)
+		}
 		close(fin)
 		return fin
 	}
 
-	step := kv.Step(a.visibleFilesMinimaxTxNum.Load() / a.StepSize())
+	step := kv.Step(visibleMinimax / a.StepSize())
 
 	a.wg.Add(1)
 	go func() {
@@ -1604,6 +1640,15 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 		//lastInDB := lastIdInDB(a.db, a.d[kv.AccountsDomain])
 		hasData := lastInDB > step // `step` must be fully-written - means `step+1` records must be visible
 		if !hasData {
+			if debugSnapshotBuild {
+				a.logger.Info(
+					"[snapshots] build skipped",
+					"reason", "last_in_db_not_ahead_of_step",
+					"step", step,
+					"last_in_db", lastInDB,
+					"txnum", txNum,
+				)
+			}
 			close(fin)
 			return
 		}
