@@ -3495,6 +3495,7 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 	ctxUpdatesDeleteSeen := 0
 	ctxUpdatesSkippedNoInput := 0
 	ctxUpdatesSyntheticDeleteSkipped := 0
+	ctxUpdatesSyntheticApplied := 0
 	ctxRuntimeFlags := resolveWitnessCtxUpdateRuntimeFlags()
 	ctxUpdatesModeDirect := updates.mode == ModeDirect
 	ctxUpdatesModeDirectApply := ctxUpdatesModeDirect && ctxRuntimeFlags.ModeDirectEnabled && !ctxRuntimeFlags.ApplyDisabledUnsafe
@@ -3630,6 +3631,14 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			// from the recorded block inputs.
 			ctxUpdatesSeen++
 			applyUpdate := stateUpdate
+			if applyUpdate == nil && ctxUpdatesModeDirect && ctxRuntimeFlags.ModeDirectUnsafe && update != nil {
+				// Unsafe fallback: when mode-direct carries only keys, allow using
+				// context updates as payloads to keep witness replay aligned for
+				// difficult blocks. Guarded by *_MODE_DIRECT_UNSAFE.
+				dup := *update
+				applyUpdate = &dup
+				ctxUpdatesSyntheticApplied++
+			}
 			if applyUpdate == nil {
 				ctxUpdatesSkippedNoInput++
 				if update != nil && update.Deleted() {
@@ -3759,6 +3768,7 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			"delete_seen", ctxUpdatesDeleteSeen,
 			"skipped_no_input", ctxUpdatesSkippedNoInput,
 			"synthetic_delete_skipped", ctxUpdatesSyntheticDeleteSkipped,
+			"synthetic_applied", ctxUpdatesSyntheticApplied,
 			"mode_direct", ctxUpdatesModeDirect,
 			"mode_direct_apply_enabled", ctxUpdatesModeDirectApply,
 			"mode_direct_unsafe", ctxRuntimeFlags.ModeDirectUnsafe,
