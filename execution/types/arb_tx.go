@@ -628,6 +628,7 @@ func copyAddressPtr(a *common.Address) *common.Address {
 // // TransactionToMessage converts a transaction into a Message.
 func TransactionToMessage(tx Transaction, s ArbitrumSigner, baseFee *big.Int, runmode MessageRunMode) (msg *Message, err error) {
 	// tx.AsMessage(s types.Signer, baseFee *big.Int, rules *chain.Rules)
+	skipChecks := skipAccountChecks[tx.Type()]
 	msg = &Message{
 		TxRunMode: runmode,
 		Tx:        tx,
@@ -642,7 +643,12 @@ func TransactionToMessage(tx Transaction, s ArbitrumSigner, baseFee *big.Int, ru
 		amount:            *tx.GetValue(), // TODO amount is value?
 		data:              tx.GetData(),
 		accessList:        tx.GetAccessList(),
-		SkipAccountChecks: false, // tx.SkipAccountChecks(), // TODO Arbitrum upstream this was init'd to false
+		// Preserve legacy Erigon nonce-check semantics as well as the explicit
+		// Arbitrum skip flag used by geth message adapters.
+		checkNonce: !skipChecks,
+		// Arbitrum internal tx types (deposit/retryable/internal/contract) must skip
+		// account nonce/EOA checks to match Nitro/geth execution semantics.
+		SkipAccountChecks: skipChecks,
 		blobHashes:        tx.GetBlobHashes(),
 		// maxFeePerBlobGas:  tx.GetBlobGasFeeCap(),
 		// BlobGasFeeCap:     tx.GetBlobGasFeeCap(), // TODO

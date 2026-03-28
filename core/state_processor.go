@@ -50,7 +50,12 @@ func applyTransaction(config *chain.Config, engine consensus.EngineReader, gp *G
 	if err != nil {
 		return nil, nil, err
 	}
-	msg.SetCheckNonce(!cfg.StatelessExec)
+	// Preserve tx-specific nonce-check semantics (e.g. Arbitrum internal/retryable
+	// transactions that intentionally skip account checks). Only force-disable in
+	// stateless execution mode.
+	if cfg.StatelessExec {
+		msg.SetCheckNonce(false)
+	}
 
 	if cfg.Tracer != nil {
 		if cfg.Tracer.OnTxStart != nil {
@@ -147,7 +152,12 @@ func applyArbTransaction(config *chain.Config, engine consensus.EngineReader, gp
 	if err != nil {
 		return nil, nil, err
 	}
-	msg.SetCheckNonce(!cfg.StatelessExec)
+	// Preserve tx-specific nonce-check semantics (e.g. Arbitrum internal/retryable
+	// transactions that intentionally skip account checks). Only force-disable in
+	// stateless execution mode.
+	if cfg.StatelessExec {
+		msg.SetCheckNonce(false)
+	}
 
 	if cfg.Tracer != nil {
 		if cfg.Tracer.OnTxStart != nil {
