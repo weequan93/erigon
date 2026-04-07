@@ -388,6 +388,16 @@ func (d *Domain) openDirtyFiles() (err error) {
 					}
 					if item.existence, err = existence.OpenFilter(fPath, false); err != nil {
 						_, fName := filepath.Split(fPath)
+						// Recover from stale/corrupted existence-filter artifacts and allow rebuild.
+						if strings.Contains(err.Error(), "wrong magic") || strings.Contains(err.Error(), "incompatible version") {
+							removed, rmErr := d.removeDomainExistenceFilters(fPath)
+							if rmErr != nil {
+								d.logger.Warn("[agg] Domain.openDirtyFiles", "err", rmErr, "f", fName)
+							} else {
+								d.logger.Warn("[snapshots] dropping invalid existence filter", "domain", d.FilenameBase, "path", fPath, "removed", removed, "err", err)
+							}
+							continue
+						}
 						d.logger.Warn("[agg] Domain.openDirtyFiles", "err", err, "f", fName)
 						// don't interrupt on error. other files may be good
 					}

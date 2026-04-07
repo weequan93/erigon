@@ -292,6 +292,17 @@ func (br *BlockRetire) retireBlocks(ctx context.Context, minBlockNum uint64, max
 			"required_min_span", 1000,
 		)
 	}
+	if debugSnapshotBuild && ok {
+		logger.Info(
+			"[snapshots] retire gate",
+			"reason", "eligible_range",
+			"min_block_num", minBlockNum,
+			"max_block_num", maxBlockNum,
+			"candidate_from", blockFrom,
+			"candidate_to", blockTo,
+			"workers", workers,
+		)
+	}
 
 	if ok {
 		if has, err := br.dbHasEnoughDataForBlocksRetire(ctx); err != nil {
@@ -311,13 +322,39 @@ func (br *BlockRetire) retireBlocks(ctx context.Context, minBlockNum uint64, max
 		}
 		logger.Log(lvl, "[snapshots] Retire Blocks", "range",
 			fmt.Sprintf("%s-%s", common.PrettyCounter(blockFrom), common.PrettyCounter(blockTo)))
+		dumpStarted := time.Now()
+		if debugSnapshotBuild {
+			logger.Info(
+				"[snapshots] retire dump start",
+				"from", blockFrom,
+				"to", blockTo,
+				"workers", workers,
+				"snapshots_dir", snapshots.Dir(),
+			)
+		}
 		// in future we will do it in background
 		if err := DumpBlocks(ctx, blockFrom, blockTo, br.chainConfig, tmpDir, snapshots.Dir(), db, int(workers), lvl, logger, blockReader); err != nil {
 			return ok, fmt.Errorf("DumpBlocks: %w", err)
 		}
+		if debugSnapshotBuild {
+			logger.Info(
+				"[snapshots] retire dump done",
+				"from", blockFrom,
+				"to", blockTo,
+				"took", time.Since(dumpStarted),
+			)
+		}
 
 		if err := snapshots.OpenFolder(); err != nil {
 			return ok, fmt.Errorf("open: %w", err)
+		}
+		if debugSnapshotBuild {
+			logger.Info(
+				"[snapshots] retire open folder done",
+				"from", blockFrom,
+				"to", blockTo,
+				"blocks_available", snapshots.BlocksAvailable(),
+			)
 		}
 		snapshots.LogStat("blocks:retire")
 		if notifier != nil && !reflect.ValueOf(notifier).IsNil() { // notify about new snapshots of any size
@@ -326,23 +363,51 @@ func (br *BlockRetire) retireBlocks(ctx context.Context, minBlockNum uint64, max
 	}
 
 	merged, err := br.MergeBlocks(ctx, lvl, seedNewSnapshots, onDelete)
+	if debugSnapshotBuild {
+		logger.Info(
+			"[snapshots] retire cycle done",
+			"retired_new_range", ok,
+			"merged_ranges", merged,
+			"err", err,
+		)
+	}
 	return ok || merged, err
 }
 
 func (br *BlockRetire) MergeBlocks(ctx context.Context, lvl log.Lvl, seedNewSnapshots func(downloadRequest []snapshotsync.DownloadRequest) error, onDelete func(l []string) error) (merged bool, err error) {
 	notifier, logger, _, tmpDir, db, workers := br.notifier, br.logger, br.blockReader, br.tmpDir, br.db, br.workers.Load()
 	snapshots := br.snapshots()
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
 
 	merger := snapshotsync.NewMerger(tmpDir, int(workers), lvl, db, br.chainConfig, logger)
 	rangesToMerge := merger.FindMergeRanges(snapshots.Ranges(true), snapshots.BlocksAvailable())
+	if debugSnapshotBuild {
+		rangesForLog := make([]string, 0, len(rangesToMerge))
+		for _, r := range rangesToMerge {
+			rangesForLog = append(rangesForLog, fmt.Sprintf("%d-%d", r.From(), r.To()))
+		}
+		logger.Info(
+			"[snapshots] merge plan",
+			"ranges", rangesForLog,
+			"blocks_available", snapshots.BlocksAvailable(),
+			"workers", workers,
+		)
+	}
 	if len(rangesToMerge) == 0 {
 		//TODO: enable, but optimize to reduce chain-tip impact
 		//if err := snapshots.RemoveOverlaps(); err != nil {
 		//	return false, err
 		//}
+		if debugSnapshotBuild {
+			logger.Info("[snapshots] merge skipped", "reason", "no_ranges")
+		}
 		return false, nil
 	}
 	merged = true
+	mergeStarted := time.Now()
+	if debugSnapshotBuild {
+		logger.Info("[snapshots] merge start", "range_count", len(rangesToMerge))
+	}
 	onMerge := func(r snapshotsync.Range) error {
 		if notifier != nil && !reflect.ValueOf(notifier).IsNil() { // notify about new snapshots of any size
 			notifier.OnNewSnapshot()
@@ -359,12 +424,24 @@ func (br *BlockRetire) MergeBlocks(ctx context.Context, lvl log.Lvl, seedNewSnap
 		return nil
 	}
 	if err = merger.Merge(ctx, &snapshots.RoSnapshots, snapshots.Types(), rangesToMerge, snapshots.Dir(), true /* doIndex */, onMerge, onDelete); err != nil {
+		if debugSnapshotBuild {
+			logger.Info("[snapshots] merge failed", "err", err)
+		}
 		return false, err
+	}
+	if debugSnapshotBuild {
+		logger.Info("[snapshots] merge done", "took", time.Since(mergeStarted))
 	}
 
 	// remove old garbage files
 	if err = snapshots.RemoveOverlaps(onDelete); err != nil {
+		if debugSnapshotBuild {
+			logger.Info("[snapshots] remove overlaps failed", "err", err)
+		}
 		return false, err
+	}
+	if debugSnapshotBuild {
+		logger.Info("[snapshots] remove overlaps done")
 	}
 	return
 }
@@ -437,17 +514,36 @@ func (br *BlockRetire) RetireBlocksInBackground(
 	onFinishRetire func() error,
 	onDone func(),
 ) bool {
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
 	if maxBlockNum > br.maxScheduledBlock.Load() {
 		br.maxScheduledBlock.Store(maxBlockNum)
 	}
 
 	if !br.working.CompareAndSwap(false, true) {
+		if debugSnapshotBuild {
+			br.logger.Info(
+				"[snapshots] retire background skipped",
+				"reason", "already_running",
+				"min_block_num", minBlockNum,
+				"max_block_num", maxBlockNum,
+				"max_scheduled_block", br.maxScheduledBlock.Load(),
+			)
+		}
 		return false
+	}
+	if debugSnapshotBuild {
+		br.logger.Info(
+			"[snapshots] retire background started",
+			"min_block_num", minBlockNum,
+			"max_block_num", maxBlockNum,
+			"max_scheduled_block", br.maxScheduledBlock.Load(),
+		)
 	}
 
 	go func() {
 		defer onDone()
 		defer br.working.Store(false)
+		started := time.Now()
 
 		if br.snBuildAllowed != nil {
 			//we are inside own goroutine - it's fine to block here
@@ -467,6 +563,9 @@ func (br *BlockRetire) RetireBlocksInBackground(
 		if err != nil {
 			br.logger.Warn("[snapshots] retire blocks", "err", err)
 			return
+		}
+		if debugSnapshotBuild {
+			br.logger.Info("[snapshots] retire background done", "took", time.Since(started))
 		}
 	}()
 

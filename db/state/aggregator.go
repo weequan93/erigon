@@ -1613,6 +1613,15 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 	}
 
 	step := kv.Step(visibleMinimax / a.StepSize())
+	if debugSnapshotBuild {
+		a.logger.Info(
+			"[snapshots] build accepted",
+			"txnum", txNum,
+			"visible_minimax_txnum", visibleMinimax,
+			"step_size", a.stepSize,
+			"start_step", step,
+		)
+	}
 
 	a.wg.Add(1)
 	go func() {
@@ -1621,12 +1630,18 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 
 		if a.snapshotBuildSema != nil {
 			//we are inside own goroutine - it's fine to block here
+			if debugSnapshotBuild {
+				a.logger.Info("[snapshots] build waiting for semaphore", "txnum", txNum, "start_step", step)
+			}
 			if err := a.snapshotBuildSema.Acquire(a.ctx, 1); err != nil { //TODO: not sure if this ctx is correct
 				a.logger.Warn("[snapshots] buildFilesInBackground", "err", err)
 				close(fin)
 				return //nolint
 			}
 			defer a.snapshotBuildSema.Release(1)
+			if debugSnapshotBuild {
+				a.logger.Info("[snapshots] build acquired semaphore", "txnum", txNum, "start_step", step)
+			}
 		}
 
 		lastInDB := max(
@@ -1635,6 +1650,7 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 			lastIdInDB(a.db, a.d[kv.StorageDomain]),
 			lastIdInDBNoHistory(a.db, a.d[kv.CommitmentDomain]))
 		a.logger.Info("BuildFilesInBackground", "step", step, "lastInDB", lastInDB)
+		startStep := step
 
 		// check if db has enough data (maybe we didn't commit them yet or all keys are unique so history is empty)
 		//lastInDB := lastIdInDB(a.db, a.d[kv.AccountsDomain])
@@ -1657,7 +1673,17 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 		// - to reduce amount of small merges
 		// - to remove old data from db as early as possible
 		// - during files build, may happen commit of new data. on each loop step getting latest id in db
+		var builtSteps uint64
 		for ; step < lastInDB; step++ { //`step` must be fully-written - means `step+1` records must be visible
+			if debugSnapshotBuild && (builtSteps == 0 || builtSteps%25 == 0 || step+1 == lastInDB) {
+				a.logger.Info(
+					"[snapshots] build progress",
+					"current_step", step,
+					"start_step", startStep,
+					"last_in_db", lastInDB,
+					"built_steps", builtSteps,
+				)
+			}
 			if err := a.buildFiles(a.ctx, step); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, common.ErrStopped) {
 					close(fin)
@@ -1666,16 +1692,33 @@ func (a *Aggregator) BuildFilesInBackground(txNum uint64) chan struct{} {
 				a.logger.Warn("[snapshots] buildFilesInBackground", "err", err)
 				break
 			}
+			builtSteps++
 			a.onFilesChange(nil)
+		}
+		if debugSnapshotBuild {
+			a.logger.Info(
+				"[snapshots] build phase done",
+				"start_step", startStep,
+				"next_step", step,
+				"last_in_db", lastInDB,
+				"built_steps", builtSteps,
+			)
 		}
 		go func() {
 			defer close(fin)
+			if debugSnapshotBuild {
+				a.logger.Info("[snapshots] merge loop start", "start_step", startStep, "built_steps", builtSteps)
+			}
 
 			if err := a.MergeLoop(a.ctx); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, common.ErrStopped) {
 					return
 				}
 				a.logger.Warn("[snapshots] merge", "err", err)
+				return
+			}
+			if debugSnapshotBuild {
+				a.logger.Info("[snapshots] merge loop done", "start_step", startStep, "built_steps", builtSteps)
 			}
 		}()
 	}()

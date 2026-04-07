@@ -18,6 +18,7 @@ package existence
 
 import (
 	"bufio"
+	"compress/gzip"
 	"fmt"
 	"hash"
 	"os"
@@ -202,8 +203,22 @@ func OpenFilter(filePath string, useFuse bool) (idx *Filter, err error) {
 		validationPassed = true
 		return idx, nil
 	}
+
 	filter := new(bloomfilter.Filter)
-	_, err = filter.UnmarshalFromReader(bufio.NewReaderSize(f, 1*1024*1024))
+	reader := bufio.NewReaderSize(f, 1*1024*1024)
+	if header, peekErr := reader.Peek(2); peekErr == nil && len(header) == 2 && header[0] == 0x1f && header[1] == 0x8b {
+		// Backward/compatibility path: some existing datasets contain gzip-compressed .kvei files.
+		// Read them transparently instead of failing with "wrong magic" on bloom payload.
+		log.Debug("[snapshots] reading gzip-compressed existence filter", "file", fileName)
+		gzReader, gzErr := gzip.NewReader(reader)
+		if gzErr != nil {
+			return nil, fmt.Errorf("OpenFilter: gzip reader: %w, %s", gzErr, fileName)
+		}
+		defer gzReader.Close()
+		_, err = filter.UnmarshalFromReader(bufio.NewReaderSize(gzReader, 1*1024*1024))
+	} else {
+		_, err = filter.UnmarshalFromReader(reader)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("OpenFilter: %w, %s", err, fileName)
 	}

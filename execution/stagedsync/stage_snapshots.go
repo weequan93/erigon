@@ -113,6 +113,16 @@ func SpawnStageSnapshots(
 	logger log.Logger,
 ) (err error) {
 	useExternalTx := tx != nil
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
+	if debugSnapshotBuild {
+		logger.Info(
+			"[snapshots] stage forward enter",
+			"stage_block_number", s.BlockNumber,
+			"first_cycle", s.CurrentSyncCycle.IsFirstCycle,
+			"initial_cycle", s.CurrentSyncCycle.IsInitialCycle,
+			"use_external_tx", useExternalTx,
+		)
+	}
 	if !useExternalTx {
 		tx, err = cfg.db.BeginRw(ctx)
 		if err != nil {
@@ -162,7 +172,11 @@ func SpawnStageSnapshots(
 }
 
 func DownloadAndIndexSnapshotsIfNeed(s *StageState, ctx context.Context, tx kv.RwTx, cfg SnapshotsCfg, logger log.Logger) error {
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
 	if !s.CurrentSyncCycle.IsFirstCycle {
+		if debugSnapshotBuild {
+			logger.Info("[snapshots] sync skipped", "reason", "not_first_cycle")
+		}
 		return nil
 	}
 
@@ -382,6 +396,7 @@ func pruneCanonicalMarkers(ctx context.Context, tx kv.RwTx, blockReader services
 // SnapshotsPrune moving block data from db into snapshots, removing old snapshots (if --prune.* enabled)
 func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.RwTx, logger log.Logger) (err error) {
 	useExternalTx := tx != nil
+	debugSnapshotBuild := strings.EqualFold(os.Getenv("ERIGON_SNAPSHOT_BUILD_DEBUG"), "true")
 	if !useExternalTx {
 		tx, err = cfg.db.BeginRw(ctx)
 		if err != nil {
@@ -391,6 +406,14 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 	}
 
 	freezingCfg := cfg.blockReader.FreezingCfg()
+	if debugSnapshotBuild {
+		logger.Info(
+			"[snapshots] prune gate",
+			"produce_e2", freezingCfg.ProduceE2,
+			"forward_progress", s.ForwardProgress,
+			"initial_cycle", s.CurrentSyncCycle.IsInitialCycle,
+		)
+	}
 	if freezingCfg.ProduceE2 {
 		//TODO: initialSync maybe save files progress here
 
@@ -403,7 +426,7 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 		}
 
 		noDl := cfg.snapshotDownloader == nil || reflect.ValueOf(cfg.snapshotDownloader).IsNil()
-		started := cfg.blockRetire.RetireBlocksInBackground(
+			started := cfg.blockRetire.RetireBlocksInBackground(
 			ctx,
 			minBlockNumber,
 			s.ForwardProgress,
@@ -432,11 +455,29 @@ func SnapshotsPrune(s *PruneState, cfg SnapshotsCfg, ctx context.Context, tx kv.
 					cfg.notifier.Events.OnRetirementDone()
 				}
 			})
-		if cfg.notifier != nil {
-			cfg.notifier.Events.OnRetirementStart(started)
-		}
+			logger.Info(
+				"[snapshots] retire background request",
+				"started", started,
+				"min_block_num", minBlockNumber,
+				"max_block_num", s.ForwardProgress,
+				"workers", cfg.blockRetire.GetWorkers(),
+			)
+			if debugSnapshotBuild {
+				logger.Info(
+					"[snapshots] prune retire scheduled",
+					"started", started,
+					"min_block_num", minBlockNumber,
+					"max_block_num", s.ForwardProgress,
+					"workers", cfg.blockRetire.GetWorkers(),
+				)
+			}
+			if cfg.notifier != nil {
+				cfg.notifier.Events.OnRetirementStart(started)
+			}
 
 		//	cfg.agg.BuildFilesInBackground()
+	} else if debugSnapshotBuild {
+		logger.Info("[snapshots] prune skipped", "reason", "produce_e2_disabled")
 	}
 
 	pruneLimit := 10

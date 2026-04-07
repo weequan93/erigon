@@ -310,6 +310,7 @@ func ExecV3(ctx context.Context,
 			"from", blockNum, "to", maxBlockNum, "fromTxNum", doms.TxNum(), "offsetFromBlockBeginning", offsetFromBlockBeginning, "initialCycle", initialCycle, "useExternalTx", useExternalTx, "inMem", inMemExec)
 	}
 
+	logSnapshotBuildCallsite(logger, "exec3.preloop", outputTxNum.Load(), blockNum, maxBlockNum)
 	agg.BuildFilesInBackground(outputTxNum.Load())
 
 	var count uint64
@@ -447,6 +448,7 @@ func ExecV3(ctx context.Context,
 			"from", blockNum, "to", maxBlockNum, "fromTxNum", executor.domains().TxNum(), "offsetFromBlockBeginning", offsetFromBlockBeginning, "initialCycle", initialCycle, "useExternalTx", useExternalTx)
 	}
 
+	logSnapshotBuildCallsite(logger, "exec3.loop.setup", outputTxNum.Load(), blockNum, maxBlockNum)
 	agg.BuildFilesInBackground(outputTxNum.Load())
 
 	var readAhead chan uint64
@@ -693,6 +695,7 @@ Loop:
 				return err
 			}
 
+			logSnapshotBuildCallsite(logger, "exec3.loop.parallel", outputTxNum.Load(), blockNum, maxBlockNum)
 			agg.BuildFilesInBackground(outputTxNum.Load())
 		} else {
 			se := executor.(*serialExecutor)
@@ -1036,6 +1039,7 @@ Loop:
 		logger.Info("Committed", "blocks", inputBlockNum.Load())
 	}
 
+	logSnapshotBuildCallsite(logger, "exec3.final", outputTxNum.Load(), blockNum, maxBlockNum)
 	agg.BuildFilesInBackground(outputTxNum.Load())
 
 	if errExhausted != nil && blockNum < maxBlockNum {
@@ -1058,6 +1062,7 @@ Loop:
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
 var ERIGON_STOP_AT_BLOCK = dbg.EnvUint("ERIGON_STOP_AT_BLOCK", 0)
 var ERIGON_BAD_ROOT_DEBUG = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var ERIGON_SNAPSHOT_CALLSITE_DEBUG = dbg.EnvBool("ERIGON_SNAPSHOT_BUILD_DEBUG", false)
 var ERIGON_BAD_ROOT_DUMP_STATE = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_STATE", false)
 var ERIGON_BAD_ROOT_ACCOUNTS = dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil)
 var ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_TOUCHED_ACCOUNTS", false)
@@ -1066,6 +1071,19 @@ var ERIGON_BAD_ROOT_STORAGE_DIFF_TIMELINE_MAX = dbg.EnvInt("ERIGON_BAD_ROOT_STOR
 var ERIGON_BAD_ROOT_PROBE_STORAGE_KEY = dbg.EnvString("ERIGON_BAD_ROOT_PROBE_STORAGE_KEY", "")
 var ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT", false)
 var ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SKIP_UNWIND_ON_BAD_ROOT", false)
+
+func logSnapshotBuildCallsite(logger log.Logger, where string, txNum uint64, blockNum uint64, maxBlockNum uint64) {
+	if !ERIGON_SNAPSHOT_CALLSITE_DEBUG {
+		return
+	}
+	logger.Info(
+		"[snapshots] build callsite",
+		"where", where,
+		"txnum", txNum,
+		"block", blockNum,
+		"max_block", maxBlockNum,
+	)
+}
 
 // nolint
 func dumpPlainStateDebug(tx kv.TemporalRwTx, doms *dbstate.SharedDomains) {

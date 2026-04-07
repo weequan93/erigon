@@ -23,6 +23,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -1077,15 +1078,9 @@ func (d *Domain) buildFileRange(ctx context.Context, stepFrom, stepTo kv.Step, c
 	}
 	if d.Accessors.Has(statecfg.AccessorExistence) {
 		fPath := d.kvExistenceIdxNewFilePath(stepFrom, stepTo)
-		exists, err := dir.FileExist(fPath)
+		existenceFilter, err = d.openExistingExistenceFilter(fPath)
 		if err != nil {
-			return StaticFiles{}, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
-		}
-		if exists {
-			existenceFilter, err = existence.OpenFilter(fPath, false)
-			if err != nil {
-				return StaticFiles{}, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
-			}
+			return StaticFiles{}, err
 		}
 	}
 	closeComp = false
@@ -1179,15 +1174,9 @@ func (d *Domain) buildFiles(ctx context.Context, step kv.Step, collation Collati
 	}
 	if d.Accessors.Has(statecfg.AccessorExistence) {
 		fPath := d.kvExistenceIdxNewFilePath(step, step+1)
-		exists, err := dir.FileExist(fPath)
+		bloom, err = d.openExistingExistenceFilter(fPath)
 		if err != nil {
-			return StaticFiles{}, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
-		}
-		if exists {
-			bloom, err = existence.OpenFilter(fPath, false)
-			if err != nil {
-				return StaticFiles{}, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
-			}
+			return StaticFiles{}, err
 		}
 	}
 	closeComp = false
@@ -1198,6 +1187,47 @@ func (d *Domain) buildFiles(ctx context.Context, step kv.Step, collation Collati
 		valuesBt:        bt,
 		existenceFilter: bloom,
 	}, nil
+}
+
+func (d *Domain) openExistingExistenceFilter(path string) (*existence.Filter, error) {
+	exists, err := dir.FileExist(path)
+	if err != nil {
+		return nil, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
+	}
+	if !exists {
+		return nil, nil
+	}
+	filter, err := existence.OpenFilter(path, false)
+	if err == nil {
+		return filter, nil
+	}
+	// Recover from stale/corrupted existence filter artifacts and allow rebuild.
+	if strings.Contains(err.Error(), "wrong magic") || strings.Contains(err.Error(), "incompatible version") {
+		removed, rmErr := d.removeDomainExistenceFilters(path)
+		if rmErr != nil {
+			return nil, fmt.Errorf("build %s .kvei: remove invalid filters: %w", d.FilenameBase, rmErr)
+		}
+		d.logger.Warn("[snapshots] dropping invalid existence filter", "domain", d.FilenameBase, "path", path, "removed", removed, "err", err)
+		return nil, nil
+	}
+	return nil, fmt.Errorf("build %s .kvei: %w", d.FilenameBase, err)
+}
+
+func (d *Domain) removeDomainExistenceFilters(path string) (int, error) {
+	dirPath := filepath.Dir(path)
+	pattern := filepath.Join(dirPath, fmt.Sprintf("*-%s.*.kvei", d.FilenameBase))
+	matches, err := filepath.Glob(pattern)
+	if err != nil {
+		return 0, err
+	}
+	removed := 0
+	for _, match := range matches {
+		if rmErr := os.Remove(match); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			return removed, rmErr
+		}
+		removed++
+	}
+	return removed, nil
 }
 
 func (d *Domain) buildHashMapAccessor(ctx context.Context, fromStep, toStep kv.Step, data *seg.Reader, ps *background.ProgressSet) error {

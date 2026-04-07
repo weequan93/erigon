@@ -491,6 +491,7 @@ func (se *serialExecutor) commit(ctx context.Context, txNum uint64, blockNum uin
 		}
 
 		t2 = time.Since(tt)
+		logSnapshotBuildCallsite(se.logger, "exec3.serial.commit", se.outputTxNum.Load(), blockNum, blockNum)
 		se.agg.BuildFilesInBackground(se.outputTxNum.Load())
 
 		se.applyTx, err = se.cfg.db.BeginRw(context.Background()) //nolint
