@@ -36,6 +36,7 @@ import (
 	"github.com/erigontech/erigon/db/datadir"
 	"github.com/erigontech/erigon/db/etl"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/dbutils"
 	"github.com/erigontech/erigon/db/kv/prune"
 	"github.com/erigontech/erigon/db/rawdb"
 	"github.com/erigontech/erigon/db/rawdb/rawdbhelpers"
@@ -454,11 +455,23 @@ func PruneExecutionStage(s *PruneState, tx kv.RwTx, cfg ExecuteBlockCfg, ctx con
 			pruneDiffsLimitOnChainTip = math.MaxInt
 			pruneTimeout = time.Hour
 		}
+		expectedCutoff := s.ForwardProgress - cfg.syncCfg.MaxReorgDepth
+		oldestBefore, oldestBeforeErr := oldestChangesetBlock(tx)
+		logger.Warn(
+			fmt.Sprintf("[%s] changesets prune gate", s.LogPrefix()),
+			"forward_progress", s.ForwardProgress,
+			"max_reorg_depth", cfg.syncCfg.MaxReorgDepth,
+			"expected_cutoff", expectedCutoff,
+			"oldest_before", oldestBefore,
+			"oldest_before_err", errString(oldestBeforeErr),
+			"always_generate_changesets", cfg.syncCfg.AlwaysGenerateChangesets,
+			"initialCycle", s.CurrentSyncCycle.IsInitialCycle,
+		)
 		pruneChangeSetsStartTime := time.Now()
 		if err := rawdb.PruneTable(
 			tx,
 			kv.ChangeSets3,
-			s.ForwardProgress-cfg.syncCfg.MaxReorgDepth,
+			expectedCutoff,
 			ctx,
 			pruneDiffsLimitOnChainTip,
 			pruneTimeout,
@@ -467,6 +480,16 @@ func PruneExecutionStage(s *PruneState, tx kv.RwTx, cfg ExecuteBlockCfg, ctx con
 		); err != nil {
 			return err
 		}
+		oldestAfter, oldestAfterErr := oldestChangesetBlock(tx)
+		logger.Warn(
+			fmt.Sprintf("[%s] changesets prune result", s.LogPrefix()),
+			"expected_cutoff", expectedCutoff,
+			"oldest_before", oldestBefore,
+			"oldest_after", oldestAfter,
+			"oldest_after_err", errString(oldestAfterErr),
+			"limit", pruneDiffsLimitOnChainTip,
+			"timeout", pruneTimeout,
+		)
 		if duration := time.Since(pruneChangeSetsStartTime); duration > quickPruneTimeout {
 			logger.Debug(
 				fmt.Sprintf("[%s] prune changesets timing", s.LogPrefix()),
@@ -520,4 +543,28 @@ func PruneExecutionStage(s *PruneState, tx kv.RwTx, cfg ExecuteBlockCfg, ctx con
 		}
 	}
 	return nil
+}
+
+func oldestChangesetBlock(tx kv.Tx) (uint64, error) {
+	c, err := tx.Cursor(kv.ChangeSets3)
+	if err != nil {
+		return 0, err
+	}
+	defer c.Close()
+
+	k, _, err := c.First()
+	if err != nil {
+		return 0, err
+	}
+	if len(k) < 8 {
+		return 0, nil
+	}
+	return dbutils.DecodeBlockNumber(k[:8])
+}
+
+func errString(err error) string {
+	if err == nil {
+		return "nil"
+	}
+	return err.Error()
 }
