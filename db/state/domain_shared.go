@@ -435,6 +435,23 @@ func (sd *SharedDomains) GetLatest(domain kv.Domain, tx kv.TemporalTx, k []byte)
 	return v, step, nil
 }
 
+func (sd *SharedDomains) getAsOf(domain kv.Domain, tx kv.TemporalTx, k []byte, txNum uint64) (v []byte, step kv.Step, err error) {
+	if tx == nil {
+		return nil, 0, errors.New("sd.getAsOf: unexpected nil tx")
+	}
+	if v, prevStep, ok := sd.mem.GetLatest(domain, k); ok {
+		return v, prevStep, nil
+	}
+	v, ok, err := tx.GetAsOf(domain, k, txNum)
+	if err != nil {
+		return nil, 0, fmt.Errorf("storage %x read error: %w", k, err)
+	}
+	if !ok {
+		return nil, 0, nil
+	}
+	return v, kv.Step(txNum / sd.mem.stepSize), nil
+}
+
 // DomainPut
 // Optimizations:
 //   - user can provide `prevVal != nil` - then it will not read prev value from storage
@@ -451,7 +468,7 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 	curStep := prevStep
 	if curVal == nil {
 		var err error
-		curVal, curStep, err = sd.GetLatest(domain, roTx, k)
+		curVal, curStep, err = sd.getAsOf(domain, roTx, k, txNum)
 		if err != nil {
 			return err
 		}
@@ -539,7 +556,7 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 	curStep := prevStep
 	if curVal == nil {
 		var err error
-		curVal, curStep, err = sd.GetLatest(domain, tx, k)
+		curVal, curStep, err = sd.getAsOf(domain, tx, k, txNum)
 		if err != nil {
 			return err
 		}
@@ -547,6 +564,13 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 
 	switch domain {
 	case kv.AccountsDomain:
+		if shouldTraceUnwindEntry(kv.AccountsDomain, k) {
+			log.Warn("domain shared account delete",
+				"key", fmt.Sprintf("0x%x", k),
+				"tx_num", txNum,
+				"cur_len", len(curVal),
+			)
+		}
 		// Always clear descendant storage/code first in case of dangling rows.
 		if err := sd.DomainDelPrefix(kv.StorageDomain, tx, k, txNum); err != nil {
 			return err
@@ -596,7 +620,21 @@ func (sd *SharedDomains) DomainDelPrefix(domain kv.Domain, roTx kv.TemporalTx, p
 	}); err != nil {
 		return err
 	}
+	if shouldTraceUnwindEntry(kv.AccountsDomain, prefix) {
+		log.Warn("domain shared delete prefix",
+			"prefix", fmt.Sprintf("0x%x", prefix),
+			"tx_num", txNum,
+			"tombs", len(tombs),
+		)
+	}
 	for _, tomb := range tombs {
+		if shouldTraceUnwindEntry(kv.StorageDomain, tomb.k) {
+			log.Warn("domain shared delete prefix tomb",
+				"key", fmt.Sprintf("0x%x", tomb.k),
+				"step", tomb.step,
+				"val_len", len(tomb.v),
+			)
+		}
 		if err := sd.DomainDel(kv.StorageDomain, roTx, tomb.k, txNum, tomb.v, tomb.step); err != nil {
 			return err
 		}

@@ -17,10 +17,12 @@
 package stagedsync
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"time"
 	"unsafe"
 
@@ -62,6 +64,75 @@ const (
 	// stateStreamLimit - don't accumulate state changes if jump is bigger than this amount of blocks
 	stateStreamLimit uint64 = 1_000
 )
+
+var unwindTraceAddr = common.HexToAddress(dbg.EnvString("ERIGON_UNWIND_TRACE_ADDR", ""))
+var unwindTraceSlot = common.HexToHash(dbg.EnvString("ERIGON_UNWIND_TRACE_SLOT", ""))
+
+func unwindValuePreview(v []byte) string {
+	if len(v) == 0 {
+		return ""
+	}
+	if len(v) <= 32 {
+		return fmt.Sprintf("0x%x", v)
+	}
+	return fmt.Sprintf("0x%x…(%d bytes)", v[:16], len(v))
+}
+
+func formatUnwindDiffKeys(diffs []kv.DomainEntryDiff, domain kv.Domain, max int) string {
+	if len(diffs) == 0 || max <= 0 {
+		return ""
+	}
+	if len(diffs) < max {
+		max = len(diffs)
+	}
+	keys := make([]string, 0, max)
+	for i := 0; i < max; i++ {
+		kb := toBytesZeroCopy(diffs[i].Key)
+		switch domain {
+		case kv.AccountsDomain:
+			if len(kb) >= length.Addr {
+				keys = append(keys, fmt.Sprintf("0x%x", kb[:length.Addr]))
+			} else {
+				keys = append(keys, fmt.Sprintf("0x%x", kb))
+			}
+		case kv.StorageDomain:
+			if len(kb) >= length.Addr+32 {
+				keys = append(keys, fmt.Sprintf("0x%x:0x%x", kb[:length.Addr], kb[length.Addr:length.Addr+32]))
+			} else {
+				keys = append(keys, fmt.Sprintf("0x%x", kb))
+			}
+		default:
+			keys = append(keys, fmt.Sprintf("0x%x", kb))
+		}
+	}
+	return strings.Join(keys, ",")
+}
+
+func formatUnwindDiffEntries(diffs []kv.DomainEntryDiff, domain kv.Domain, max int) string {
+	if len(diffs) == 0 || max <= 0 {
+		return ""
+	}
+	if len(diffs) < max {
+		max = len(diffs)
+	}
+	entries := make([]string, 0, max)
+	for i := 0; i < max; i++ {
+		kb := toBytesZeroCopy(diffs[i].Key)
+		keyStr := fmt.Sprintf("0x%x", kb)
+		switch domain {
+		case kv.AccountsDomain:
+			if len(kb) >= length.Addr {
+				keyStr = fmt.Sprintf("0x%x", kb[:length.Addr])
+			}
+		case kv.StorageDomain:
+			if len(kb) >= length.Addr+32 {
+				keyStr = fmt.Sprintf("0x%x:0x%x", kb[:length.Addr], kb[length.Addr:length.Addr+32])
+			}
+		}
+		entries = append(entries, fmt.Sprintf("%s[len=%d prev=%x]", keyStr, len(diffs[i].Value), diffs[i].PrevStepBytes))
+	}
+	return strings.Join(entries, ",")
+}
 
 type headerDownloader interface {
 	ReportBadHeaderPoS(badHeader, lastValidAncestor common.Hash)
@@ -249,6 +320,15 @@ func unwindExec3State(ctx context.Context, tx kv.TemporalRwTx, sd *state.SharedD
 
 	//TODO: why we don't call accumulator.ChangeCode???
 	handle := func(k, v []byte, table etl.CurrentTableReader, next etl.LoadNextFunc) error {
+		if unwindTraceAddr != (common.Address{}) && len(k) == length.Addr && bytes.Equal(k, unwindTraceAddr.Bytes()) {
+			logger.Warn("state3 unwind handle trace",
+				"target_txnum", txUnwindTo,
+				"target_block", blockUnwindTo,
+				"key", fmt.Sprintf("0x%x", k),
+				"value_len", len(v),
+				"value_preview", unwindValuePreview(v),
+			)
+		}
 		if len(k) == length.Addr {
 			if len(v) > 0 {
 				var acc accounts.Account
@@ -286,16 +366,69 @@ func unwindExec3State(ctx context.Context, tx kv.TemporalRwTx, sd *state.SharedD
 	defer stateChanges.Close()
 	stateChanges.SortAndFlushInBackground(true)
 
-	accountDiffs := changeset[kv.AccountsDomain]
+	accountDiffs := dedupeDomainDiffsKeepFirst(changeset[kv.AccountsDomain])
+	changeset[kv.AccountsDomain] = accountDiffs
+	accountTraceMatches := 0
 	for _, kv := range accountDiffs {
+		if unwindTraceAddr != (common.Address{}) && bytes.Equal(toBytesZeroCopy(kv.Key)[:length.Addr], unwindTraceAddr.Bytes()) {
+			accountTraceMatches++
+			logger.Warn("state3 unwind account diff trace",
+				"target_txnum", txUnwindTo,
+				"target_block", blockUnwindTo,
+				"key", fmt.Sprintf("0x%x", toBytesZeroCopy(kv.Key)[:length.Addr]),
+				"value_len", len(kv.Value),
+			)
+		}
 		if err := stateChanges.Collect(toBytesZeroCopy(kv.Key)[:length.Addr], kv.Value); err != nil {
 			return err
 		}
 	}
 	storageDiffs := changeset[kv.StorageDomain]
+	storageTraceMatches := 0
 	for _, kv := range storageDiffs {
+		kb := toBytesZeroCopy(kv.Key)
+		if unwindTraceAddr != (common.Address{}) && len(kb) == length.Addr+32 &&
+			bytes.Equal(kb[:length.Addr], unwindTraceAddr.Bytes()) &&
+			(unwindTraceSlot == (common.Hash{}) || bytes.Equal(kb[length.Addr:], unwindTraceSlot.Bytes())) {
+			storageTraceMatches++
+			logger.Warn("state3 unwind storage diff trace",
+				"target_txnum", txUnwindTo,
+				"target_block", blockUnwindTo,
+				"key", fmt.Sprintf("0x%x", kb),
+				"value_len", len(kv.Value),
+			)
+		}
 		if err := stateChanges.Collect(toBytesZeroCopy(kv.Key), kv.Value); err != nil {
 			return err
+		}
+	}
+	if unwindTraceAddr != (common.Address{}) {
+		logger.Warn("state3 unwind diff trace summary",
+			"target_txnum", txUnwindTo,
+			"target_block", blockUnwindTo,
+			"account_matches", accountTraceMatches,
+			"storage_matches", storageTraceMatches,
+			"account_diffs", len(accountDiffs),
+			"storage_diffs", len(storageDiffs),
+			"account_keys_sample", formatUnwindDiffKeys(accountDiffs, kv.AccountsDomain, 16),
+			"account_entries_sample", formatUnwindDiffEntries(accountDiffs, kv.AccountsDomain, 16),
+			"storage_keys_sample", formatUnwindDiffKeys(storageDiffs, kv.StorageDomain, 16),
+			"storage_entries_sample", formatUnwindDiffEntries(storageDiffs, kv.StorageDomain, 16),
+		)
+	}
+	if unwindTraceAddr != (common.Address{}) {
+		for _, diff := range accountDiffs {
+			kb := toBytesZeroCopy(diff.Key)
+			if len(kb) >= length.Addr && bytes.Equal(kb[:length.Addr], unwindTraceAddr.Bytes()) {
+				logger.Warn("state3 unwind pre-unwind account trace",
+					"target_txnum", txUnwindTo,
+					"target_block", blockUnwindTo,
+					"key", fmt.Sprintf("0x%x", kb[:length.Addr]),
+					"value_len", len(diff.Value),
+					"value_preview", unwindValuePreview(diff.Value),
+					"prev_step", fmt.Sprintf("0x%x", diff.PrevStepBytes),
+				)
+			}
 		}
 	}
 
@@ -307,18 +440,53 @@ func unwindExec3State(ctx context.Context, tx kv.TemporalRwTx, sd *state.SharedD
 	//if err != nil {
 	//	return err
 	//}
+	sd.ClearRam(true)
+	sd.SetTxNum(txUnwindTo)
+	sd.SetBlockNum(blockUnwindTo)
 	if err := sd.Flush(ctx, tx); err != nil {
 		return err
 	}
 
+	if unwindTraceAddr != (common.Address{}) {
+		for _, diff := range accountDiffs {
+			kb := toBytesZeroCopy(diff.Key)
+			if len(kb) >= length.Addr && bytes.Equal(kb[:length.Addr], unwindTraceAddr.Bytes()) {
+				logger.Warn("state3 unwind before tx.Unwind account trace",
+					"target_txnum", txUnwindTo,
+					"target_block", blockUnwindTo,
+					"key", fmt.Sprintf("0x%x", kb[:length.Addr]),
+					"value_len", len(diff.Value),
+					"value_preview", unwindValuePreview(diff.Value),
+					"prev_step", fmt.Sprintf("0x%x", diff.PrevStepBytes),
+				)
+			}
+		}
+	}
 	if err := tx.Unwind(ctx, txUnwindTo, changeset); err != nil {
 		return err
 	}
-
-	sd.ClearRam(true)
-	sd.SetTxNum(txUnwindTo)
-	sd.SetBlockNum(blockUnwindTo)
 	return nil
+}
+
+func dedupeDomainDiffsKeepFirst(in []kv.DomainEntryDiff) []kv.DomainEntryDiff {
+	if len(in) < 2 {
+		return in
+	}
+	seen := make(map[string]struct{}, len(in))
+	out := make([]kv.DomainEntryDiff, 0, len(in))
+	for i := range in {
+		kb := toBytesZeroCopy(in[i].Key)
+		key := in[i].Key
+		if len(kb) >= length.Addr {
+			key = string(kb[:length.Addr])
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, in[i])
+	}
+	return out
 }
 
 func toBytesZeroCopy(s string) []byte { return unsafe.Slice(unsafe.StringData(s), len(s)) }

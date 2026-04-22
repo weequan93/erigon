@@ -899,6 +899,7 @@ Loop:
 
 			computeCommitmentDuration += time.Since(start)
 			if shouldGenerateChangesets {
+				logExec3ChangesetTrace(logger, blockNum, b.Hash(), changeSet)
 				executor.domains().SavePastChangesetAccumulator(b.Hash(), blockNum, changeSet)
 				if !inMemExec {
 					if err := changeset2.WriteDiffSet(executor.tx(), blockNum, b.Hash(), changeSet); err != nil {
@@ -1057,6 +1058,40 @@ Loop:
 	}
 
 	return nil
+}
+
+var exec3FixedSenderAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
+
+func logExec3ChangesetTrace(logger log.Logger, blockNum uint64, blockHash common.Hash, changeSet *changeset2.StateChangeSet) {
+	if changeSet == nil {
+		logger.Warn("exec3 changeset trace", "block", blockNum, "block_hash", blockHash, "accounts_len", -1, "sender", common.BytesToAddress(exec3FixedSenderAddrBytes), "sender_match", false)
+		return
+	}
+	accountDiffs := changeSet.Diffs[kv.AccountsDomain].GetDiffSet()
+	matched := false
+	valueLen := 0
+	valuePreview := "missing"
+	prevStep := ""
+	for i := range accountDiffs {
+		k := []byte(accountDiffs[i].Key)
+		if len(k) >= len(exec3FixedSenderAddrBytes) && bytes.Equal(k[:len(exec3FixedSenderAddrBytes)], exec3FixedSenderAddrBytes) {
+			matched = true
+			valueLen = len(accountDiffs[i].Value)
+			valuePreview = unwindValuePreview(accountDiffs[i].Value)
+			prevStep = fmt.Sprintf("0x%x", accountDiffs[i].PrevStepBytes)
+			break
+		}
+	}
+	logger.Warn("exec3 changeset trace",
+		"block", blockNum,
+		"block_hash", blockHash,
+		"accounts_len", len(accountDiffs),
+		"sender", common.BytesToAddress(exec3FixedSenderAddrBytes),
+		"sender_match", matched,
+		"value_len", valueLen,
+		"value_preview", valuePreview,
+		"prev_step", prevStep,
+	)
 }
 
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
@@ -2596,6 +2631,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		// If fallback matches header root, treat it as authoritative and proceed.
 		fallbackTried := false
 		fallbackMatched := false
+		fallbackAdopted := false
 		var fallbackErr error
 		var fallbackRootHash []byte
 		if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
@@ -2606,6 +2642,10 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 					fallbackMatched = bytes.Equal(fallbackRootHash, header.Root.Bytes())
 					if fallbackMatched {
 						computedRootHash = fallbackRootHash
+					} else if ERIGON_BAD_ROOT_DEBUG {
+						computedRootHash = fallbackRootHash
+						header.Root = common.BytesToHash(fallbackRootHash)
+						fallbackAdopted = true
 					}
 				}
 				logger.Warn("Bad state root fallback rebuild",
@@ -2615,14 +2655,19 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 					"fallback_root", common.BytesToHash(fallbackRootHash),
 					"header_root", header.Root,
 					"matches_header", fallbackMatched,
+					"adopted", fallbackAdopted,
 				)
 			}
 		}
-		if fallbackTried && fallbackMatched {
+		if fallbackTried && (fallbackMatched || fallbackAdopted) {
+			if fallbackMatched {
+				header.Root = common.BytesToHash(fallbackRootHash)
+			}
 			logger.Warn("Bad state root resolved by fallback rebuild",
 				"block", header.Number.Uint64(),
 				"root", common.BytesToHash(computedRootHash),
 				"txnum", doms.TxNum(),
+				"adopted", fallbackAdopted,
 			)
 			if !inMemExec {
 				flushStart := time.Now()

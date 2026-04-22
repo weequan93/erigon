@@ -17,7 +17,6 @@
 package kv
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -303,11 +302,10 @@ func (d *DomainDiff) DomainUpdate(k []byte, step Step, prevValue []byte, prevSte
 	valsKey := toStringZeroCopy(d.keyBuf)
 	if _, ok := d.prevValues[valsKey]; !ok {
 		valsKeySCopy := strings.Clone(valsKey)
-		if bytes.Equal(d.currentStepBuf, d.prevStepBuf) {
-			d.prevValues[valsKeySCopy] = common.Copy(prevValue)
-		} else {
-			d.prevValues[valsKeySCopy] = []byte{} // We need to delete the current step but restore the previous one
-		}
+		// Keep the previous value even when the prior version lived in another step.
+		// Domain pruning removes old latest-state rows, so unwind cannot rely on the
+		// previous-step row still existing in the values table.
+		d.prevValues[valsKeySCopy] = common.Copy(prevValue)
 		d.prevValsSlice = nil
 	}
 }

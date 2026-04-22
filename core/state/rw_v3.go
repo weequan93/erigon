@@ -33,6 +33,7 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/rawdb"
 	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/eth/ethconfig"
@@ -56,7 +57,7 @@ var mdbxMigrateStorageTraceBlockSet = mdbxMigrateStorageTraceBlockRaw != ""
 var mdbxMigrateStorageTraceTxIndexRaw = dbg.EnvString("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", "")
 var mdbxMigrateStorageTraceTxIndex = dbg.EnvInt("ERIGON_MDBX_MIGRATE_STORAGETRACE_TX_INDEX", 0)
 var mdbxMigrateStorageTraceTxIndexSet = mdbxMigrateStorageTraceTxIndexRaw != ""
-var mdbxMigrateFixEmptyRoot = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FIX_EMPTY_ROOT", false)
+var mdbxMigrateFixEmptyRoot = dbg.EnvBool("ERIGON_MDBX_MIGRATE_FIX_EMPTY_ROOT", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var keepEmptyAccounts = dbg.EnvBool("ERIGON_MDBX_MIGRATE_KEEP_EMPTY_ACCOUNTS", false)
 var keepEmptyAccountsList = loadKeepEmptyAccountsList()
 
@@ -179,7 +180,10 @@ func shouldMdbxMigrateApplyTrace(txTask *TxTask) bool {
 }
 
 func shouldTraceApplyAccount(addr common.Address) bool {
-	return addr == mdbxMigrateApplyTraceAccountProbe || addr == mdbxMigrateApplyTraceStorageProbeAddr || isBadRootAccount(addr)
+	return addr == mdbxMigrateApplyTraceAccountProbe ||
+		addr == mdbxMigrateApplyTraceStorageProbeAddr ||
+		addr == common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce") ||
+		isBadRootAccount(addr)
 }
 
 func readApplyTraceAccount(domains *dbstate.SharedDomains, tx kv.TemporalTx, addr common.Address, out *accounts.Account) (exists bool, enc []byte, step kv.Step, err error) {
@@ -235,6 +239,35 @@ func computeStorageRootFromLatest(domains *dbstate.SharedDomains, tx kv.Tx, addr
 	prefix := addr.Bytes()
 	tr := etrie.New(common.Hash{})
 	items := 0
+	if ttx, ok := tx.(kv.TemporalTx); ok {
+		to, ok := kv.NextSubtree(prefix)
+		if !ok {
+			return common.Hash{}, 0, nil
+		}
+		asOfTxNum := domains.TxNum() + 1
+		it, err := ttx.RangeAsOf(kv.StorageDomain, prefix, to, asOfTxNum, order.Asc, kv.Unlim)
+		if err != nil {
+			return common.Hash{}, items, err
+		}
+		defer it.Close()
+		for it.HasNext() {
+			k, v, err := it.Next()
+			if err != nil {
+				return common.Hash{}, items, err
+			}
+			if len(v) == 0 {
+				continue
+			}
+			if len(k) < length.Addr {
+				return common.Hash{}, items, fmt.Errorf("short storage key: %d bytes", len(k))
+			}
+			slot := k[length.Addr:]
+			slotHash, _ := common.HashData(slot)
+			tr.Update(slotHash.Bytes(), common.Copy(v))
+			items++
+		}
+		return tr.Hash(), items, nil
+	}
 	err := domains.IteratePrefix(kv.StorageDomain, prefix, tx, func(k []byte, v []byte, step kv.Step) (bool, error) {
 		if len(v) == 0 {
 			return true, nil
@@ -439,6 +472,15 @@ func logApplyAccountDomainSnapshot(stage string, domains *dbstate.SharedDomains,
 		prevAcc, prevDecodeErr = decodeAccountV3(prevEnc)
 	}
 
+	asofEnc, asofOk, asofErr := tx.GetAsOf(kv.AccountsDomain, keyBytes, txTask.TxNum)
+	var (
+		asofAcc       *accounts.Account
+		asofDecodeErr error
+	)
+	if asofErr == nil && asofOk {
+		asofAcc, asofDecodeErr = decodeAccountV3(asofEnc)
+	}
+
 	var (
 		writeAcc       *accounts.Account
 		writeDecodeErr error
@@ -491,6 +533,11 @@ func logApplyAccountDomainSnapshot(stage string, domains *dbstate.SharedDomains,
 		"pre_step", prevStep,
 		"pre_read_err", errToString(prevErr),
 		"pre_decode_err", errToString(prevDecodeErr),
+		"asof_ok", asofOk,
+		"asof_len", len(asofEnc),
+		"asof_tombstone", isAccountTombstone(asofEnc),
+		"asof_read_err", errToString(asofErr),
+		"asof_decode_err", errToString(asofDecodeErr),
 		"has_storage_prefix", hasStoragePrefix,
 		"has_storage_prefix_err", hasStoragePrefixErr,
 		"storage_items", storageItems,
@@ -513,6 +560,15 @@ func logApplyAccountDomainSnapshot(stage string, domains *dbstate.SharedDomains,
 			"write_code_hash", writeAcc.CodeHash.Hex(),
 			"write_root", writeAcc.Root.Hex(),
 			"write_empty", writeAcc.Nonce == 0 && writeAcc.Balance.IsZero() && writeAcc.IsEmptyCodeHash(),
+		)
+	}
+	if asofAcc != nil {
+		fields = append(fields,
+			"asof_nonce", asofAcc.Nonce,
+			"asof_balance", asofAcc.Balance.ToBig().String(),
+			"asof_code_hash", asofAcc.CodeHash.Hex(),
+			"asof_root", asofAcc.Root.Hex(),
+			"asof_empty", asofAcc.Nonce == 0 && asofAcc.Balance.IsZero() && asofAcc.IsEmptyCodeHash(),
 		)
 	}
 	log.Warn("state apply account snapshot", fields...)
@@ -561,6 +617,40 @@ func hexPreviewBytes(raw []byte, max int) string {
 		return fmt.Sprintf("%x", raw)
 	}
 	return fmt.Sprintf("%x...len=%d", raw[:max], len(raw))
+}
+
+func logFixedSenderAccountCompare(site string, domains *dbstate.SharedDomains, tx kv.TemporalTx, txTask *TxTask, addr common.Address) {
+	if txTask == nil {
+		return
+	}
+	if addr != common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce") {
+		return
+	}
+	addrBytes := addr.Bytes()
+	latestVal, latestStep, latestErr := domains.GetLatest(kv.AccountsDomain, tx, addrBytes)
+	asofVal, asofOk, asofErr := tx.GetAsOf(kv.AccountsDomain, addrBytes, txTask.TxNum)
+	fields := []interface{}{
+		"site", site,
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"tx_num", txTask.TxNum,
+		"addr", addr.Hex(),
+		"latest_len", len(latestVal),
+		"latest_step", latestStep,
+		"latest_preview", hexPreviewBytes(latestVal, 32),
+		"latest_err", errToString(latestErr),
+		"asof_ok", asofOk,
+		"asof_len", len(asofVal),
+		"asof_preview", hexPreviewBytes(asofVal, 32),
+		"asof_err", errToString(asofErr),
+	}
+	if acc, err := decodeAccountV3(latestVal); err == nil && acc != nil {
+		fields = append(fields, "latest_nonce", acc.Nonce)
+	}
+	if acc, err := decodeAccountV3(asofVal); err == nil && acc != nil {
+		fields = append(fields, "asof_nonce", acc.Nonce)
+	}
+	log.Warn("state fixed sender account compare", fields...)
 }
 
 // ParallelExecutionState - mainly designed for parallel transactions execution. It does separate:
@@ -1027,6 +1117,38 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 					}
 				}
 
+				if domain == kv.AccountsDomain && len(keyBytes) == length.Addr && list.Vals[i] != nil && mdbxMigrateFixEmptyRoot {
+					addr := common.BytesToAddress(keyBytes)
+					if _, watch := fixEmptyRootAddrs[addr]; watch {
+						acc.Reset()
+						if err := accounts.DeserialiseV3(&acc, list.Vals[i]); err != nil {
+							return err
+						}
+						if acc.IsEmptyRoot() {
+							storageRoot, items, err := computeStorageRootFromLatest(domains, rs.tx, addr)
+							if err != nil {
+								return err
+							}
+							if items > 0 && storageRoot != acc.Root {
+								acc.Root = storageRoot
+								list.Vals[i] = accounts.SerialiseV3(&acc)
+								if isBadRootAccount(addr) {
+									log.Warn("state account patched empty root before apply",
+										"tx_num", txTask.TxNum,
+										"block", txTask.BlockNum,
+										"tx_index", txTask.TxIndex,
+										"addr", addr.Hex(),
+										"storage_items", items,
+										"storage_root", storageRoot,
+										"val_len", len(list.Vals[i]),
+										"val", hexPreviewBytes(list.Vals[i], 64),
+									)
+								}
+							}
+						}
+					}
+				}
+
 				if domain == kv.AccountsDomain && len(keyBytes) == length.Addr {
 					logApplyAccountDomainSnapshot("pre-apply", domains, rs.tx, txTask, keyBytes, list.Vals[i])
 				}
@@ -1236,6 +1358,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			emptyRemoval = false
 		}
 		addrBytes := addr.Bytes()
+		logFixedSenderAccountCompare("balance_increase_pre", domains, rs.tx, txTask, addr)
 		enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
 		if err != nil {
 			return err
@@ -1367,6 +1490,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 			continue
 		}
 		addrBytes := addr.Bytes()
+		logFixedSenderAccountCompare("touched_contract_pre", domains, rs.tx, txTask, addr)
 		enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
 		if err != nil {
 			return err
@@ -1511,6 +1635,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 	if mdbxMigrateFixEmptyRoot && len(fixEmptyRootAddrs) > 0 {
 		for addr := range fixEmptyRootAddrs {
 			addrBytes := addr.Bytes()
+			logFixedSenderAccountCompare("fix_empty_root_pre", domains, rs.tx, txTask, addr)
 			enc0, step0, err := domains.GetLatest(kv.AccountsDomain, rs.tx, addrBytes)
 			if err != nil {
 				return err

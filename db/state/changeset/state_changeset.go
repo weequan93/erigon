@@ -18,12 +18,14 @@ package changeset
 
 import (
 	"encoding/binary"
+	"fmt"
 	"math"
 	"strings"
 	"sync"
 	"unsafe"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbutils"
 )
@@ -202,8 +204,10 @@ type threadSafeBuf struct {
 }
 
 var writeDiffsetBuf = &threadSafeBuf{}
+var writeDiffsetFixedSenderAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
 
 func WriteDiffSet(tx kv.RwTx, blockNumber uint64, blockHash common.Hash, diffSet *StateChangeSet) error {
+	logWriteDiffSetTrace(blockNumber, blockHash, diffSet)
 	writeDiffsetBuf.Lock()
 	defer writeDiffsetBuf.Unlock()
 	writeDiffsetBuf.b = diffSet.SerializeKeys(writeDiffsetBuf.b[:0])
@@ -236,6 +240,55 @@ func WriteDiffSet(tx kv.RwTx, blockNumber uint64, blockHash common.Hash, diffSet
 	return nil
 }
 
+func logWriteDiffSetTrace(blockNumber uint64, blockHash common.Hash, diffSet *StateChangeSet) {
+	if diffSet == nil {
+		log.Warn("state write diffset trace",
+			"block", blockNumber,
+			"block_hash", blockHash,
+			"sender", common.BytesToAddress(writeDiffsetFixedSenderAddrBytes),
+			"accounts_len", -1,
+			"sender_match", false,
+		)
+		return
+	}
+	accountDiffs := diffSet.Diffs[kv.AccountsDomain].GetDiffSet()
+	matched := false
+	valueLen := 0
+	valuePreview := "missing"
+	prevStep := ""
+	targetKey := string(writeDiffsetFixedSenderAddrBytes)
+	for i := range accountDiffs {
+		if len(accountDiffs[i].Key) >= len(writeDiffsetFixedSenderAddrBytes) && accountDiffs[i].Key[:len(writeDiffsetFixedSenderAddrBytes)] == targetKey {
+			matched = true
+			valueLen = len(accountDiffs[i].Value)
+			valuePreview = diffValuePreview(accountDiffs[i].Value)
+			prevStep = fmt.Sprintf("0x%x", accountDiffs[i].PrevStepBytes)
+			break
+		}
+	}
+	log.Warn("state write diffset trace",
+		"block", blockNumber,
+		"block_hash", blockHash,
+		"sender", common.BytesToAddress(writeDiffsetFixedSenderAddrBytes),
+		"accounts_len", len(accountDiffs),
+		"sender_match", matched,
+		"value_len", valueLen,
+		"value_preview", valuePreview,
+		"prev_step", prevStep,
+	)
+}
+
+func diffValuePreview(v []byte) string {
+	if len(v) == 0 {
+		return "nil"
+	}
+	const max = 16
+	if len(v) <= max {
+		return fmt.Sprintf("0x%x", v)
+	}
+	return fmt.Sprintf("0x%x...", v[:max])
+}
+
 func ReadDiffSet(tx kv.Tx, blockNumber uint64, blockHash common.Hash) ([kv.DomainLen][]kv.DomainEntryDiff, bool, error) {
 	// Read the diffSet from the database
 	chunkCountBytes, err := tx.GetOne(kv.ChangeSets3, dbutils.BlockBodyKey(blockNumber, blockHash))
@@ -266,7 +319,28 @@ func ReadDiffSet(tx kv.Tx, blockNumber uint64, blockHash common.Hash) ([kv.Domai
 		val = append(val, chunk...)
 	}
 
-	return DeserializeKeys(val), true, nil
+	decoded := DeserializeKeys(val)
+	logReadDiffSetTrace(blockNumber, blockHash, decoded)
+	return decoded, true, nil
+}
+
+func logReadDiffSetTrace(blockNumber uint64, blockHash common.Hash, decoded [kv.DomainLen][]kv.DomainEntryDiff) {
+	accountDiffs := decoded[kv.AccountsDomain]
+	samples := make([]string, 0, 3)
+	for i := 0; i < len(accountDiffs) && i < 3; i++ {
+		keyBytes := []byte(accountDiffs[i].Key)
+		show := keyBytes
+		if len(show) > 28 {
+			show = show[:28]
+		}
+		samples = append(samples, fmt.Sprintf("0x%x[len=%d]", show, len(keyBytes)))
+	}
+	log.Warn("state read diffset trace",
+		"block", blockNumber,
+		"block_hash", blockHash,
+		"accounts_len", len(accountDiffs),
+		"account_samples", strings.Join(samples, ","),
+	)
 }
 func ReadLowestUnwindableBlock(tx kv.Tx) (uint64, error) {
 	//TODO: move this function somewhere from `commitment`/`state` pkg

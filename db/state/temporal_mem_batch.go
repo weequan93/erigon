@@ -21,6 +21,7 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 	"unsafe"
@@ -30,6 +31,8 @@ import (
 	"github.com/erigontech/erigon-lib/common"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
+	"github.com/erigontech/erigon/db/kv/order"
+	"github.com/erigontech/erigon/db/kv/rawdbv3"
 	"github.com/erigontech/erigon/db/state/changeset"
 )
 
@@ -54,6 +57,8 @@ type TemporalMemBatch struct {
 	currentChangesAccumulator *changeset.StateChangeSet
 	pastChangesAccumulator    map[string]*changeset.StateChangeSet
 }
+
+var fixedSenderDiffTraceAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
 
 func newTemporalMemBatch(tx kv.TemporalTx) *TemporalMemBatch {
 	sd := &TemporalMemBatch{
@@ -173,6 +178,13 @@ func (sd *TemporalMemBatch) ClearRam() {
 
 	sd.storage = btree2.NewMap[string, dataWithPrevStep](128)
 	sd.estSize = 0
+	sd.currentChangesAccumulator = nil
+	sd.pastChangesAccumulator = nil
+	for i := range sd.domainWriters {
+		if sd.domainWriters[i] != nil {
+			sd.domainWriters[i].SetDiff(nil)
+		}
+	}
 }
 
 func (sd *TemporalMemBatch) IteratePrefix(domain kv.Domain, prefix []byte, roTx kv.Tx, it func(k []byte, v []byte, step kv.Step) (cont bool, err error)) error {
@@ -211,14 +223,345 @@ func (sd *TemporalMemBatch) GetDiffset(tx kv.RwTx, blockHash common.Hash, blockN
 	binary.BigEndian.PutUint64(key[:8], blockNumber)
 	copy(key[8:], blockHash[:])
 	if changeset, ok := sd.pastChangesAccumulator[toStringZeroCopy(key[:])]; ok {
-		return [kv.DomainLen][]kv.DomainEntryDiff{
+		diffs := [kv.DomainLen][]kv.DomainEntryDiff{
 			changeset.Diffs[kv.AccountsDomain].GetDiffSet(),
 			changeset.Diffs[kv.StorageDomain].GetDiffSet(),
 			changeset.Diffs[kv.CodeDomain].GetDiffSet(),
 			changeset.Diffs[kv.CommitmentDomain].GetDiffSet(),
-		}, true, nil
+		}
+		logDiffsetSource("mem", blockNumber, blockHash, diffs)
+		return diffs, true, nil
 	}
-	return changeset.ReadDiffSet(tx, blockNumber, blockHash)
+	diffs, ok, err := changeset.ReadDiffSet(tx, blockNumber, blockHash)
+	if err == nil && ok && len(diffs[kv.AccountsDomain]) == 0 {
+		if synthesized, synthOK, synthErr := synthesizeAccountDiffsetFromHistory(tx, blockNumber); synthErr != nil {
+			log.Warn("state diffset history fallback failed", "block", blockNumber, "block_hash", blockHash, "err", synthErr)
+		} else if synthOK && len(synthesized) > 0 {
+			diffs[kv.AccountsDomain] = synthesized
+			log.Warn("state diffset history fallback",
+				"block", blockNumber,
+				"block_hash", blockHash,
+				"accounts_len", len(synthesized),
+			)
+		}
+	} else if err == nil && ok && len(diffs[kv.AccountsDomain]) > 0 {
+		if rewritten, changed, rewriteErr := rewriteAccountDiffsetFromHistory(tx, blockNumber, diffs[kv.AccountsDomain]); rewriteErr != nil {
+			log.Warn("state diffset history rewrite failed", "block", blockNumber, "block_hash", blockHash, "err", rewriteErr)
+		} else if changed {
+			diffs[kv.AccountsDomain] = rewritten
+			log.Warn("state diffset history rewrite",
+				"block", blockNumber,
+				"block_hash", blockHash,
+				"accounts_len", len(rewritten),
+			)
+		}
+	}
+	if err == nil && ok && len(diffs[kv.StorageDomain]) == 0 {
+		if synthesized, synthOK, synthErr := synthesizeStorageDiffsetFromHistory(tx, blockNumber); synthErr != nil {
+			log.Warn("state storage diffset history fallback failed", "block", blockNumber, "block_hash", blockHash, "err", synthErr)
+		} else if synthOK && len(synthesized) > 0 {
+			diffs[kv.StorageDomain] = synthesized
+			log.Warn("state storage diffset history fallback",
+				"block", blockNumber,
+				"block_hash", blockHash,
+				"storage_len", len(synthesized),
+			)
+		}
+	} else if err == nil && ok && len(diffs[kv.StorageDomain]) > 0 {
+		if rewritten, changed, rewriteErr := rewriteStorageDiffsetFromHistory(tx, blockNumber, diffs[kv.StorageDomain]); rewriteErr != nil {
+			log.Warn("state storage diffset history rewrite failed", "block", blockNumber, "block_hash", blockHash, "err", rewriteErr)
+		} else if changed {
+			diffs[kv.StorageDomain] = rewritten
+			log.Warn("state storage diffset history rewrite",
+				"block", blockNumber,
+				"block_hash", blockHash,
+				"storage_len", len(rewritten),
+			)
+		}
+	}
+	if err == nil {
+		logDiffsetSource("db", blockNumber, blockHash, diffs)
+	}
+	return diffs, ok, err
+}
+
+func synthesizeAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.DomainEntryDiff, bool, error) {
+	ttx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return nil, false, nil
+	}
+	startTxNum, err := rawdbv3.TxNums.Min(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	endTxNum, err := rawdbv3.TxNums.Max(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	if endTxNum == 0 && blockNumber != 0 {
+		return nil, false, nil
+	}
+	it, err := ttx.HistoryRange(kv.AccountsDomain, int(startTxNum), int(endTxNum+1), order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+
+	diffs := make([]kv.DomainEntryDiff, 0, 16)
+	prevStepBytes := make([]byte, 8)
+	currentStepBytes := make([]byte, 8)
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, false, err
+		}
+		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		step := kv.Step(0)
+		if _, latestStep, latestErr := ttx.GetLatest(kv.AccountsDomain, k); latestErr == nil {
+			step = latestStep
+		}
+		binary.BigEndian.PutUint64(prevStepBytes, ^uint64(step))
+		binary.BigEndian.PutUint64(currentStepBytes, ^uint64(step))
+		valsKey := append(append(make([]byte, 0, len(k)+8), k...), currentStepBytes...)
+		diffs = append(diffs, kv.DomainEntryDiff{
+			Key:           toStringZeroCopy(valsKey),
+			Value:         common.Copy(restoreVal),
+			PrevStepBytes: common.Copy(prevStepBytes),
+		})
+	}
+	return diffs, len(diffs) > 0, nil
+}
+
+func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing []kv.DomainEntryDiff) ([]kv.DomainEntryDiff, bool, error) {
+	ttx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return existing, false, nil
+	}
+	startTxNum, err := rawdbv3.TxNums.Min(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	endTxNum, err := rawdbv3.TxNums.Max(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	if endTxNum == 0 && blockNumber != 0 {
+		return existing, false, nil
+	}
+	it, err := ttx.HistoryRange(kv.AccountsDomain, int(startTxNum), int(endTxNum+1), order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+
+	rewritten := make(map[string]kv.DomainEntryDiff, len(existing)+8)
+	for i := range existing {
+		entry := existing[i]
+		rewritten[entry.Key] = kv.DomainEntryDiff{
+			Key:           entry.Key,
+			Value:         common.Copy(entry.Value),
+			PrevStepBytes: common.Copy(entry.PrevStepBytes),
+		}
+	}
+
+	prevStepBytes := make([]byte, 8)
+	currentStepBytes := make([]byte, 8)
+	changed := false
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, false, err
+		}
+		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		step := kv.Step(0)
+		if _, latestStep, latestErr := ttx.GetLatest(kv.AccountsDomain, k); latestErr == nil {
+			step = latestStep
+		}
+		binary.BigEndian.PutUint64(prevStepBytes, ^uint64(step))
+		binary.BigEndian.PutUint64(currentStepBytes, ^uint64(step))
+		valsKey := append(append(make([]byte, 0, len(k)+8), k...), currentStepBytes...)
+		key := toStringZeroCopy(valsKey)
+		rewritten[key] = kv.DomainEntryDiff{
+			Key:           key,
+			Value:         common.Copy(restoreVal),
+			PrevStepBytes: common.Copy(prevStepBytes),
+		}
+		changed = true
+	}
+	if !changed {
+		return existing, false, nil
+	}
+	out := make([]kv.DomainEntryDiff, 0, len(rewritten))
+	for _, entry := range rewritten {
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Key < out[j].Key
+	})
+	return out, true, nil
+}
+
+func synthesizeStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.DomainEntryDiff, bool, error) {
+	ttx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return nil, false, nil
+	}
+	startTxNum, err := rawdbv3.TxNums.Min(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	endTxNum, err := rawdbv3.TxNums.Max(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	if endTxNum == 0 && blockNumber != 0 {
+		return nil, false, nil
+	}
+	it, err := ttx.HistoryRange(kv.StorageDomain, int(startTxNum), int(endTxNum+1), order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+
+	diffs := make([]kv.DomainEntryDiff, 0, 32)
+	prevStepBytes := make([]byte, 8)
+	currentStepBytes := make([]byte, 8)
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, false, err
+		}
+		restoreVal, _, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		step := kv.Step(0)
+		if _, latestStep, latestErr := ttx.GetLatest(kv.StorageDomain, k); latestErr == nil {
+			step = latestStep
+		}
+		binary.BigEndian.PutUint64(prevStepBytes, ^uint64(step))
+		binary.BigEndian.PutUint64(currentStepBytes, ^uint64(step))
+		valsKey := append(append(make([]byte, 0, len(k)+8), k...), currentStepBytes...)
+		diffs = append(diffs, kv.DomainEntryDiff{
+			Key:           toStringZeroCopy(valsKey),
+			Value:         common.Copy(restoreVal),
+			PrevStepBytes: common.Copy(prevStepBytes),
+		})
+	}
+	return diffs, len(diffs) > 0, nil
+}
+
+func rewriteStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing []kv.DomainEntryDiff) ([]kv.DomainEntryDiff, bool, error) {
+	ttx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return existing, false, nil
+	}
+	startTxNum, err := rawdbv3.TxNums.Min(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	endTxNum, err := rawdbv3.TxNums.Max(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	if endTxNum == 0 && blockNumber != 0 {
+		return existing, false, nil
+	}
+	it, err := ttx.HistoryRange(kv.StorageDomain, int(startTxNum), int(endTxNum+1), order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+
+	rewritten := make(map[string]kv.DomainEntryDiff, len(existing)+16)
+	for i := range existing {
+		entry := existing[i]
+		rewritten[entry.Key] = kv.DomainEntryDiff{
+			Key:           entry.Key,
+			Value:         common.Copy(entry.Value),
+			PrevStepBytes: common.Copy(entry.PrevStepBytes),
+		}
+	}
+
+	prevStepBytes := make([]byte, 8)
+	currentStepBytes := make([]byte, 8)
+	changed := false
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, false, err
+		}
+		restoreVal, _, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		step := kv.Step(0)
+		if _, latestStep, latestErr := ttx.GetLatest(kv.StorageDomain, k); latestErr == nil {
+			step = latestStep
+		}
+		binary.BigEndian.PutUint64(prevStepBytes, ^uint64(step))
+		binary.BigEndian.PutUint64(currentStepBytes, ^uint64(step))
+		valsKey := append(append(make([]byte, 0, len(k)+8), k...), currentStepBytes...)
+		key := toStringZeroCopy(valsKey)
+		rewritten[key] = kv.DomainEntryDiff{
+			Key:           key,
+			Value:         common.Copy(restoreVal),
+			PrevStepBytes: common.Copy(prevStepBytes),
+		}
+		changed = true
+	}
+	if !changed {
+		return existing, false, nil
+	}
+	out := make([]kv.DomainEntryDiff, 0, len(rewritten))
+	for _, entry := range rewritten {
+		out = append(out, entry)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Key < out[j].Key
+	})
+	return out, true, nil
+}
+
+func logDiffsetSource(source string, blockNumber uint64, blockHash common.Hash, diffs [kv.DomainLen][]kv.DomainEntryDiff) {
+	if sender := findDomainDiff(diffs[kv.AccountsDomain], fixedSenderDiffTraceAddrBytes); sender != nil {
+		log.Warn("state diffset source trace",
+			"source", source,
+			"block", blockNumber,
+			"block_hash", blockHash,
+			"sender", common.BytesToAddress(fixedSenderDiffTraceAddrBytes),
+			"value_len", len(sender.Value),
+			"value_preview", badRootValuePreview(sender.Value),
+			"prev_step", fmt.Sprintf("%x", sender.PrevStepBytes),
+			"accounts_len", len(diffs[kv.AccountsDomain]),
+		)
+		return
+	}
+	log.Warn("state diffset source trace",
+		"source", source,
+		"block", blockNumber,
+		"block_hash", blockHash,
+		"sender", common.BytesToAddress(fixedSenderDiffTraceAddrBytes),
+		"value_len", 0,
+		"value_preview", "missing",
+		"accounts_len", len(diffs[kv.AccountsDomain]),
+	)
+}
+
+func findDomainDiff(diffs []kv.DomainEntryDiff, key []byte) *kv.DomainEntryDiff {
+	keyStr := toStringZeroCopy(key)
+	for i := range diffs {
+		if diffs[i].Key == keyStr {
+			return &diffs[i]
+		}
+	}
+	return nil
 }
 
 func (sd *TemporalMemBatch) IndexAdd(table kv.InvertedIdx, key []byte, txNum uint64) (err error) {

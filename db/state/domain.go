@@ -56,8 +56,26 @@ var (
 	traceFileLife    = dbg.EnvString("AGG_TRACE_FILE_LIFE", "")
 	traceGetAsOf     = dbg.EnvString("AGG_TRACE_GET_AS_OF", "")
 	tracePutWithPrev = dbg.EnvString("AGG_TRACE_PUT_WITH_PREV", "")
+	traceUnwindAddr  = common.HexToAddress(dbg.EnvString("ERIGON_UNWIND_TRACE_ADDR", ""))
+	traceUnwindSlotRaw = dbg.EnvString("ERIGON_UNWIND_TRACE_SLOT", "")
+	traceUnwindSlot    = common.HexToHash(traceUnwindSlotRaw)
 )
 var traceGetLatest, _ = kv.String2Domain(dbg.EnvString("AGG_TRACE_GET_LATEST", ""))
+
+func shouldTraceUnwindEntry(domain kv.Domain, key []byte) bool {
+	switch domain {
+	case kv.AccountsDomain:
+		return traceUnwindAddr != (common.Address{}) && len(key) == 20 && bytes.Equal(key, traceUnwindAddr.Bytes())
+	case kv.StorageDomain:
+		if traceUnwindAddr == (common.Address{}) || len(key) != 52 {
+			return false
+		}
+		return bytes.Equal(key[:20], traceUnwindAddr.Bytes()) &&
+			(traceUnwindSlotRaw == "" || bytes.Equal(key[20:], traceUnwindSlot.Bytes()))
+	default:
+		return false
+	}
+}
 
 // Domain is a part of the state (examples are Accounts, Storage, Code)
 // Domain should not have any go routines or locks
@@ -545,8 +563,34 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 			}
 			return nil
 		}
-		if err := valuesCursor.DeleteCurrent(); err != nil {
+		kFound, firstDup, err := valuesCursor.SeekExact(k)
+		if err != nil {
 			return err
+		}
+		if len(kFound) > 0 {
+			var toDelete [][]byte
+			dup := common.Copy(firstDup)
+			if len(dup) >= 8 && bytes.Equal(dup[:8], vOnDisk[:8]) {
+				toDelete = append(toDelete, dup)
+			}
+			for {
+				nextK, nextDup, nextErr := valuesCursor.NextDup()
+				if nextErr != nil {
+					return nextErr
+				}
+				if len(nextK) == 0 {
+					break
+				}
+				dup = common.Copy(nextDup)
+				if len(dup) >= 8 && bytes.Equal(dup[:8], vOnDisk[:8]) {
+					toDelete = append(toDelete, dup)
+				}
+			}
+			for _, dupVal := range toDelete {
+				if err := valuesCursor.DeleteExact(k, dupVal); err != nil {
+					return err
+				}
+			}
 		}
 		if err := valuesCursor.Put(k, vOnDisk); err != nil {
 			return err
@@ -1439,11 +1483,27 @@ func (dt *DomainRoTx) unwind(ctx context.Context, rwTx kv.RwTx, step, txNumUnwin
 	defer valsCursor.Close()
 	// First revert keys
 	for i := range domainDiffs {
-		keyStr, value, prevStepBytes := domainDiffs[i].Key, domainDiffs[i].Value, domainDiffs[i].PrevStepBytes
+		keyStr := domainDiffs[i].Key
+		// DomainEntryDiff slices may point at cursor-backed memory. Once we start
+		// seeking/deleting with valsCursor below, those views can become invalid.
+		// Copy them up front so same-step restore does not lose the previous value.
+		value := common.Copy(domainDiffs[i].Value)
+		prevStepBytes := common.Copy(domainDiffs[i].PrevStepBytes)
 		key := toBytesZeroCopy(keyStr)
+		if shouldTraceUnwindEntry(dt.name, key) {
+			log.Warn("domain unwind trace entry",
+				"domain", dt.name.String(),
+				"key", fmt.Sprintf("0x%x", key),
+				"value_len", len(value),
+				"value_preview", badRootValuePreview(value),
+				"prev_step", fmt.Sprintf("0x%x", prevStepBytes),
+				"target_txnum", txNumUnwindTo,
+			)
+		}
 		if dt.d.LargeValues {
+			currentStepBytes := key[len(key)-8:]
 			if len(value) == 0 {
-				if !bytes.Equal(key[len(key)-8:], prevStepBytes) {
+				if !bytes.Equal(currentStepBytes, prevStepBytes) {
 					if err := rwTx.Delete(d.ValuesTable, key); err != nil {
 						return err
 					}
@@ -1452,37 +1512,151 @@ func (dt *DomainRoTx) unwind(ctx context.Context, rwTx kv.RwTx, step, txNumUnwin
 						return err
 					}
 				}
-			} else {
-				if err := rwTx.Put(d.ValuesTable, key, value); err != nil {
-					return err
-				}
+				continue
+			}
+			restoreKey := append(append(make([]byte, 0, len(key)), key[:len(key)-8]...), prevStepBytes...)
+			if err := rwTx.Put(d.ValuesTable, restoreKey, value); err != nil {
+				return err
 			}
 			continue
 		}
 		stepBytes := key[len(key)-8:]
 		fullKey := key[:len(key)-8]
-		// Second, we need to restore the previous value
-		valInDB, err := valsCursor.SeekBothRange(fullKey, stepBytes)
+		// Remove all duplicates for the current key at the affected step(s).
+		// During repeated rewind/replay attempts we can end up with multiple values for
+		// the same key and aggregation step; selecting one via SeekExact then becomes
+		// value-order dependent instead of state-order dependent.
+		kFound, firstDup, err := valsCursor.SeekExact(fullKey)
 		if err != nil {
 			return err
 		}
-		if len(valInDB) > 0 {
-			stepInDB := valInDB[:8]
-			if bytes.Equal(stepInDB, stepBytes) {
-				if err := valsCursor.DeleteCurrent(); err != nil {
+		if shouldTraceUnwindEntry(dt.name, fullKey) {
+			log.Warn("domain unwind trace current",
+				"domain", dt.name.String(),
+				"key", fmt.Sprintf("0x%x", fullKey),
+				"step", fmt.Sprintf("0x%x", stepBytes),
+				"current_len", len(firstDup),
+				"current_preview", badRootValuePreview(firstDup),
+				"prev_step", fmt.Sprintf("0x%x", prevStepBytes),
+			)
+		}
+		if len(kFound) > 0 {
+			var toDelete [][]byte
+			dup := common.Copy(firstDup)
+			if len(dup) >= 8 && (bytes.Equal(dup[:8], stepBytes) || bytes.Equal(dup[:8], prevStepBytes)) {
+				toDelete = append(toDelete, dup)
+			}
+			for {
+				nextK, nextDup, nextErr := valsCursor.NextDup()
+				if nextErr != nil {
+					return nextErr
+				}
+				if len(nextK) == 0 {
+					break
+				}
+				dup = common.Copy(nextDup)
+				if len(dup) >= 8 && (bytes.Equal(dup[:8], stepBytes) || bytes.Equal(dup[:8], prevStepBytes)) {
+					toDelete = append(toDelete, dup)
+				}
+			}
+			for _, dupVal := range toDelete {
+				if err := valsCursor.DeleteExact(fullKey, dupVal); err != nil {
 					return err
 				}
 			}
+			if shouldTraceUnwindEntry(dt.name, fullKey) {
+				kAfterDelete, firstAfterDelete, seekAfterDeleteErr := valsCursor.SeekExact(fullKey)
+				if seekAfterDeleteErr != nil {
+					return seekAfterDeleteErr
+				}
+				var dupsAfterDelete []string
+				if len(kAfterDelete) > 0 {
+					if len(firstAfterDelete) >= 8 {
+						dupsAfterDelete = append(dupsAfterDelete, fmt.Sprintf("%x[len=%d]", firstAfterDelete[:8], len(firstAfterDelete)-8))
+					} else {
+						dupsAfterDelete = append(dupsAfterDelete, fmt.Sprintf("short[len=%d]", len(firstAfterDelete)))
+					}
+					for len(dupsAfterDelete) < 8 {
+						nextK, nextDup, nextErr := valsCursor.NextDup()
+						if nextErr != nil {
+							return nextErr
+						}
+						if len(nextK) == 0 {
+							break
+						}
+						if len(nextDup) >= 8 {
+							dupsAfterDelete = append(dupsAfterDelete, fmt.Sprintf("%x[len=%d]", nextDup[:8], len(nextDup)-8))
+						} else {
+							dupsAfterDelete = append(dupsAfterDelete, fmt.Sprintf("short[len=%d]", len(nextDup)))
+						}
+					}
+				}
+				log.Warn("domain unwind trace after delete",
+					"domain", dt.name.String(),
+					"key", fmt.Sprintf("0x%x", fullKey),
+					"dups", strings.Join(dupsAfterDelete, ","),
+				)
+			}
 		}
 
-		if !bytes.Equal(stepBytes, prevStepBytes) {
+		if len(value) == 0 {
 			continue
 		}
 
-		if err := valsCursor.Put(fullKey, append(stepBytes, value...)); err != nil {
-			return err
+			restoreVal := append(prevStepBytes, value...)
+			if shouldTraceUnwindEntry(dt.name, fullKey) {
+				log.Warn("domain unwind trace before put",
+					"domain", dt.name.String(),
+					"key", fmt.Sprintf("0x%x", fullKey),
+					"restore_step", fmt.Sprintf("0x%x", prevStepBytes),
+					"restore_len", len(value),
+					"restore_preview", badRootValuePreview(value),
+				)
+			}
+			if err := valsCursor.Put(fullKey, restoreVal); err != nil {
+				return err
+			}
+			if shouldTraceUnwindEntry(dt.name, fullKey) {
+				log.Warn("domain unwind trace restored",
+					"domain", dt.name.String(),
+					"key", fmt.Sprintf("0x%x", fullKey),
+					"step", fmt.Sprintf("0x%x", prevStepBytes),
+					"restored_len", len(value),
+					"restored_preview", badRootValuePreview(value),
+				)
+				kNow, firstNow, seekErr := valsCursor.SeekExact(fullKey)
+				if seekErr != nil {
+					return seekErr
+				}
+				var dups []string
+				if len(kNow) > 0 {
+					if len(firstNow) >= 8 {
+						dups = append(dups, fmt.Sprintf("%x[len=%d]", firstNow[:8], len(firstNow)-8))
+					} else {
+						dups = append(dups, fmt.Sprintf("short[len=%d]", len(firstNow)))
+					}
+					for len(dups) < 8 {
+						nextK, nextDup, nextErr := valsCursor.NextDup()
+						if nextErr != nil {
+							return nextErr
+						}
+						if len(nextK) == 0 {
+							break
+						}
+						if len(nextDup) >= 8 {
+							dups = append(dups, fmt.Sprintf("%x[len=%d]", nextDup[:8], len(nextDup)-8))
+						} else {
+							dups = append(dups, fmt.Sprintf("short[len=%d]", len(nextDup)))
+						}
+					}
+				}
+				log.Warn("domain unwind trace post",
+					"domain", dt.name.String(),
+					"key", fmt.Sprintf("0x%x", fullKey),
+					"dups", strings.Join(dups, ","),
+				)
+			}
 		}
-	}
 	// Compare valsKV with prevSeenKeys
 	if _, err := dt.ht.prune(ctx, rwTx, txNumUnwindTo, math.MaxUint64, math.MaxUint64, true, logEvery); err != nil {
 		return fmt.Errorf("[domain][%s] unwinding, prune history to txNum=%d, step %d: %w", dt.d.FilenameBase, txNumUnwindTo, step, err)
@@ -1515,9 +1689,15 @@ func (dt *DomainRoTx) getLatestFromFiles(k []byte, maxTxNum uint64) (v []byte, f
 	}
 
 	for i := len(dt.files) - 1; i >= 0; i-- {
-		if maxTxNum != math.MaxUint64 && (dt.files[i].startTxNum > maxTxNum || maxTxNum > dt.files[i].endTxNum) { // (maxTxNum > dt.files[i].endTxNum || dt.files[i].startTxNum > maxTxNum) { // skip partially matched files
-			//fmt.Printf("getLatestFromFiles: skipping file %d %s, maxTxNum=%d, startTxNum=%d, endTxNum=%d\n", i, dt.files[i].src.decompressor.FileName(), maxTxNum, dt.files[i].startTxNum, dt.files[i].endTxNum)
-			continue
+		if maxTxNum != math.MaxUint64 {
+			// File-backed "latest" values only tell us that a key's latest change happened
+			// somewhere inside that file range. For an as-of lookup at tx N, any file whose
+			// range extends past N can still contain a future value relative to N, so it must
+			// be ignored. Only files fully ending at or before N are safe fallbacks after a
+			// history miss.
+			if dt.files[i].endTxNum > maxTxNum {
+				continue
+			}
 		}
 		// fmt.Printf("getLatestFromFiles: lim=%d %d %d %d %d\n", maxTxNum, dt.files[i].startTxNum, dt.files[i].endTxNum, dt.files[i].startTxNum/dt.stepSize, dt.files[i].endTxNum/dt.stepSize)
 		if useExistenceFilter {
@@ -1605,16 +1785,33 @@ func (dt *DomainRoTx) GetAsOf(key []byte, txNum uint64, roTx kv.Tx) ([]byte, boo
 		return nil, false, nil
 	}
 
+	// Prefer a raw DB value first, even if it falls inside the visible file range.
+	// This matters after unwind: the restored latest value is reinserted into the DB,
+	// while snapshot files may still contain a newer value for the same key.
+	dbVal, dbStep, dbOK, err := dt.getLatestFromDbAny(key, roTx)
+	if err != nil {
+		return nil, false, err
+	}
+	if dbOK && firstTxNumOfStep(dbStep, dt.stepSize) <= txNum {
+		if traceGetAsOf == dt.d.FilenameBase {
+			fmt.Printf("DomainGetAsOf(%s, %x, %d) -> found in db latest state\n", dt.d.FilenameBase, key, txNum)
+		}
+		return dbVal, dbVal != nil, nil
+	}
+
+	// When history is unavailable, fall back only to snapshot files that are valid
+	// for the requested txNum. Unbounded GetLatest() can surface a future value from
+	// a newer file range, which is exactly the wrong thing during replay after unwind.
 	var ok bool
-	v, _, ok, err = dt.GetLatest(key, roTx)
+	v, ok, _, _, err = dt.getLatestFromFiles(key, txNum)
 	if err != nil {
 		return nil, false, err
 	}
 	if traceGetAsOf == dt.d.FilenameBase {
 		if ok {
-			fmt.Printf("DomainGetAsOf(%s, %x, %d) -> found in latest state\n", dt.d.FilenameBase, key, txNum)
+			fmt.Printf("DomainGetAsOf(%s, %x, %d) -> found in bounded latest state\n", dt.d.FilenameBase, key, txNum)
 		} else {
-			fmt.Printf("DomainGetAsOf(%s, %x, %d) -> not found in latest state\n", dt.d.FilenameBase, key, txNum)
+			fmt.Printf("DomainGetAsOf(%s, %x, %d) -> not found in bounded latest state\n", dt.d.FilenameBase, key, txNum)
 		}
 	}
 	return v, v != nil, nil
@@ -1751,6 +1948,21 @@ func (dt *DomainRoTx) getLatestFromDb(key []byte, roTx kv.Tx) ([]byte, kv.Step, 
 		return nil, 0, false, nil
 	}
 
+	v, foundStep, found, err := dt.getLatestFromDbAny(key, roTx)
+	if err != nil || !found {
+		return nil, 0, found, err
+	}
+	if lastTxNumOfStep(foundStep, dt.stepSize) >= dt.files.EndTxNum() {
+		return v, foundStep, true, nil
+	}
+	return nil, 0, false, nil
+}
+
+func (dt *DomainRoTx) getLatestFromDbAny(key []byte, roTx kv.Tx) ([]byte, kv.Step, bool, error) {
+	if dt == nil {
+		return nil, 0, false, nil
+	}
+
 	valsC, err := dt.valsCursor(roTx)
 
 	if err != nil {
@@ -1772,26 +1984,39 @@ func (dt *DomainRoTx) getLatestFromDb(key []byte, roTx kv.Tx) ([]byte, kv.Step, 
 		}
 		foundInvStep = fullkey[len(fullkey)-8:]
 	} else {
-		_, stepWithVal, err := valsC.SeekExact(key)
+		dupValsC, ok := valsC.(kv.CursorDupSort)
+		if !ok {
+			return nil, 0, false, fmt.Errorf("valsCursor is not dupsort for %s", dt.name.String())
+		}
+		kFound, stepWithVal, err := dupValsC.SeekExact(key)
 		if err != nil {
 			return nil, 0, false, fmt.Errorf("valsCursor.SeekExact: %w", err)
 		}
-		if len(stepWithVal) == 0 {
+		if len(kFound) == 0 || len(stepWithVal) == 0 {
 			return nil, 0, false, nil
 		}
+		bestVal := common.Copy(stepWithVal)
+		foundInvStep = common.Copy(stepWithVal[:8])
+		for {
+			nextK, nextVal, nextErr := dupValsC.NextDup()
+			if nextErr != nil {
+				return nil, 0, false, fmt.Errorf("valsCursor.NextDup: %w", nextErr)
+			}
+			if len(nextK) == 0 || len(nextVal) < 8 || !bytes.Equal(nextVal[:8], foundInvStep) {
+				break
+			}
+			// Repeated rewind/replay attempts can leave multiple values for the same key
+			// and aggregation step. Prefer a non-empty value over an empty tombstone.
+			if len(bestVal) <= 8 && len(nextVal) > 8 {
+				bestVal = common.Copy(nextVal)
+			}
+		}
 
-		v = stepWithVal[8:]
-
-		foundInvStep = stepWithVal[:8]
+		v = bestVal[8:]
 	}
 
 	foundStep := kv.Step(^binary.BigEndian.Uint64(foundInvStep))
-
-	if lastTxNumOfStep(foundStep, dt.stepSize) >= dt.files.EndTxNum() {
-		return v, foundStep, true, nil
-	}
-
-	return nil, 0, false, nil
+	return v, foundStep, true, nil
 }
 
 // GetLatest returns value, step in which the value last changed, and bool value which is true if the value
