@@ -25,6 +25,7 @@ import (
 	"unsafe"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/dbutils"
@@ -205,9 +206,12 @@ type threadSafeBuf struct {
 
 var writeDiffsetBuf = &threadSafeBuf{}
 var writeDiffsetFixedSenderAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
+var traceDiffsets = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DIFFSET_TRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 
 func WriteDiffSet(tx kv.RwTx, blockNumber uint64, blockHash common.Hash, diffSet *StateChangeSet) error {
-	logWriteDiffSetTrace(blockNumber, blockHash, diffSet)
+	if traceDiffsets {
+		logWriteDiffSetTrace(blockNumber, blockHash, diffSet)
+	}
 	writeDiffsetBuf.Lock()
 	defer writeDiffsetBuf.Unlock()
 	writeDiffsetBuf.b = diffSet.SerializeKeys(writeDiffsetBuf.b[:0])
@@ -320,7 +324,9 @@ func ReadDiffSet(tx kv.Tx, blockNumber uint64, blockHash common.Hash) ([kv.Domai
 	}
 
 	decoded := DeserializeKeys(val)
-	logReadDiffSetTrace(blockNumber, blockHash, decoded)
+	if traceDiffsets {
+		logReadDiffSetTrace(blockNumber, blockHash, decoded)
+	}
 	return decoded, true, nil
 }
 

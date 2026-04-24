@@ -208,6 +208,82 @@ func nothingToExec(applyTx kv.Tx, txNumsReader rawdbv3.TxNumsReader, inputTxNum 
 	return lastTxNum == inputTxNum, nil
 }
 
+func realignDomainsToExecutionStageIfStale(
+	ctx context.Context,
+	logger log.Logger,
+	applyTx kv.Tx,
+	doms *dbstate.SharedDomains,
+	execStage *StageState,
+) error {
+	if doms == nil || execStage == nil {
+		return nil
+	}
+	if execStage.BlockNumber == 0 {
+		return nil
+	}
+	if doms.BlockNum() >= execStage.BlockNumber {
+		return nil
+	}
+	temporalTx, ok := applyTx.(kv.TemporalTx)
+	if !ok {
+		return nil
+	}
+	targetBlock := execStage.BlockNumber
+	targetTxNum, err := rawdbv3.TxNums.Max(temporalTx, targetBlock)
+	if err != nil {
+		return fmt.Errorf("exec3: read stage txnum for block %d: %w", targetBlock, err)
+	}
+	commitmentCtx := doms.GetCommitmentContext()
+	if commitmentCtx == nil {
+		return errors.New("exec3: missing commitment context for stale-stage realign")
+	}
+	prevBlock := doms.BlockNum()
+	prevTxNum := doms.TxNum()
+	restoredBlock, restoredTxNum, restoredRoot, restored, err := commitmentCtx.RestoreCommitmentStateAsOfTxNum(temporalTx, targetTxNum)
+	if err != nil {
+		return fmt.Errorf("exec3: restore stale commitment state to block %d txnum %d: %w", targetBlock, targetTxNum, err)
+	}
+	if restored && restoredBlock >= targetBlock && restoredTxNum >= targetTxNum {
+		doms.SetBlockNum(restoredBlock)
+		doms.SetTxNum(restoredTxNum)
+		logger.Warn("exec3: realigned stale commitment state to execution stage",
+			"stage_block", targetBlock,
+			"stage_txnum", targetTxNum,
+			"prev_block", prevBlock,
+			"prev_txnum", prevTxNum,
+			"restored_block", restoredBlock,
+			"restored_txnum", restoredTxNum,
+			"root", common.BytesToHash(restoredRoot),
+		)
+		return nil
+	}
+	if restored {
+		logger.Warn("exec3: stale commitment restore was behind execution stage, rebuilding",
+			"stage_block", targetBlock,
+			"stage_txnum", targetTxNum,
+			"prev_block", prevBlock,
+			"prev_txnum", prevTxNum,
+			"restored_block", restoredBlock,
+			"restored_txnum", restoredTxNum,
+			"restored_root", common.BytesToHash(restoredRoot),
+		)
+	}
+	rebuiltRoot, err := commitmentCtx.RebuildCommitmentAsOfTxNumFullScan(ctx, temporalTx, targetBlock, targetTxNum)
+	if err != nil {
+		return fmt.Errorf("exec3: rebuild stale commitment state to block %d txnum %d: %w", targetBlock, targetTxNum, err)
+	}
+	doms.SetBlockNum(targetBlock)
+	doms.SetTxNum(targetTxNum)
+	logger.Warn("exec3: rebuilt stale commitment state to execution stage",
+		"stage_block", targetBlock,
+		"stage_txnum", targetTxNum,
+		"prev_block", prevBlock,
+		"prev_txnum", prevTxNum,
+		"root", common.BytesToHash(rebuiltRoot),
+	)
+	return nil
+}
+
 func ExecV3(ctx context.Context,
 	execStage *StageState, u Unwinder, workerCount int, cfg ExecuteBlockCfg, txc wrap.TxContainer,
 	parallel bool, //nolint
@@ -284,6 +360,9 @@ func ExecV3(ctx context.Context,
 			return err
 		}
 		defer doms.Close()
+	}
+	if err := realignDomainsToExecutionStageIfStale(ctx, logger, applyTx, doms, execStage); err != nil {
+		return err
 	}
 	txNumInDB := doms.TxNum()
 
@@ -899,7 +978,9 @@ Loop:
 
 			computeCommitmentDuration += time.Since(start)
 			if shouldGenerateChangesets {
-				logExec3ChangesetTrace(logger, blockNum, b.Hash(), changeSet)
+				if ERIGON_BAD_ROOT_DEBUG || ERIGON_MDBX_MIGRATE_CHANGESET_TRACE {
+					logExec3ChangesetTrace(logger, blockNum, b.Hash(), changeSet)
+				}
 				executor.domains().SavePastChangesetAccumulator(b.Hash(), blockNum, changeSet)
 				if !inMemExec {
 					if err := changeset2.WriteDiffSet(executor.tx(), blockNum, b.Hash(), changeSet); err != nil {
@@ -1062,6 +1143,83 @@ Loop:
 
 var exec3FixedSenderAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
 
+func decodeExec3AccountTraceValue(enc []byte) (*accounts.Account, error) {
+	if len(enc) == 0 {
+		return nil, nil
+	}
+	var acc accounts.Account
+	acc.Reset()
+	if err := accounts.DeserialiseV3(&acc, enc); err != nil {
+		return nil, err
+	}
+	out := acc
+	return &out, nil
+}
+
+func logExec3SenderFlushCheckpoint(logger log.Logger, label string, blockNum uint64, doms *dbstate.SharedDomains, applyTx kv.RwTx) {
+	if logger == nil || doms == nil {
+		return
+	}
+	domsBlock := doms.BlockNum()
+	if blockNum != 156244 && (blockNum < 156425 || blockNum > 156427) && domsBlock == blockNum {
+		return
+	}
+	fields := []interface{}{
+		"label", label,
+		"block", blockNum,
+		"doms_block", domsBlock,
+		"doms_txnum", doms.TxNum(),
+		"block_mismatch", domsBlock != blockNum,
+	}
+	if memVal, memStep, ok := doms.DebugGetLatestFromMem(kv.AccountsDomain, exec3FixedSenderAddrBytes); ok {
+		fields = append(fields,
+			"mem_len", len(memVal),
+			"mem_preview", unwindValuePreview(memVal),
+			"mem_step", memStep,
+		)
+		if acc, err := decodeExec3AccountTraceValue(memVal); err == nil && acc != nil {
+			fields = append(fields,
+				"mem_nonce", acc.Nonce,
+				"mem_balance", acc.Balance.ToBig().String(),
+				"mem_root", acc.Root,
+			)
+		}
+	} else {
+		fields = append(fields, "mem_len", 0, "mem_preview", "missing")
+	}
+	if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
+		latestVal, latestStep, latestErr := doms.GetLatest(kv.AccountsDomain, temporalTx, exec3FixedSenderAddrBytes)
+		fields = append(fields,
+			"latest_err", latestErr,
+			"latest_len", len(latestVal),
+			"latest_preview", unwindValuePreview(latestVal),
+			"latest_step", latestStep,
+		)
+		if acc, err := decodeExec3AccountTraceValue(latestVal); err == nil && acc != nil {
+			fields = append(fields,
+				"latest_nonce", acc.Nonce,
+				"latest_balance", acc.Balance.ToBig().String(),
+				"latest_root", acc.Root,
+			)
+		}
+		txLatestVal, txLatestStep, txLatestErr := temporalTx.GetLatest(kv.AccountsDomain, exec3FixedSenderAddrBytes)
+		fields = append(fields,
+			"tx_latest_err", txLatestErr,
+			"tx_latest_len", len(txLatestVal),
+			"tx_latest_preview", unwindValuePreview(txLatestVal),
+			"tx_latest_step", txLatestStep,
+		)
+		if acc, err := decodeExec3AccountTraceValue(txLatestVal); err == nil && acc != nil {
+			fields = append(fields,
+				"tx_latest_nonce", acc.Nonce,
+				"tx_latest_balance", acc.Balance.ToBig().String(),
+				"tx_latest_root", acc.Root,
+			)
+		}
+	}
+	logger.Warn("exec3: sender flush checkpoint", fields...)
+}
+
 func logExec3ChangesetTrace(logger log.Logger, blockNum uint64, blockHash common.Hash, changeSet *changeset2.StateChangeSet) {
 	if changeSet == nil {
 		logger.Warn("exec3 changeset trace", "block", blockNum, "block_hash", blockHash, "accounts_len", -1, "sender", common.BytesToAddress(exec3FixedSenderAddrBytes), "sender_match", false)
@@ -1097,6 +1255,7 @@ func logExec3ChangesetTrace(logger log.Logger, blockNum uint64, blockHash common
 var ERIGON_COMMIT_EACH_BLOCK = dbg.EnvBool("ERIGON_COMMIT_EACH_BLOCK", false)
 var ERIGON_STOP_AT_BLOCK = dbg.EnvUint("ERIGON_STOP_AT_BLOCK", 0)
 var ERIGON_BAD_ROOT_DEBUG = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var ERIGON_MDBX_MIGRATE_CHANGESET_TRACE = dbg.EnvBool("ERIGON_MDBX_MIGRATE_CHANGESET_TRACE", false)
 var ERIGON_SNAPSHOT_CALLSITE_DEBUG = dbg.EnvBool("ERIGON_SNAPSHOT_BUILD_DEBUG", false)
 var ERIGON_BAD_ROOT_DUMP_STATE = dbg.EnvBool("ERIGON_BAD_ROOT_DUMP_STATE", false)
 var ERIGON_BAD_ROOT_ACCOUNTS = dbg.EnvStrings("ERIGON_BAD_ROOT_ACCOUNTS", ",", nil)
@@ -2632,6 +2791,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		fallbackTried := false
 		fallbackMatched := false
 		fallbackAdopted := false
+		fallbackAdoptAllowed := dbg.EnvBool("ERIGON_ADOPT_FALLBACK_ROOT_UNSAFE", false)
 		var fallbackErr error
 		var fallbackRootHash []byte
 		if temporalTx, ok := applyTx.(kv.TemporalTx); ok {
@@ -2642,7 +2802,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 					fallbackMatched = bytes.Equal(fallbackRootHash, header.Root.Bytes())
 					if fallbackMatched {
 						computedRootHash = fallbackRootHash
-					} else if ERIGON_BAD_ROOT_DEBUG {
+					} else if ERIGON_BAD_ROOT_DEBUG && fallbackAdoptAllowed {
 						computedRootHash = fallbackRootHash
 						header.Root = common.BytesToHash(fallbackRootHash)
 						fallbackAdopted = true
@@ -2655,6 +2815,7 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 					"fallback_root", common.BytesToHash(fallbackRootHash),
 					"header_root", header.Root,
 					"matches_header", fallbackMatched,
+					"adopt_allowed", fallbackAdoptAllowed,
 					"adopted", fallbackAdopted,
 				)
 			}
@@ -2671,9 +2832,11 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 			)
 			if !inMemExec {
 				flushStart := time.Now()
+				logExec3SenderFlushCheckpoint(logger, "pre-flush-fallback-resolved", header.Number.Uint64(), doms, applyTx)
 				if err := doms.Flush(ctx, applyTx); err != nil {
 					return false, times, err
 				}
+				logExec3SenderFlushCheckpoint(logger, "post-flush-fallback-resolved", header.Number.Uint64(), doms, applyTx)
 				times.Flush = time.Since(flushStart)
 			}
 			return true, times, nil
@@ -2702,9 +2865,11 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		logger.Warn(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", e.LogPrefix(), header.Number.Uint64(), computedRootHash, header.Root.Bytes(), header.Hash()))
 		if ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT && !inMemExec {
 			flushStart := time.Now()
+			logExec3SenderFlushCheckpoint(logger, "pre-flush-bad-root", header.Number.Uint64(), doms, applyTx)
 			if err := doms.Flush(ctx, applyTx); err != nil {
 				return false, times, err
 			}
+			logExec3SenderFlushCheckpoint(logger, "post-flush-bad-root", header.Number.Uint64(), doms, applyTx)
 			times.Flush = time.Since(flushStart)
 		}
 		logBadRootDetails(ctx, header, computedRootHash, applyTx, doms, touchedPlainKeys, cfg, e, maxBlockNum, logger)
@@ -2713,11 +2878,13 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	}
 	if !inMemExec {
 		start = time.Now()
+		logExec3SenderFlushCheckpoint(logger, "pre-flush", header.Number.Uint64(), doms, applyTx)
 		err := doms.Flush(ctx, applyTx)
 		times.Flush = time.Since(start)
 		if err != nil {
 			return false, times, err
 		}
+		logExec3SenderFlushCheckpoint(logger, "post-flush", header.Number.Uint64(), doms, applyTx)
 	}
 	return true, times, nil
 

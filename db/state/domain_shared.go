@@ -31,6 +31,7 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/state/changeset"
+	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/db/state/statecfg"
 	"github.com/erigontech/erigon/execution/commitment"
 	"github.com/erigontech/erigon/execution/commitment/commitmentdb"
@@ -146,6 +147,19 @@ func NewSharedDomains(tx kv.TemporalTx, logger log.Logger) (*SharedDomains, erro
 	}
 
 	return sd, nil
+}
+
+func decodeAccountTraceValue(enc []byte) (*accounts.Account, error) {
+	if len(enc) == 0 {
+		return nil, nil
+	}
+	var acc accounts.Account
+	acc.Reset()
+	if err := accounts.DeserialiseV3(&acc, enc); err != nil {
+		return nil, err
+	}
+	out := acc
+	return &out, nil
 }
 
 type temporalPutDel struct {
@@ -474,6 +488,34 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 		}
 	}
 	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
+	if domain == kv.AccountsDomain && bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
+		fields := []interface{}{
+			"block_num", sd.blockNum.Load(),
+			"tx_num", txNum,
+			"key", common.BytesToAddress(k).Hex(),
+			"new_len", len(v),
+			"new_preview", badRootValuePreview(v),
+			"prev_len", len(curVal),
+			"prev_preview", badRootValuePreview(curVal),
+			"prev_step", curStep,
+			"unchanged", bytes.Equal(curVal, v),
+		}
+		if acc, err := decodeAccountTraceValue(v); err == nil && acc != nil {
+			fields = append(fields,
+				"new_nonce", acc.Nonce,
+				"new_balance", acc.Balance.ToBig().String(),
+				"new_root", acc.Root.Hex(),
+			)
+		}
+		if acc, err := decodeAccountTraceValue(curVal); err == nil && acc != nil {
+			fields = append(fields,
+				"prev_nonce", acc.Nonce,
+				"prev_balance", acc.Balance.ToBig().String(),
+				"prev_root", acc.Root.Hex(),
+			)
+		}
+		log.Warn("domain shared account put", fields...)
+	}
 	if domain == kv.AccountsDomain && bytes.Equal(k, escrowTraceAddrBytes) {
 		log.Info("escrow trace shared_domain_put",
 			"sd", fmt.Sprintf("%p", sd),

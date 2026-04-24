@@ -180,10 +180,15 @@ func shouldMdbxMigrateApplyTrace(txTask *TxTask) bool {
 }
 
 func shouldTraceApplyAccount(addr common.Address) bool {
+	if isBadRootAccount(addr) {
+		return true
+	}
+	if !mdbxMigrateApplyTrace {
+		return false
+	}
 	return addr == mdbxMigrateApplyTraceAccountProbe ||
 		addr == mdbxMigrateApplyTraceStorageProbeAddr ||
-		addr == common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce") ||
-		isBadRootAccount(addr)
+		addr == common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce")
 }
 
 func readApplyTraceAccount(domains *dbstate.SharedDomains, tx kv.TemporalTx, addr common.Address, out *accounts.Account) (exists bool, enc []byte, step kv.Step, err error) {
@@ -921,7 +926,7 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 							if list.Vals[i] == nil {
 								op = "del"
 							}
-							log.Warn("state apply account write-list op",
+							fields := []interface{}{
 								"block", txTask.BlockNum,
 								"tx_index", txTask.TxIndex,
 								"tx_num", txTask.TxNum,
@@ -931,7 +936,15 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 								"val_len", len(list.Vals[i]),
 								"is_tombstone", isAccountTombstone(list.Vals[i]),
 								"is_empty_encoding", isEmptyAccountEncoding(list.Vals[i]),
-							)
+							}
+							if acc, err := decodeAccountV3(list.Vals[i]); err == nil && acc != nil {
+								fields = append(fields,
+									"val_nonce", acc.Nonce,
+									"val_balance", acc.Balance.ToBig().String(),
+									"val_root", acc.Root.Hex(),
+								)
+							}
+							log.Warn("state apply account write-list op", fields...)
 						}
 					}
 					if domain == kv.StorageDomain && len(keyBytes) >= length.Addr+length.Hash {
@@ -1984,6 +1997,27 @@ func (w *StateWriterBufferedV3) PrevAndDels() (map[string][]byte, map[string]*ac
 
 func (w *StateWriterBufferedV3) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
 	logMdbxMigrateAccountTrace("put", w.txNum, address, original, account)
+	if shouldTraceApplyAccount(address) {
+		fields := []interface{}{
+			"tx_num", w.txNum,
+			"addr", address.Hex(),
+		}
+		if original != nil {
+			fields = append(fields,
+				"orig_nonce", original.Nonce,
+				"orig_balance", original.Balance.ToBig().String(),
+				"orig_root", original.Root.Hex(),
+			)
+		}
+		if account != nil {
+			fields = append(fields,
+				"new_nonce", account.Nonce,
+				"new_balance", account.Balance.ToBig().String(),
+				"new_root", account.Root.Hex(),
+			)
+		}
+		log.Warn("state writer buffered updateAccountData", fields...)
+	}
 	if w.trace {
 		fmt.Printf("acc %x: {Balance: %d, Nonce: %d, Inc: %d, CodeHash: %x}\n", address, &account.Balance, account.Nonce, account.Incarnation, account.CodeHash)
 	}
@@ -2191,6 +2225,27 @@ func (w *Writer) PrevAndDels() (map[string][]byte, map[string]*accounts.Account,
 
 func (w *Writer) UpdateAccountData(address common.Address, original, account *accounts.Account) error {
 	logMdbxMigrateAccountTrace("put", w.txNum, address, original, account)
+	if shouldTraceApplyAccount(address) {
+		fields := []interface{}{
+			"tx_num", w.txNum,
+			"addr", address.Hex(),
+		}
+		if original != nil {
+			fields = append(fields,
+				"orig_nonce", original.Nonce,
+				"orig_balance", original.Balance.ToBig().String(),
+				"orig_root", original.Root.Hex(),
+			)
+		}
+		if account != nil {
+			fields = append(fields,
+				"new_nonce", account.Nonce,
+				"new_balance", account.Balance.ToBig().String(),
+				"new_root", account.Root.Hex(),
+			)
+		}
+		log.Warn("state writer direct updateAccountData", fields...)
+	}
 	if w.trace {
 		fmt.Printf("acc %x: {Balance: %d, Nonce: %d, Inc: %d, CodeHash: %x}\n", address, &account.Balance, account.Nonce, account.Incarnation, account.CodeHash)
 	}

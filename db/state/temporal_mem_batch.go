@@ -29,6 +29,7 @@ import (
 	btree2 "github.com/tidwall/btree"
 
 	"github.com/erigontech/erigon-lib/common"
+	"github.com/erigontech/erigon-lib/common/dbg"
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/kv/order"
@@ -59,6 +60,7 @@ type TemporalMemBatch struct {
 }
 
 var fixedSenderDiffTraceAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
+var traceDiffsetSource = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DIFFSET_TRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 
 func newTemporalMemBatch(tx kv.TemporalTx) *TemporalMemBatch {
 	sd := &TemporalMemBatch{
@@ -319,6 +321,17 @@ func synthesizeAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.D
 		if err != nil {
 			return nil, false, err
 		}
+		if bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
+			log.Warn("state account history restore probe",
+				"mode", "fallback",
+				"block", blockNumber,
+				"start_txnum", startTxNum,
+				"end_txnum", endTxNum,
+				"key", common.BytesToAddress(k),
+				"restore_len", len(restoreVal),
+				"restore_preview", badRootValuePreview(restoreVal),
+			)
+		}
 		step := kv.Step(0)
 		if _, latestStep, latestErr := ttx.GetLatest(kv.AccountsDomain, k); latestErr == nil {
 			step = latestStep
@@ -370,6 +383,52 @@ func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 	prevStepBytes := make([]byte, 8)
 	currentStepBytes := make([]byte, 8)
 	changed := false
+	// Some persisted diffsets already contain the affected account key, but
+	// HistoryRange over the block span may not enumerate it in this replay path.
+	// For those entries, prefer the raw AccountVals row identified by the diff's
+	// PrevStepBytes. That is the value unwind will restore, and it avoids the
+	// marker-like HistorySeek/GetAsOf payloads observed on poster rewind.
+	for i := range existing {
+		logicalKey := accountLogicalKey(toBytesZeroCopy(existing[i].Key))
+		if len(logicalKey) == 0 || !bytes.Equal(logicalKey, fixedSenderDiffTraceAddrBytes) {
+			continue
+		}
+		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, logicalKey, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		asOfVal, asOfOK, asOfErr := ttx.GetAsOf(kv.AccountsDomain, logicalKey, startTxNum)
+		asOfNextVal, asOfNextOK, asOfNextErr := ttx.GetAsOf(kv.AccountsDomain, logicalKey, startTxNum+1)
+		prevStepVal, prevStepOK, prevStepErr := lookupAccountValueByPrevStep(tx, logicalKey, existing[i].PrevStepBytes)
+		log.Warn("state account history restore probe",
+			"mode", "rewrite-existing-probe",
+			"block", blockNumber,
+			"start_txnum", startTxNum,
+			"end_txnum", endTxNum,
+			"key", common.BytesToAddress(logicalKey),
+			"existing_len", len(existing[i].Value),
+			"existing_preview", badRootValuePreview(existing[i].Value),
+			"restore_len", len(restoreVal),
+			"restore_preview", badRootValuePreview(restoreVal),
+			"asof_ok", asOfOK,
+			"asof_preview", badRootValuePreview(asOfVal),
+			"asof_err", errString(asOfErr),
+			"asof_next_ok", asOfNextOK,
+			"asof_next_preview", badRootValuePreview(asOfNextVal),
+			"asof_next_err", errString(asOfNextErr),
+			"prev_step_lookup_ok", prevStepOK,
+			"prev_step_lookup_preview", badRootValuePreview(prevStepVal),
+			"prev_step_lookup_err", errString(prevStepErr),
+		)
+		if prevStepOK {
+			log.Warn("state account history restore probe",
+				"mode", "rewrite-existing-candidate",
+				"block", blockNumber,
+				"key", common.BytesToAddress(logicalKey),
+				"candidate_preview", badRootValuePreview(prevStepVal),
+			)
+		}
+	}
 	for it.HasNext() {
 		k, _, err := it.Next()
 		if err != nil {
@@ -378,6 +437,17 @@ func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
 		if err != nil {
 			return nil, false, err
+		}
+		if bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
+			log.Warn("state account history restore probe",
+				"mode", "rewrite",
+				"block", blockNumber,
+				"start_txnum", startTxNum,
+				"end_txnum", endTxNum,
+				"key", common.BytesToAddress(k),
+				"restore_len", len(restoreVal),
+				"restore_preview", badRootValuePreview(restoreVal),
+			)
 		}
 		step := kv.Step(0)
 		if _, latestStep, latestErr := ttx.GetLatest(kv.AccountsDomain, k); latestErr == nil {
@@ -530,6 +600,9 @@ func rewriteStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 }
 
 func logDiffsetSource(source string, blockNumber uint64, blockHash common.Hash, diffs [kv.DomainLen][]kv.DomainEntryDiff) {
+	if !traceDiffsetSource {
+		return
+	}
 	if sender := findDomainDiff(diffs[kv.AccountsDomain], fixedSenderDiffTraceAddrBytes); sender != nil {
 		log.Warn("state diffset source trace",
 			"source", source,
@@ -555,13 +628,55 @@ func logDiffsetSource(source string, blockNumber uint64, blockHash common.Hash, 
 }
 
 func findDomainDiff(diffs []kv.DomainEntryDiff, key []byte) *kv.DomainEntryDiff {
-	keyStr := toStringZeroCopy(key)
 	for i := range diffs {
-		if diffs[i].Key == keyStr {
+		diffKey := toBytesZeroCopy(diffs[i].Key)
+		if bytes.Equal(diffKey, key) {
+			return &diffs[i]
+		}
+		if len(diffKey) > len(key) && bytes.Equal(diffKey[:len(key)], key) {
 			return &diffs[i]
 		}
 	}
 	return nil
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func lookupAccountValueByPrevStep(tx kv.Tx, logicalKey []byte, prevStepBytes []byte) ([]byte, bool, error) {
+	if len(logicalKey) == 0 || len(prevStepBytes) != 8 {
+		return nil, false, nil
+	}
+	c, err := tx.CursorDupSort(kv.TblAccountVals)
+	if err != nil {
+		return nil, false, err
+	}
+	defer c.Close()
+	dup, err := c.SeekBothRange(logicalKey, prevStepBytes)
+	if err != nil {
+		return nil, false, err
+	}
+	if dup == nil || len(dup) < 8 || !bytes.Equal(dup[:8], prevStepBytes) {
+		return nil, false, nil
+	}
+	return common.Copy(dup[8:]), true, nil
+}
+
+func accountLogicalKey(diffKey []byte) []byte {
+	if len(diffKey) == 0 {
+		return nil
+	}
+	if len(diffKey) >= 20+8 {
+		return common.Copy(diffKey[:20])
+	}
+	if len(diffKey) >= 20 {
+		return common.Copy(diffKey[:20])
+	}
+	return common.Copy(diffKey)
 }
 
 func (sd *TemporalMemBatch) IndexAdd(table kv.InvertedIdx, key []byte, txNum uint64) (err error) {

@@ -3497,8 +3497,14 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 	ctxUpdatesSyntheticDeleteSkipped := 0
 	ctxUpdatesSyntheticApplied := 0
 	ctxRuntimeFlags := resolveWitnessCtxUpdateRuntimeFlags()
+	// Keep the normal witness path authoritative by default. Context-update
+	// mutation of witness cells is useful for root diagnostics, but in validator
+	// recording it can suppress canonical trie-node preimage capture and force
+	// expensive fallback/fullscan recovery. Require an extra explicit unsafe gate
+	// before mutating witness cells from ctx updates.
+	ctxUpdatesApplyAllowed := parseWitnessEnvBool(os.Getenv("ERIGON_WITNESS_ALLOW_CTX_UPDATES_IN_WITNESS_UNSAFE"), false)
 	ctxUpdatesModeDirect := updates.mode == ModeDirect
-	ctxUpdatesModeDirectApply := ctxUpdatesModeDirect && ctxRuntimeFlags.ModeDirectEnabled && !ctxRuntimeFlags.ApplyDisabledUnsafe
+	ctxUpdatesModeDirectApply := ctxUpdatesApplyAllowed && ctxUpdatesModeDirect && ctxRuntimeFlags.ModeDirectEnabled && !ctxRuntimeFlags.ApplyDisabledUnsafe
 	err = updates.HashSort(ctx, func(hashedKey, plainKey []byte, stateUpdate *Update) error {
 		select {
 		case <-logEvery.C:
@@ -3624,7 +3630,7 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			}
 		}
 		//hph.PrintGrid()
-		if ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply {
+		if ctxUpdatesApplyAllowed && (ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply) {
 			// Only payloaded iterator updates may mutate witness cells. ModeDirect
 			// carries touched keys without canonical payloads; synthesizing from ctx
 			// makes witness generation depend on the ambient as-of view and can drift
@@ -3743,9 +3749,10 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			"apply_ctx_updates_mode_direct_disabled", ctxRuntimeFlags.ModeDirectDisabled,
 			"apply_ctx_updates_mode_direct_enabled", ctxUpdatesModeDirectApply,
 			"apply_ctx_updates_mode_direct_unsafe", ctxRuntimeFlags.ModeDirectUnsafe,
+			"apply_ctx_updates_allowed_in_witness", ctxUpdatesApplyAllowed,
 			"apply_ctx_updates_resolution", ctxRuntimeFlags.ModeDirectResolution,
 		)
-		if (ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply) && mode == ModeDirect.String() {
+		if (ctxUpdatesApplyAllowed && (ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply)) && mode == ModeDirect.String() {
 			note := "ModeDirect keys are augmented from ctx updates during witness diagnostics"
 			if !ctxUpdatesModeDirectApply {
 				note = "ModeDirect ctx-update augmentation disabled by env"
@@ -3758,7 +3765,7 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			)
 		}
 	}
-	if (ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply) && erigonBadRootDebug {
+	if (ctxUpdatesApplyAllowed && (ctxRuntimeFlags.ApplyEffective || ctxUpdatesModeDirectApply)) && erigonBadRootDebug {
 		log.Warn(
 			"witness ctx update application summary",
 			"prefix", logPrefix,
@@ -3772,6 +3779,7 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			"mode_direct", ctxUpdatesModeDirect,
 			"mode_direct_apply_enabled", ctxUpdatesModeDirectApply,
 			"mode_direct_unsafe", ctxRuntimeFlags.ModeDirectUnsafe,
+			"ctx_update_apply_allowed_in_witness", ctxUpdatesApplyAllowed,
 			"apply_ctx_updates", ctxRuntimeFlags.ApplyEffective,
 			"apply_ctx_updates_resolution", ctxRuntimeFlags.ModeDirectResolution,
 			"note", "witness extraction applies update payloads in-memory to grid cells only",
@@ -4254,11 +4262,12 @@ func (hph *HexPatriciaHashed) GenerateWitness(ctx context.Context, updates *Upda
 			log.Warn(
 				"witness root mismatch detail",
 				"prefix", logPrefix,
-				"ctx_update_apply_enabled", ctxRuntimeFlags.ApplyEffective,
+				"ctx_update_apply_enabled", ctxRuntimeFlags.ApplyEffective && ctxUpdatesApplyAllowed,
 				"ctx_update_mode_direct_apply_enabled", ctxUpdatesModeDirectApply,
 				"ctx_update_mode_direct_requested", ctxRuntimeFlags.ModeDirectRequested,
 				"ctx_update_mode_direct_disabled", ctxRuntimeFlags.ModeDirectDisabled,
 				"ctx_update_mode_direct_unsafe", ctxRuntimeFlags.ModeDirectUnsafe,
+				"ctx_update_apply_allowed_in_witness", ctxUpdatesApplyAllowed,
 				"ctx_update_resolution", ctxRuntimeFlags.ModeDirectResolution,
 				"ctx_updates_applied", ctxUpdatesApplied > 0,
 				"ctx_updates_would_apply", ctxUpdatesWouldApply > 0,
