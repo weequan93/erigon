@@ -16,8 +16,9 @@ func (hph *HexPatriciaHashed) mountTo(root *HexPatriciaHashed, nibble int) {
 	hph.Reset()
 
 	hph.root = root.root
-	// hph.rootPresent = !hph.root.IsEmpty()
-	// hph.rootPresent = false
+	hph.rootChecked = root.rootChecked
+	hph.rootTouched = root.rootTouched
+	hph.rootPresent = root.rootPresent
 
 	hph.activeRows = root.activeRows
 	hph.currentKeyLen = root.currentKeyLen
@@ -287,6 +288,20 @@ func (p *ConcurrentPatriciaHashed) Reset() {
 	for i := 0; i < len(p.mounts); i++ {
 		p.mounts[i].Reset()
 	}
+}
+
+func (p *ConcurrentPatriciaHashed) SetState(buf []byte) error {
+	if err := p.root.SetState(buf); err != nil {
+		return err
+	}
+	for i := 0; i < len(p.mounts); i++ {
+		if err := p.mounts[i].SetState(nil); err != nil {
+			return err
+		}
+		p.mounts[i].mountTo(p.root, i)
+		p.mounts[i].ctx = p.ctx[i]
+	}
+	return nil
 }
 
 // Set context for state IO

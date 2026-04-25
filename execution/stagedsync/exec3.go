@@ -412,6 +412,12 @@ func ExecV3(ctx context.Context,
 		if inputTxNum, maxTxNum, offsetFromBlockBeginning, err = restoreTxNum(ctx, &cfg, applyTx, doms, maxBlockNum); err != nil {
 			return err
 		}
+		if cfg.syncCfg.DisableTxNumSkip {
+			// Migration recovery must replay the whole current block after an
+			// unwind. Treating a block prefix as history-only drops its gas from
+			// post-validation and causes deterministic header gas mismatches.
+			offsetFromBlockBeginning = 0
+		}
 	} else {
 		if err := cfg.db.View(ctx, func(tx kv.Tx) (err error) {
 			inputTxNum, maxTxNum, offsetFromBlockBeginning, err = restoreTxNum(ctx, &cfg, tx, doms, maxBlockNum)
@@ -567,14 +573,29 @@ Loop:
 		inputBlockNum.Store(blockNum)
 		executor.domains().SetBlockNum(blockNum)
 
+		logExecutionLoopTrace(logger, "read_block_start", blockNum, executor.domains(),
+			"input_txnum", inputTxNum,
+			"output_txnum", outputTxNum.Load(),
+			"stage_progress", stageProgress,
+			"changesets", shouldGenerateChangesets,
+		)
 		b, err = blockWithSenders(ctx, cfg.db, executor.tx(), blockReader, blockNum)
 		if err != nil {
+			logExecutionLoopTrace(logger, "read_block_failed", blockNum, executor.domains(),
+				"input_txnum", inputTxNum,
+				"err", err,
+			)
 			return err
 		}
 		if b == nil {
 			// TODO: panic here and see that overall process deadlock
 			return fmt.Errorf("nil block %d", blockNum)
 		}
+		logExecutionLoopTrace(logger, "read_block_done", blockNum, executor.domains(),
+			"txs", len(b.Transactions()),
+			"gas_used", b.GasUsed(),
+			"hash", b.Hash(),
+		)
 
 		if b.NumberU64() == 0 {
 			if hooks != nil && hooks.OnGenesisBlock != nil {
@@ -683,7 +704,7 @@ Loop:
 			// When resuming from the middle of a block, we must replay the skipped prefix
 			// in history mode. If we short-circuit by txNum here, we can end up executing
 			// only the final synthetic task, which diverges state/receipts.
-			if offsetFromBlockBeginning == 0 && txTask.TxNum <= txNumInDB && txTask.TxNum > 0 && !cfg.blockProduction {
+			if !cfg.syncCfg.DisableTxNumSkip && offsetFromBlockBeginning == 0 && txTask.TxNum <= txNumInDB && txTask.TxNum > 0 && !cfg.blockProduction {
 				inputTxNum++
 				skipPostEvaluation = true
 				continue
@@ -781,13 +802,33 @@ Loop:
 
 			se.skipPostEvaluation = skipPostEvaluation
 
+			logExecutionLoopTrace(logger, "serial_execute_start", blockNum, executor.domains(),
+				"tasks", len(txTasks),
+				"txs", len(txs),
+				"input_txnum", inputTxNum,
+				"output_txnum", outputTxNum.Load(),
+				"skip_post_eval", skipPostEvaluation,
+			)
+			executeStart := time.Now()
 			continueLoop, err := se.execute(ctx, txTasks, gp)
+			executeElapsed := time.Since(executeStart)
 			if b.NumberU64() > 0 && hooks != nil && hooks.OnBlockEnd != nil {
 				hooks.OnBlockEnd(err)
 			}
 			if err != nil {
+				logExecutionLoopTrace(logger, "serial_execute_failed", blockNum, executor.domains(),
+					"elapsed", executeElapsed,
+					"tasks", len(txTasks),
+					"err", err,
+				)
 				return err
 			}
+			logExecutionLoopTrace(logger, "serial_execute_done", blockNum, executor.domains(),
+				"elapsed", executeElapsed,
+				"tasks", len(txTasks),
+				"continue_loop", continueLoop,
+				"read_state_size", executor.readState().SizeEstimate(),
+			)
 
 			count += uint64(len(txTasks))
 			logGas += se.gasUsed
@@ -929,7 +970,31 @@ Loop:
 					"probe_disabled_reason", "avoid mutating commitment context before compute",
 				)
 			}
+			logExecutionLoopTrace(logger, "per_block_commitment_start", blockNum, executor.domains(),
+				"commit_txnum", commitTxNum,
+				"commit_txnum_source", commitTxNumSource,
+				"input_txnum", inputTxNum,
+				"real_tx_count", realTxCount,
+				"read_state_size", executor.readState().SizeEstimate(),
+			)
+			perBlockCommitStart := time.Now()
 			rh, err := executor.domains().ComputeCommitment(ctx, true, blockNum, commitTxNum, execStage.LogPrefix())
+			perBlockCommitElapsed := time.Since(perBlockCommitStart)
+			if err != nil {
+				logExecutionLoopTrace(logger, "per_block_commitment_failed", blockNum, executor.domains(),
+					"elapsed", perBlockCommitElapsed,
+					"commit_txnum", commitTxNum,
+					"err", err,
+				)
+			} else {
+				logExecutionLoopTrace(logger, "per_block_commitment_done", blockNum, executor.domains(),
+					"elapsed", perBlockCommitElapsed,
+					"commit_txnum", commitTxNum,
+					"computed_root", common.BytesToHash(rh),
+					"header_root", header.Root,
+					"matches_header", len(rh) > 0 && common.BytesToHash(rh) == header.Root,
+				)
+			}
 			if domsAdjusted {
 				executor.domains().SetTxNum(domsTxNumBefore)
 				if ERIGON_BAD_ROOT_DEBUG && blockNum >= 33 {
@@ -966,6 +1031,33 @@ Loop:
 				logCommitmentAnchorProbe("per_block_after_compute", blockNum, executor.domains(), executor.tx(), rh, logger)
 			}
 			if err != nil {
+				if cfg.syncCfg.DisableTxNumSkip && strings.Contains(err.Error(), "empty branch data read during unfold") {
+					unwindTo := uint64(0)
+					if header.Number.Uint64() > 0 {
+						unwindTo = header.Number.Uint64() - 1
+					}
+					allowedUnwindTo, ok, unwindCheckErr := rawtemporaldb.CanUnwindBeforeBlockNum(unwindTo, applyTx.(kv.TemporalRwTx))
+					if unwindCheckErr != nil {
+						return unwindCheckErr
+					}
+					if !ok {
+						return fmt.Errorf("%w: requested=%d, minAllowed=%d", ErrTooDeepUnwind, unwindTo, allowedUnwindTo)
+					}
+					logger.Warn("Commitment branch missing during migration replay; treating as bad state root",
+						"block", header.Number.Uint64(),
+						"hash", header.Hash(),
+						"commit_txnum", commitTxNum,
+						"requested_unwind_to", unwindTo,
+						"allowed_unwind_to", allowedUnwindTo,
+						"err", err,
+					)
+					if u != nil {
+						if unwindErr := u.UnwindTo(allowedUnwindTo, BadBlock(header.Hash(), ErrInvalidStateRootHash), applyTx); unwindErr != nil {
+							return unwindErr
+						}
+					}
+					return fmt.Errorf("%w: missing commitment branch: %v", ErrInvalidStateRootHash, err)
+				}
 				return err
 			}
 
@@ -981,12 +1073,31 @@ Loop:
 				if ERIGON_BAD_ROOT_DEBUG || ERIGON_MDBX_MIGRATE_CHANGESET_TRACE {
 					logExec3ChangesetTrace(logger, blockNum, b.Hash(), changeSet)
 				}
+				logExecutionLoopTrace(logger, "changeset_save_start", blockNum, executor.domains(),
+					"block_hash", b.Hash(),
+				)
 				executor.domains().SavePastChangesetAccumulator(b.Hash(), blockNum, changeSet)
 				if !inMemExec {
+					logExecutionLoopTrace(logger, "diffset_write_start", blockNum, executor.domains(),
+						"block_hash", b.Hash(),
+					)
+					diffsetWriteStart := time.Now()
 					if err := changeset2.WriteDiffSet(executor.tx(), blockNum, b.Hash(), changeSet); err != nil {
+						logExecutionLoopTrace(logger, "diffset_write_failed", blockNum, executor.domains(),
+							"elapsed", time.Since(diffsetWriteStart),
+							"block_hash", b.Hash(),
+							"err", err,
+						)
 						return err
 					}
+					logExecutionLoopTrace(logger, "diffset_write_done", blockNum, executor.domains(),
+						"elapsed", time.Since(diffsetWriteStart),
+						"block_hash", b.Hash(),
+					)
 				}
+				logExecutionLoopTrace(logger, "changeset_save_done", blockNum, executor.domains(),
+					"block_hash", b.Hash(),
+				)
 			}
 			executor.domains().SetChangesetAccumulator(nil)
 		}
@@ -1030,15 +1141,47 @@ Loop:
 
 				var (
 					commitStart = time.Now()
+					flushStart  = commitStart
 
 					pruneDuration time.Duration
 				)
+				logExecutionCommitmentFlush(logger, "starting", "periodic", blockNum, executor.domains(),
+					"stage_progress", stageProgress,
+					"input_block", inputBlockNum.Load(),
+					"output_block", outputBlockNum.GetValueUint64(),
+					"output_txnum", outputTxNum.Load(),
+					"batch_estimate", executor.readState().SizeEstimate(),
+					"batch_threshold", commitThreshold,
+					"is_batch_full", isBatchFull,
+					"can_prune", canPrune,
+					"skip_post_eval", skipPostEvaluation,
+					"changesets", shouldGenerateChangesets,
+					"initial_cycle", initialCycle,
+					"parallel", parallel,
+					"in_mem_exec", inMemExec,
+				)
 				ok, times, err := flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), executor.tx(), executor.domains(), cfg, execStage, stageProgress, parallel, logger, u, inMemExec)
 				if err != nil {
+					logExecutionCommitmentFlush(logger, "failed", "periodic", blockNum, executor.domains(),
+						"elapsed", time.Since(flushStart),
+						"flush", times.Flush,
+						"compute_commitment", times.ComputeCommitment,
+						"err", err,
+					)
 					return err
 				} else if !ok {
+					logExecutionCommitmentFlush(logger, "unwind_requested", "periodic", blockNum, executor.domains(),
+						"elapsed", time.Since(flushStart),
+						"flush", times.Flush,
+						"compute_commitment", times.ComputeCommitment,
+					)
 					break Loop
 				}
+				logExecutionCommitmentFlush(logger, "completed", "periodic", blockNum, executor.domains(),
+					"elapsed", time.Since(flushStart),
+					"flush", times.Flush,
+					"compute_commitment", times.ComputeCommitment,
+				)
 
 				computeCommitmentDuration += times.ComputeCommitment
 				flushDuration := times.Flush
@@ -1103,10 +1246,32 @@ Loop:
 
 	if u != nil && !u.HasUnwindPoint() {
 		if b != nil {
-			_, _, err = flushAndCheckCommitmentV3(ctx, b.HeaderNoCopy(), executor.tx(), executor.domains(), cfg, execStage, stageProgress, parallel, logger, u, inMemExec)
+			header := b.HeaderNoCopy()
+			flushStart := time.Now()
+			logExecutionCommitmentFlush(logger, "starting", "final", header.Number.Uint64(), executor.domains(),
+				"stage_progress", stageProgress,
+				"input_block", inputBlockNum.Load(),
+				"output_block", outputBlockNum.GetValueUint64(),
+				"output_txnum", outputTxNum.Load(),
+				"initial_cycle", initialCycle,
+				"parallel", parallel,
+				"in_mem_exec", inMemExec,
+			)
+			_, times, err := flushAndCheckCommitmentV3(ctx, header, executor.tx(), executor.domains(), cfg, execStage, stageProgress, parallel, logger, u, inMemExec)
 			if err != nil {
+				logExecutionCommitmentFlush(logger, "failed", "final", header.Number.Uint64(), executor.domains(),
+					"elapsed", time.Since(flushStart),
+					"flush", times.Flush,
+					"compute_commitment", times.ComputeCommitment,
+					"err", err,
+				)
 				return err
 			}
+			logExecutionCommitmentFlush(logger, "completed", "final", header.Number.Uint64(), executor.domains(),
+				"elapsed", time.Since(flushStart),
+				"flush", times.Flush,
+				"compute_commitment", times.ComputeCommitment,
+			)
 		} else {
 			fmt.Printf("[dbg] mmmm... do we need action here????\n")
 		}
@@ -1142,6 +1307,11 @@ Loop:
 }
 
 var exec3FixedSenderAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
+
+var (
+	exec3LoopTrace         = dbg.EnvBool("ERIGON_EXEC_LOOP_TRACE", false)
+	exec3LoopTraceMinBlock = dbg.EnvUint("ERIGON_EXEC_LOOP_TRACE_MIN_BLOCK", 0)
+)
 
 func decodeExec3AccountTraceValue(enc []byte) (*accounts.Account, error) {
 	if len(enc) == 0 {
@@ -1218,6 +1388,58 @@ func logExec3SenderFlushCheckpoint(logger log.Logger, label string, blockNum uin
 		}
 	}
 	logger.Warn("exec3: sender flush checkpoint", fields...)
+}
+
+func logExecutionCommitmentFlush(logger log.Logger, status string, reason string, blockNum uint64, doms *dbstate.SharedDomains, extra ...interface{}) {
+	fields := []interface{}{
+		"status", status,
+		"reason", reason,
+		"block", blockNum,
+	}
+	if doms != nil {
+		fields = append(fields,
+			"domains_block", doms.BlockNum(),
+			"domains_txnum", doms.TxNum(),
+		)
+	}
+	fields = append(fields, extra...)
+	logger.Warn("Execution commitment flush", fields...)
+}
+
+func logExecutionLoopTrace(logger log.Logger, phase string, blockNum uint64, doms *dbstate.SharedDomains, extra ...interface{}) {
+	if !exec3LoopTrace || blockNum < exec3LoopTraceMinBlock {
+		return
+	}
+	fields := []interface{}{
+		"phase", phase,
+		"block", blockNum,
+	}
+	if doms != nil {
+		fields = append(fields,
+			"domains_block", doms.BlockNum(),
+			"domains_txnum", doms.TxNum(),
+		)
+	}
+	fields = append(fields, extra...)
+	logger.Warn("Execution loop trace", fields...)
+}
+
+func logExecutionFlushTrace(logger log.Logger, phase string, blockNum uint64, doms *dbstate.SharedDomains, extra ...interface{}) {
+	if !exec3LoopTrace || blockNum < exec3LoopTraceMinBlock {
+		return
+	}
+	fields := []interface{}{
+		"phase", phase,
+		"block", blockNum,
+	}
+	if doms != nil {
+		fields = append(fields,
+			"domains_block", doms.BlockNum(),
+			"domains_txnum", doms.TxNum(),
+		)
+	}
+	fields = append(fields, extra...)
+	logger.Warn("Execution flush trace", fields...)
 }
 
 func logExec3ChangesetTrace(logger log.Logger, blockNum uint64, blockHash common.Hash, changeSet *changeset2.StateChangeSet) {
@@ -2741,12 +2963,26 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	// E2 state root check was in another stage - means we did flush state even if state root will not match
 	// And Unwind expecting it
 	if !parallel {
+		updateStart := time.Now()
+		logExecutionFlushTrace(logger, "stage_update_start", header.Number.Uint64(), doms,
+			"stage_progress", e.BlockNumber,
+			"target_block", maxBlockNum,
+		)
 		if err := e.Update(applyTx, maxBlockNum); err != nil {
 			return false, times, err
 		}
+		logExecutionFlushTrace(logger, "stage_update_done", header.Number.Uint64(), doms,
+			"elapsed", time.Since(updateStart),
+			"stage_progress", maxBlockNum,
+		)
+		stateVersionStart := time.Now()
+		logExecutionFlushTrace(logger, "state_version_start", header.Number.Uint64(), doms)
 		if _, err := rawdb.IncrementStateVersion(applyTx); err != nil {
 			return false, times, fmt.Errorf("writing plain state version: %w", err)
 		}
+		logExecutionFlushTrace(logger, "state_version_done", header.Number.Uint64(), doms,
+			"elapsed", time.Since(stateVersionStart),
+		)
 	}
 
 	if header == nil {
@@ -2773,11 +3009,19 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 
 	logCommitmentAnchorProbe("before_compute", header.Number.Uint64(), doms, applyTx, nil, logger)
 
+	computeStart := time.Now()
+	logExecutionFlushTrace(logger, "compute_commitment_start", header.Number.Uint64(), doms,
+		"log_prefix", e.LogPrefix(),
+	)
 	computedRootHash, err := doms.ComputeCommitment(ctx, true, header.Number.Uint64(), doms.TxNum(), e.LogPrefix())
-	times.ComputeCommitment = time.Since(start)
+	times.ComputeCommitment = time.Since(computeStart)
 	if err != nil {
 		return false, times, fmt.Errorf("ParallelExecutionState.Apply: %w", err)
 	}
+	logExecutionFlushTrace(logger, "compute_commitment_done", header.Number.Uint64(), doms,
+		"elapsed", times.ComputeCommitment,
+		"computed_root", common.BytesToHash(computedRootHash),
+	)
 	logCommitmentAnchorProbe("after_compute", header.Number.Uint64(), doms, applyTx, computedRootHash, logger)
 
 	if cfg.blockProduction {
@@ -2832,12 +3076,19 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 			)
 			if !inMemExec {
 				flushStart := time.Now()
+				logExecutionFlushTrace(logger, "domains_flush_start", header.Number.Uint64(), doms,
+					"reason", "fallback_resolved",
+				)
 				logExec3SenderFlushCheckpoint(logger, "pre-flush-fallback-resolved", header.Number.Uint64(), doms, applyTx)
 				if err := doms.Flush(ctx, applyTx); err != nil {
 					return false, times, err
 				}
 				logExec3SenderFlushCheckpoint(logger, "post-flush-fallback-resolved", header.Number.Uint64(), doms, applyTx)
 				times.Flush = time.Since(flushStart)
+				logExecutionFlushTrace(logger, "domains_flush_done", header.Number.Uint64(), doms,
+					"reason", "fallback_resolved",
+					"elapsed", times.Flush,
+				)
 			}
 			return true, times, nil
 		}
@@ -2865,12 +3116,19 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 		logger.Warn(fmt.Sprintf("[%s] Wrong trie root of block %d: %x, expected (from header): %x. Block hash: %x", e.LogPrefix(), header.Number.Uint64(), computedRootHash, header.Root.Bytes(), header.Hash()))
 		if ERIGON_MDBX_MIGRATE_FLUSH_ON_BAD_ROOT && !inMemExec {
 			flushStart := time.Now()
+			logExecutionFlushTrace(logger, "domains_flush_start", header.Number.Uint64(), doms,
+				"reason", "bad_root",
+			)
 			logExec3SenderFlushCheckpoint(logger, "pre-flush-bad-root", header.Number.Uint64(), doms, applyTx)
 			if err := doms.Flush(ctx, applyTx); err != nil {
 				return false, times, err
 			}
 			logExec3SenderFlushCheckpoint(logger, "post-flush-bad-root", header.Number.Uint64(), doms, applyTx)
 			times.Flush = time.Since(flushStart)
+			logExecutionFlushTrace(logger, "domains_flush_done", header.Number.Uint64(), doms,
+				"reason", "bad_root",
+				"elapsed", times.Flush,
+			)
 		}
 		logBadRootDetails(ctx, header, computedRootHash, applyTx, doms, touchedPlainKeys, cfg, e, maxBlockNum, logger)
 		ok, err = handleIncorrectRootHashError(header, applyTx.(kv.TemporalRwTx), cfg, e, maxBlockNum, logger, u)
@@ -2878,6 +3136,9 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 	}
 	if !inMemExec {
 		start = time.Now()
+		logExecutionFlushTrace(logger, "domains_flush_start", header.Number.Uint64(), doms,
+			"reason", "matched_root",
+		)
 		logExec3SenderFlushCheckpoint(logger, "pre-flush", header.Number.Uint64(), doms, applyTx)
 		err := doms.Flush(ctx, applyTx)
 		times.Flush = time.Since(start)
@@ -2885,6 +3146,10 @@ func flushAndCheckCommitmentV3(ctx context.Context, header *types.Header, applyT
 			return false, times, err
 		}
 		logExec3SenderFlushCheckpoint(logger, "post-flush", header.Number.Uint64(), doms, applyTx)
+		logExecutionFlushTrace(logger, "domains_flush_done", header.Number.Uint64(), doms,
+			"reason", "matched_root",
+			"elapsed", times.Flush,
+		)
 	}
 	return true, times, nil
 

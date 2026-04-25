@@ -573,6 +573,31 @@ func (sdc *SharedDomainsCommitmentContext) Reset() {
 		sdc.patriciaTrie.Reset()
 	}
 }
+
+func (sdc *SharedDomainsCommitmentContext) resetPatriciaTrieToEmpty() error {
+	var hext *commitment.HexPatriciaHashed
+	switch trie := sdc.patriciaTrie.(type) {
+	case *commitment.HexPatriciaHashed:
+		hext = trie
+	case *commitment.ConcurrentPatriciaHashed:
+		if err := trie.SetState(nil); err != nil {
+			return err
+		}
+		sdc.justRestored.Store(true)
+		return nil
+	default:
+		return fmt.Errorf("unsupported empty state reset for patricia trie type: %T", sdc.patriciaTrie)
+	}
+	if err := hext.SetState(nil); err != nil {
+		return err
+	}
+	// ComputeCommitment calls Reset() before Process. Keep the just-restored
+	// marker set so that Reset() does not convert the empty trie into a
+	// present-root trie backed by stale commitment branches.
+	sdc.justRestored.Store(true)
+	return nil
+}
+
 func (sdc *SharedDomainsCommitmentContext) ClearRam() {
 	sdc.updates.Reset()
 	sdc.Reset()
@@ -835,6 +860,22 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 		return rootHash, err
 	}
 
+	var retryUpdates *commitment.Updates
+	var retryState []byte
+	if sdc.mainTtx != nil {
+		// Process/HashSort consumes update iterators in direct mode. Keep a
+		// narrow retry copy for missing commitment branch rows during migration.
+		retryUpdates = sdc.updates.DebugSnapshot()
+		if retryUpdates != nil {
+			defer retryUpdates.Close()
+		}
+		if state, stateErr := sdc.encodeCommitmentState(blockNum, txNum); stateErr == nil {
+			retryState = state
+		} else if debugBadRootCommitmentProbe {
+			log.Warn("commitment compute retry state snapshot failed", "block", blockNum, "tx_num", txNum, "err", stateErr)
+		}
+	}
+
 	// data accessing functions should be set when domain is opened/shared context updated
 	sdc.patriciaTrie.SetTrace(sdc.trace)
 	sdc.Reset()
@@ -845,7 +886,48 @@ func (sdc *SharedDomainsCommitmentContext) ComputeCommitment(ctx context.Context
 	// and can pin the trie to stale restored state.
 	sdc.justRestored.Store(false)
 	if err != nil {
-		return nil, err
+		if sdc.mainTtx != nil && retryUpdates != nil && retryUpdates.Size() > 0 && strings.Contains(err.Error(), "empty branch data read during unfold") {
+			initialErr := err
+			if len(retryState) > 0 {
+				if _, _, restoreErr := sdc.restorePatriciaState(retryState); restoreErr != nil {
+					log.Warn("commitment compute retry state restore failed", "block", blockNum, "tx_num", txNum, "err", restoreErr)
+					sdc.justRestored.Store(false)
+					sdc.Reset()
+				}
+			} else {
+				sdc.Reset()
+			}
+
+			prevFallback := sdc.mainTtx.allowCommitmentLatestFallback
+			log.Warn("commitment compute retry with commitment latest fallback",
+				"block", blockNum,
+				"tx_num", txNum,
+				"log_prefix", logPrefix,
+				"updates", retryUpdates.Size(),
+				"initial_err", initialErr,
+			)
+			sdc.mainTtx.SetCommitmentLatestFallback(true)
+			rootHash, err = sdc.patriciaTrie.Process(ctx, retryUpdates, logPrefix+"/retry_latest_commitment")
+			sdc.justRestored.Store(false)
+			sdc.mainTtx.SetCommitmentLatestFallback(prevFallback)
+			if err == nil {
+				log.Warn("commitment compute retry with commitment latest fallback succeeded",
+					"block", blockNum,
+					"tx_num", txNum,
+					"root", common.BytesToHash(rootHash),
+				)
+			} else {
+				log.Warn("commitment compute retry with commitment latest fallback failed",
+					"block", blockNum,
+					"tx_num", txNum,
+					"initial_err", initialErr,
+					"retry_err", err,
+				)
+			}
+		}
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	if saveState {
@@ -1111,8 +1193,10 @@ func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ct
 	}
 
 	accLatestCount := 0
+	codeLatestCount := 0
 	storageLatestCount := 0
 	accHistoryCount := 0
+	codeHistoryCount := 0
 	storageHistoryCount := 0
 
 	latestAccIt, err := tx.Debug().RangeLatest(kv.AccountsDomain, nil, nil, -1)
@@ -1127,6 +1211,20 @@ func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ct
 		}
 		accLatestCount++
 		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
+	}
+
+	latestCodeIt, err := tx.Debug().RangeLatest(kv.CodeDomain, nil, nil, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer latestCodeIt.Close()
+	for latestCodeIt.HasNext() {
+		k, _, err := latestCodeIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		codeLatestCount++
+		sdc.TouchKey(kv.CodeDomain, string(k), nil)
 	}
 
 	latestStorageIt, err := tx.Debug().RangeLatest(kv.StorageDomain, nil, nil, -1)
@@ -1159,6 +1257,20 @@ func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ct
 		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
 	}
 
+	codeHistoryIt, err := tx.HistoryRange(kv.CodeDomain, int(txNum), -1, order.Asc, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer codeHistoryIt.Close()
+	for codeHistoryIt.HasNext() {
+		k, _, err := codeHistoryIt.Next()
+		if err != nil {
+			return nil, err
+		}
+		codeHistoryCount++
+		sdc.TouchKey(kv.CodeDomain, string(k), nil)
+	}
+
 	storageHistoryIt, err := tx.HistoryRange(kv.StorageDomain, int(txNum), -1, order.Asc, -1)
 	if err != nil {
 		return nil, err
@@ -1179,8 +1291,10 @@ func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ct
 			"block", blockNum,
 			"tx_num_arg", txNum,
 			"accounts_latest_count", accLatestCount,
+			"code_latest_count", codeLatestCount,
 			"storage_latest_count", storageLatestCount,
 			"accounts_history_count", accHistoryCount,
+			"code_history_count", codeHistoryCount,
 			"storage_history_count", storageHistoryCount,
 			"updates_count_after_touch", sdc.updates.Size(),
 			"updates_mode", sdc.updates.Mode(),
@@ -1191,8 +1305,9 @@ func (sdc *SharedDomainsCommitmentContext) RebuildCommitmentAsOfTxNumFullScan(ct
 	sdc.mainTtx.SetAllowHistoryBranchWrites(true)
 	defer sdc.mainTtx.SetAllowHistoryBranchWrites(prevAllowHistoryBranchWrites)
 
-	sdc.justRestored.Store(false)
-	sdc.Reset()
+	if err := sdc.resetPatriciaTrieToEmpty(); err != nil {
+		return nil, err
+	}
 	return sdc.ComputeCommitment(ctx, true, blockNum, txNum, "rebuild commit fullscan")
 }
 
@@ -1464,7 +1579,20 @@ func (sdc *SharedDomainsCommitmentContext) restorePatriciaState(value []byte) (u
 	}
 
 	if err := hext.SetState(cs.trieState); err != nil {
-		return 0, 0, fmt.Errorf("failed restore state : %w", err)
+		if strings.Contains(err.Error(), "target trie has active rows") {
+			log.Warn("commitment restore clearing dirty active trie rows", "err", err)
+			if resetErr := hext.SetState(nil); resetErr != nil {
+				return 0, 0, fmt.Errorf("failed reset dirty trie before restore: %w", resetErr)
+			}
+			if retryErr := hext.SetState(cs.trieState); retryErr == nil {
+				err = nil
+			} else {
+				err = retryErr
+			}
+		}
+		if err != nil {
+			return 0, 0, fmt.Errorf("failed restore state : %w", err)
+		}
 	}
 	sdc.justRestored.Store(true) // to prevent double reset
 	if sdc.trace {
@@ -1481,6 +1609,7 @@ func (sdc *SharedDomainsCommitmentContext) restorePatriciaState(value []byte) (u
 // To rebuild commitment correctly for any state size - use RebuildCommitmentFiles.
 func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context, roTx kv.TemporalTx, blockNum, txNum uint64) ([]byte, error) {
 	accHistoryCount := 0
+	codeHistoryCount := 0
 	storageHistoryCount := 0
 	it, err := roTx.HistoryRange(kv.AccountsDomain, int(txNum), -1, order.Asc, -1)
 	if err != nil {
@@ -1494,6 +1623,20 @@ func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context
 		}
 		accHistoryCount++
 		sdc.TouchKey(kv.AccountsDomain, string(k), nil)
+	}
+
+	it, err = roTx.HistoryRange(kv.CodeDomain, int(txNum), -1, order.Asc, -1)
+	if err != nil {
+		return nil, err
+	}
+	defer it.Close()
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, err
+		}
+		codeHistoryCount++
+		sdc.TouchKey(kv.CodeDomain, string(k), nil)
 	}
 
 	it, err = roTx.HistoryRange(kv.StorageDomain, int(txNum), -1, order.Asc, -1)
@@ -1517,6 +1660,7 @@ func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context
 			"block", blockNum,
 			"tx_num_arg", txNum,
 			"accounts_history_count", accHistoryCount,
+			"code_history_count", codeHistoryCount,
 			"storage_history_count", storageHistoryCount,
 			"updates_count_after_touch", sdc.updates.Size(),
 			"updates_mode", sdc.updates.Mode(),
@@ -1529,8 +1673,9 @@ func (sdc *SharedDomainsCommitmentContext) rebuildCommitment(ctx context.Context
 
 	// Rebuild must start from a clean trie even if a previous restore/process
 	// sequence failed and left justRestored=true.
-	sdc.justRestored.Store(false)
-	sdc.Reset()
+	if err := sdc.resetPatriciaTrieToEmpty(); err != nil {
+		return nil, err
+	}
 	return sdc.ComputeCommitment(ctx, true, blockNum, txNum, "rebuild commit")
 }
 

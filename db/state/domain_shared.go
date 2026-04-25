@@ -31,10 +31,10 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon/db/kv"
 	"github.com/erigontech/erigon/db/state/changeset"
-	"github.com/erigontech/erigon/execution/types/accounts"
 	"github.com/erigontech/erigon/db/state/statecfg"
 	"github.com/erigontech/erigon/execution/commitment"
 	"github.com/erigontech/erigon/execution/commitment/commitmentdb"
+	"github.com/erigontech/erigon/execution/types/accounts"
 )
 
 // KvList sort.Interface to sort write list by keys
@@ -79,6 +79,7 @@ type SharedDomains struct {
 var sweepAccountTombstonesInit = dbg.EnvBool("ERIGON_MDBX_MIGRATE_SWEEP_TOMBSTONES_INIT", false)
 var badRootWriteTrace = dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
 var badRootTraceGetLatest = dbg.EnvBool("ERIGON_BAD_ROOT_TRACE_GET_LATEST", false)
+
 // ERIGON_COMMITMENT_MODE_UPDATE forces commitment tracking to carry update payloads
 // instead of direct key-only touches. Useful for diagnosing/avoiding divergence
 // when direct-mode value resolution differs between builder and replay contexts.
@@ -487,8 +488,10 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 			return err
 		}
 	}
-	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
-	if domain == kv.AccountsDomain && bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
+	// Record the immediate previous value for this tx. Using the first value
+	// seen in the in-memory batch makes per-block diffsets restore stale state
+	// after a migration unwind when the same account is updated in many blocks.
+	if badRootWriteTrace && domain == kv.AccountsDomain && bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
 		fields := []interface{}{
 			"block_num", sd.blockNum.Load(),
 			"tx_num", txNum,
@@ -584,7 +587,7 @@ func (sd *SharedDomains) DomainPut(domain kv.Domain, roTx kv.TemporalTx, k, v []
 			return nil
 		}
 	}
-	return sd.mem.DomainPut(domain, ks, v, txNum, orig.data, orig.prevStep)
+	return sd.mem.DomainPut(domain, ks, v, txNum, curVal, curStep)
 }
 
 // DomainDel
@@ -628,8 +631,8 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 		}
 
 		sd.sdCtx.TouchKey(domain, ks, nil)
-		orig, _ := sd.origPrev(domain, ks, curVal, curStep)
-		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, orig.data, orig.prevStep)
+		// Record the immediate previous value for this tx; see DomainPut.
+		return sd.mem.DomainDel(kv.AccountsDomain, ks, txNum, curVal, curStep)
 	case kv.CodeDomain:
 		if len(curVal) == 0 {
 			return nil
@@ -641,8 +644,8 @@ func (sd *SharedDomains) DomainDel(domain kv.Domain, tx kv.TemporalTx, k []byte,
 		}
 		sd.sdCtx.TouchKey(domain, ks, nil)
 	}
-	orig, _ := sd.origPrev(domain, ks, curVal, curStep)
-	return sd.mem.DomainDel(domain, ks, txNum, orig.data, orig.prevStep)
+	// Record the immediate previous value for this tx; see DomainPut.
+	return sd.mem.DomainDel(domain, ks, txNum, curVal, curStep)
 }
 
 func (sd *SharedDomains) DomainDelPrefix(domain kv.Domain, roTx kv.TemporalTx, prefix []byte, txNum uint64) error {

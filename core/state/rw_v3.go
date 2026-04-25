@@ -33,7 +33,6 @@ import (
 	"github.com/erigontech/erigon-lib/log/v3"
 	"github.com/erigontech/erigon-lib/metrics"
 	"github.com/erigontech/erigon/db/kv"
-	"github.com/erigontech/erigon/db/kv/order"
 	"github.com/erigontech/erigon/db/rawdb"
 	dbstate "github.com/erigontech/erigon/db/state"
 	"github.com/erigontech/erigon/eth/ethconfig"
@@ -105,7 +104,6 @@ var arbosKeepEmptyAccounts = map[common.Address]struct{}{
 	common.HexToAddress("0x8807ed26dbaae86b62d0b663d754ce66f9d373b8"): {},
 	common.HexToAddress("0x571fb9e1003ebe9c99ad3c1a60797e19cb577e93"): {},
 	common.HexToAddress("0xA4b000000000000000000073657175656e636572"): {},
-	common.HexToAddress("0xA4b00000000000000000000000000000000000F6"): {},
 	common.HexToAddress("0xA4b05FffffFffFFFFfFFfffFfffFFfffFfFfFFFf"): {},
 }
 
@@ -244,35 +242,6 @@ func computeStorageRootFromLatest(domains *dbstate.SharedDomains, tx kv.Tx, addr
 	prefix := addr.Bytes()
 	tr := etrie.New(common.Hash{})
 	items := 0
-	if ttx, ok := tx.(kv.TemporalTx); ok {
-		to, ok := kv.NextSubtree(prefix)
-		if !ok {
-			return common.Hash{}, 0, nil
-		}
-		asOfTxNum := domains.TxNum() + 1
-		it, err := ttx.RangeAsOf(kv.StorageDomain, prefix, to, asOfTxNum, order.Asc, kv.Unlim)
-		if err != nil {
-			return common.Hash{}, items, err
-		}
-		defer it.Close()
-		for it.HasNext() {
-			k, v, err := it.Next()
-			if err != nil {
-				return common.Hash{}, items, err
-			}
-			if len(v) == 0 {
-				continue
-			}
-			if len(k) < length.Addr {
-				return common.Hash{}, items, fmt.Errorf("short storage key: %d bytes", len(k))
-			}
-			slot := k[length.Addr:]
-			slotHash, _ := common.HashData(slot)
-			tr.Update(slotHash.Bytes(), common.Copy(v))
-			items++
-		}
-		return tr.Hash(), items, nil
-	}
 	err := domains.IteratePrefix(kv.StorageDomain, prefix, tx, func(k []byte, v []byte, step kv.Step) (bool, error) {
 		if len(v) == 0 {
 			return true, nil
@@ -622,6 +591,17 @@ func hexPreviewBytes(raw []byte, max int) string {
 		return fmt.Sprintf("%x", raw)
 	}
 	return fmt.Sprintf("%x...len=%d", raw[:max], len(raw))
+}
+
+func codeHashForLog(code []byte) string {
+	if len(code) == 0 {
+		return ""
+	}
+	hash, err := common.HashData(code)
+	if err != nil {
+		return "error:" + err.Error()
+	}
+	return hash.Hex()
 }
 
 func logFixedSenderAccountCompare(site string, domains *dbstate.SharedDomains, tx kv.TemporalTx, txTask *TxTask, addr common.Address) {
@@ -1158,6 +1138,37 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 									)
 								}
 							}
+							if domain == kv.CodeDomain && len(keyBytes) == length.Addr {
+								addr := common.BytesToAddress(keyBytes)
+								if shouldTraceApplyAccount(addr) {
+									op := "put"
+									if list.Vals[i] == nil {
+										op = "del"
+									}
+									var codeHash common.Hash
+									var hashErr error
+									if len(list.Vals[i]) > 0 {
+										codeHash, hashErr = common.HashData(list.Vals[i])
+									}
+									prevVal, prevStep, prevErr := domains.GetLatest(kv.CodeDomain, rs.tx, keyBytes)
+									log.Warn("state apply code write-list op",
+										"block", txTask.BlockNum,
+										"tx_index", txTask.TxIndex,
+										"tx_num", txTask.TxNum,
+										"domain", domain.String(),
+										"op", op,
+										"addr", addr.Hex(),
+										"prev_step", prevStep,
+										"prev_len", len(prevVal),
+										"prev_hash", codeHashForLog(prevVal),
+										"prev_err", prevErr,
+										"val_len", len(list.Vals[i]),
+										"val_hash", codeHash.Hex(),
+										"val_hash_err", hashErr,
+										"val_preview", hexPreviewBytes(list.Vals[i], 32),
+									)
+								}
+							}
 						}
 					}
 				}
@@ -1315,6 +1326,32 @@ func (rs *ParallelExecutionState) applyState(txTask *TxTask, domains *dbstate.Sh
 				} else {
 					if err := domains.DomainPut(domain, rs.tx, keyBytes, list.Vals[i], txTask.TxNum, nil, 0); err != nil {
 						return err
+					}
+					if traceApply && domain == kv.CodeDomain && len(keyBytes) == length.Addr {
+						addr := common.BytesToAddress(keyBytes)
+						if shouldTraceApplyAccount(addr) {
+							domsVal, domsStep, domsErr := domains.GetLatest(kv.CodeDomain, rs.tx, keyBytes)
+							txVal, txStep, txErr := rs.tx.GetLatest(kv.CodeDomain, keyBytes)
+							log.Warn("state apply code post-put check",
+								"block", txTask.BlockNum,
+								"tx_index", txTask.TxIndex,
+								"tx_num", txTask.TxNum,
+								"domain", domain.String(),
+								"addr", addr.Hex(),
+								"write_len", len(list.Vals[i]),
+								"write_hash", codeHashForLog(list.Vals[i]),
+								"doms_len", len(domsVal),
+								"doms_step", domsStep,
+								"doms_hash", codeHashForLog(domsVal),
+								"doms_err", domsErr,
+								"doms_matches_write", domsErr == nil && bytes.Equal(domsVal, list.Vals[i]),
+								"tx_len", len(txVal),
+								"tx_step", txStep,
+								"tx_hash", codeHashForLog(txVal),
+								"tx_err", txErr,
+								"tx_matches_write", txErr == nil && bytes.Equal(txVal, list.Vals[i]),
+							)
+						}
 					}
 					if traceApply && domain == kv.StorageDomain && len(keyBytes) >= length.Addr+length.Hash {
 						addr := common.BytesToAddress(keyBytes[:length.Addr])

@@ -301,5 +301,6 @@ type Sync struct {
 	MaxReorgDepth            uint64
 	KeepExecutionProofs      bool
 	PersistReceiptsCacheV2   bool
+	DisableTxNumSkip         bool
 	SnapshotDownloadToBlock  uint64 // exclusive [0,toBlock)
 }

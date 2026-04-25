@@ -61,6 +61,7 @@ type TemporalMemBatch struct {
 
 var fixedSenderDiffTraceAddrBytes = common.HexToAddress("0x28c18bc63069e3581870904f32Dd34D9e3332cce").Bytes()
 var traceDiffsetSource = dbg.EnvBool("ERIGON_MDBX_MIGRATE_DIFFSET_TRACE", false) || dbg.EnvBool("ERIGON_BAD_ROOT_DEBUG", false)
+var traceTemporalFlush = dbg.EnvBool("ERIGON_TEMPORAL_FLUSH_TRACE", false) || dbg.EnvBool("ERIGON_EXEC_LOOP_TRACE", false)
 
 func newTemporalMemBatch(tx kv.TemporalTx) *TemporalMemBatch {
 	sd := &TemporalMemBatch{
@@ -246,17 +247,6 @@ func (sd *TemporalMemBatch) GetDiffset(tx kv.RwTx, blockHash common.Hash, blockN
 				"accounts_len", len(synthesized),
 			)
 		}
-	} else if err == nil && ok && len(diffs[kv.AccountsDomain]) > 0 {
-		if rewritten, changed, rewriteErr := rewriteAccountDiffsetFromHistory(tx, blockNumber, diffs[kv.AccountsDomain]); rewriteErr != nil {
-			log.Warn("state diffset history rewrite failed", "block", blockNumber, "block_hash", blockHash, "err", rewriteErr)
-		} else if changed {
-			diffs[kv.AccountsDomain] = rewritten
-			log.Warn("state diffset history rewrite",
-				"block", blockNumber,
-				"block_hash", blockHash,
-				"accounts_len", len(rewritten),
-			)
-		}
 	}
 	if err == nil && ok && len(diffs[kv.StorageDomain]) == 0 {
 		if synthesized, synthOK, synthErr := synthesizeStorageDiffsetFromHistory(tx, blockNumber); synthErr != nil {
@@ -269,15 +259,16 @@ func (sd *TemporalMemBatch) GetDiffset(tx kv.RwTx, blockHash common.Hash, blockN
 				"storage_len", len(synthesized),
 			)
 		}
-	} else if err == nil && ok && len(diffs[kv.StorageDomain]) > 0 {
-		if rewritten, changed, rewriteErr := rewriteStorageDiffsetFromHistory(tx, blockNumber, diffs[kv.StorageDomain]); rewriteErr != nil {
-			log.Warn("state storage diffset history rewrite failed", "block", blockNumber, "block_hash", blockHash, "err", rewriteErr)
-		} else if changed {
-			diffs[kv.StorageDomain] = rewritten
-			log.Warn("state storage diffset history rewrite",
+	}
+	if err == nil && ok && len(diffs[kv.CodeDomain]) == 0 {
+		if synthesized, synthOK, synthErr := synthesizeCodeDiffsetFromHistory(tx, blockNumber); synthErr != nil {
+			log.Warn("state code diffset history fallback failed", "block", blockNumber, "block_hash", blockHash, "err", synthErr)
+		} else if synthOK && len(synthesized) > 0 {
+			diffs[kv.CodeDomain] = synthesized
+			log.Warn("state code diffset history fallback",
 				"block", blockNumber,
 				"block_hash", blockHash,
-				"storage_len", len(rewritten),
+				"code_len", len(synthesized),
 			)
 		}
 	}
@@ -317,9 +308,12 @@ func synthesizeAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.D
 		if err != nil {
 			return nil, false, err
 		}
-		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
 		if err != nil {
 			return nil, false, err
+		}
+		if !restoreOK {
+			continue
 		}
 		if bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
 			log.Warn("state account history restore probe",
@@ -393,7 +387,7 @@ func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 		if len(logicalKey) == 0 || !bytes.Equal(logicalKey, fixedSenderDiffTraceAddrBytes) {
 			continue
 		}
-		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, logicalKey, startTxNum)
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.AccountsDomain, logicalKey, startTxNum)
 		if err != nil {
 			return nil, false, err
 		}
@@ -410,6 +404,7 @@ func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 			"existing_preview", badRootValuePreview(existing[i].Value),
 			"restore_len", len(restoreVal),
 			"restore_preview", badRootValuePreview(restoreVal),
+			"restore_ok", restoreOK,
 			"asof_ok", asOfOK,
 			"asof_preview", badRootValuePreview(asOfVal),
 			"asof_err", errString(asOfErr),
@@ -434,9 +429,12 @@ func rewriteAccountDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 		if err != nil {
 			return nil, false, err
 		}
-		restoreVal, _, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.AccountsDomain, k, startTxNum)
 		if err != nil {
 			return nil, false, err
+		}
+		if !restoreOK {
+			continue
 		}
 		if bytes.Equal(k, fixedSenderDiffTraceAddrBytes) {
 			log.Warn("state account history restore probe",
@@ -507,9 +505,12 @@ func synthesizeStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.D
 		if err != nil {
 			return nil, false, err
 		}
-		restoreVal, _, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
 		if err != nil {
 			return nil, false, err
+		}
+		if !restoreOK {
+			continue
 		}
 		step := kv.Step(0)
 		if _, latestStep, latestErr := ttx.GetLatest(kv.StorageDomain, k); latestErr == nil {
@@ -567,9 +568,12 @@ func rewriteStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 		if err != nil {
 			return nil, false, err
 		}
-		restoreVal, _, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.StorageDomain, k, startTxNum)
 		if err != nil {
 			return nil, false, err
+		}
+		if !restoreOK {
+			continue
 		}
 		step := kv.Step(0)
 		if _, latestStep, latestErr := ttx.GetLatest(kv.StorageDomain, k); latestErr == nil {
@@ -597,6 +601,59 @@ func rewriteStorageDiffsetFromHistory(tx kv.RwTx, blockNumber uint64, existing [
 		return out[i].Key < out[j].Key
 	})
 	return out, true, nil
+}
+
+func synthesizeCodeDiffsetFromHistory(tx kv.RwTx, blockNumber uint64) ([]kv.DomainEntryDiff, bool, error) {
+	ttx, ok := tx.(kv.TemporalTx)
+	if !ok {
+		return nil, false, nil
+	}
+	startTxNum, err := rawdbv3.TxNums.Min(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	endTxNum, err := rawdbv3.TxNums.Max(tx, blockNumber)
+	if err != nil {
+		return nil, false, err
+	}
+	if endTxNum == 0 && blockNumber != 0 {
+		return nil, false, nil
+	}
+	it, err := ttx.HistoryRange(kv.CodeDomain, int(startTxNum), int(endTxNum+1), order.Asc, kv.Unlim)
+	if err != nil {
+		return nil, false, err
+	}
+	defer it.Close()
+
+	diffs := make([]kv.DomainEntryDiff, 0, 8)
+	prevStepBytes := make([]byte, 8)
+	currentStepBytes := make([]byte, 8)
+	for it.HasNext() {
+		k, _, err := it.Next()
+		if err != nil {
+			return nil, false, err
+		}
+		restoreVal, restoreOK, err := ttx.HistorySeek(kv.CodeDomain, k, startTxNum)
+		if err != nil {
+			return nil, false, err
+		}
+		if !restoreOK {
+			continue
+		}
+		step := kv.Step(0)
+		if _, latestStep, latestErr := ttx.GetLatest(kv.CodeDomain, k); latestErr == nil {
+			step = latestStep
+		}
+		binary.BigEndian.PutUint64(prevStepBytes, ^uint64(step))
+		binary.BigEndian.PutUint64(currentStepBytes, ^uint64(step))
+		valsKey := append(append(make([]byte, 0, len(k)+8), k...), currentStepBytes...)
+		diffs = append(diffs, kv.DomainEntryDiff{
+			Key:           toStringZeroCopy(valsKey),
+			Value:         common.Copy(restoreVal),
+			PrevStepBytes: common.Copy(prevStepBytes),
+		})
+	}
+	return diffs, len(diffs) > 0, nil
 }
 
 func logDiffsetSource(source string, blockNumber uint64, blockHash common.Hash, diffs [kv.DomainLen][]kv.DomainEntryDiff) {
@@ -698,6 +755,10 @@ func (sd *TemporalMemBatch) Close() {
 }
 func (sd *TemporalMemBatch) Flush(ctx context.Context, tx kv.RwTx) error {
 	defer mxFlushTook.ObserveDuration(time.Now())
+	start := time.Now()
+	if traceTemporalFlush {
+		log.Warn("temporal flush trace", "phase", "flush_start", "diffsets", len(sd.pastChangesAccumulator))
+	}
 	if err := sd.flushDiffSet(ctx, tx); err != nil {
 		return err
 	}
@@ -705,16 +766,34 @@ func (sd *TemporalMemBatch) Flush(ctx context.Context, tx kv.RwTx) error {
 	if err := sd.flushWriters(ctx, tx); err != nil {
 		return err
 	}
+	if traceTemporalFlush {
+		log.Warn("temporal flush trace", "phase", "flush_done", "elapsed", time.Since(start))
+	}
 	return nil
 }
 
 func (sd *TemporalMemBatch) flushDiffSet(ctx context.Context, tx kv.RwTx) error {
+	start := time.Now()
+	if traceTemporalFlush {
+		log.Warn("temporal flush trace", "phase", "diffset_start", "diffsets", len(sd.pastChangesAccumulator))
+	}
+	written := 0
 	for key, changeSet := range sd.pastChangesAccumulator {
+		if len(key) < 40 {
+			return fmt.Errorf("unexpected diffset key len %d", len(key))
+		}
 		blockNum := binary.BigEndian.Uint64(toBytesZeroCopy(key[:8]))
 		blockHash := common.BytesToHash(toBytesZeroCopy(key[8:]))
+		if traceTemporalFlush && (written == 0 || written%1000 == 0) {
+			log.Warn("temporal flush trace", "phase", "diffset_write", "written", written, "diffset_block", blockNum, "diffset_hash", blockHash)
+		}
 		if err := changeset.WriteDiffSet(tx, blockNum, blockHash, changeSet); err != nil {
 			return err
 		}
+		written++
+	}
+	if traceTemporalFlush {
+		log.Warn("temporal flush trace", "phase", "diffset_done", "written", written, "elapsed", time.Since(start))
 	}
 	return nil
 }
@@ -724,6 +803,10 @@ func (sd *TemporalMemBatch) flushWriters(ctx context.Context, tx kv.RwTx) error 
 	for di, w := range sd.domainWriters {
 		if w == nil {
 			continue
+		}
+		start := time.Now()
+		if traceTemporalFlush {
+			log.Warn("temporal flush trace", "phase", "domain_writer_start", "domain", kv.Domain(di).String())
 		}
 		if kv.Domain(di) == kv.AccountsDomain {
 			log.Info("escrow trace mem_flush",
@@ -737,15 +820,25 @@ func (sd *TemporalMemBatch) flushWriters(ctx context.Context, tx kv.RwTx) error 
 		if err := w.Flush(ctx, tx); err != nil {
 			return err
 		}
+		if traceTemporalFlush {
+			log.Warn("temporal flush trace", "phase", "domain_writer_done", "domain", kv.Domain(di).String(), "elapsed", time.Since(start))
+		}
 		aggTx.d[di].closeValsCursor() //TODO: why?
 		w.Close()
 	}
-	for _, w := range sd.iiWriters {
+	for ii, w := range sd.iiWriters {
 		if w == nil {
 			continue
 		}
+		start := time.Now()
+		if traceTemporalFlush {
+			log.Warn("temporal flush trace", "phase", "ii_writer_start", "index", ii, "name", w.name, "filename", w.filenameBase)
+		}
 		if err := w.Flush(ctx, tx); err != nil {
 			return err
+		}
+		if traceTemporalFlush {
+			log.Warn("temporal flush trace", "phase", "ii_writer_done", "index", ii, "name", w.name, "filename", w.filenameBase, "elapsed", time.Since(start))
 		}
 		w.close()
 	}

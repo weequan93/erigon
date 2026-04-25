@@ -778,6 +778,9 @@ func (rw *Worker) RunTxTaskNoLock(txTask *state.TxTask, isMining, skipPostEvalua
 			txTask.TraceTos = rw.callTracer.Tos()
 
 			txTask.CreateReceipt(rw.Tx())
+			if txTask.TxIndex >= 0 && txTask.TxIndex < len(txTask.BlockReceipts) && txTask.BlockReceipts[txTask.TxIndex] != nil {
+				rw.evm.ProcessingHook.FillReceiptInfo(txTask.BlockReceipts[txTask.TxIndex])
+			}
 			logRuntimePathProbe(rw.logger, "after-receipt", txTask, rw.stateReader, ibs, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 			logRuntimeTxBoundary(rw.logger, "after-receipt", txTask, rw.stateReader, rw.historyMode, runtimeDomainsTxNum(rw.rs))
 			if hooks != nil && hooks.OnTxEnd != nil {
@@ -932,6 +935,9 @@ func (rw *Worker) execAATxn(txTask *state.TxTask) {
 	txTask.TraceFroms = rw.callTracer.Froms()
 	txTask.TraceTos = rw.callTracer.Tos()
 	txTask.CreateReceipt(rw.Tx())
+	if txTask.TxIndex >= 0 && txTask.TxIndex < len(txTask.BlockReceipts) && txTask.BlockReceipts[txTask.TxIndex] != nil {
+		rw.evm.ProcessingHook.FillReceiptInfo(txTask.BlockReceipts[txTask.TxIndex])
+	}
 
 	log.Info("🚀[aa] executed AA bundle transaction", "txIndex", txTask.TxIndex, "status", status, "gasUsed", gasUsed)
 }

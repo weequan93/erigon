@@ -267,8 +267,13 @@ func unwindExec3(u *UnwindState, s *StageState, txc wrap.TxContainer, ctx contex
 
 	txNumsReader := br.TxnumReader(ctx)
 
-	// unwind all txs of u.UnwindPoint block. 1 txn in begin/end of block - system txs
+	// Unwind state to u.UnwindPoint post-state. restoreTxNum maps the max
+	// txnum of a block to the next block, so a bad-root unwind to N resumes at
+	// N+1 while an invalid-block unwind to N-1 retries N.
 	txNum, err := txNumsReader.Min(tx, u.UnwindPoint+1)
+	if cfg.syncCfg.DisableTxNumSkip && u.UnwindPoint > 0 {
+		txNum, err = txNumsReader.Max(tx, u.UnwindPoint)
+	}
 	if err != nil {
 		return err
 	}
@@ -299,7 +304,7 @@ func unwindExec3(u *UnwindState, s *StageState, txc wrap.TxContainer, ctx contex
 			}
 		}
 	}
-	if err := unwindExec3State(ctx, tx, domains, u.UnwindPoint, txNum, accumulator, changeSet, logger); err != nil {
+	if err := unwindExec3State(ctx, tx, domains, u.UnwindPoint, txNum, accumulator, changeSet, logger, cfg.syncCfg.DisableTxNumSkip); err != nil {
 		return fmt.Errorf("ParallelExecutionState.Unwind(%d->%d): %w, took %s", s.BlockNumber, u.UnwindPoint, err, time.Since(t))
 	}
 	if err := rawdb.DeleteNewerEpochs(tx, u.UnwindPoint+1); err != nil {
@@ -313,7 +318,7 @@ var mxState3Unwind = metrics.GetOrCreateSummary("state3_unwind")
 func unwindExec3State(ctx context.Context, tx kv.TemporalRwTx, sd *state.SharedDomains,
 	blockUnwindTo, txUnwindTo uint64,
 	accumulator *shards.Accumulator,
-	changeset *[kv.DomainLen][]kv.DomainEntryDiff, logger log.Logger) error {
+	changeset *[kv.DomainLen][]kv.DomainEntryDiff, logger log.Logger, rebuildCommitmentCheckpoint bool) error {
 	st := time.Now()
 	defer mxState3Unwind.ObserveDuration(st)
 	var currentInc uint64
@@ -464,6 +469,29 @@ func unwindExec3State(ctx context.Context, tx kv.TemporalRwTx, sd *state.SharedD
 	}
 	if err := tx.Unwind(ctx, txUnwindTo, changeset); err != nil {
 		return err
+	}
+	if rebuildCommitmentCheckpoint {
+		// tx.Unwind prunes temporal state/history after the value restore above.
+		// In migration recovery we also need a fresh commitment checkpoint at the
+		// unwind target; otherwise SeekCommitment can reopen at a stale txnum and
+		// replay the target block against its own post-state. Rebuild from the
+		// as-of domain state; a direct ComputeCommitment with no touched keys
+		// would only persist the currently loaded trie root.
+		sd.ClearRam(true)
+		sd.SetTxNum(txUnwindTo)
+		sd.SetBlockNum(blockUnwindTo)
+		root, err := sd.GetCommitmentContext().RebuildCommitmentAsOfTxNumFullScan(ctx, tx, blockUnwindTo, txUnwindTo)
+		if err != nil {
+			return fmt.Errorf("rebuild unwind commitment checkpoint block=%d txnum=%d: %w", blockUnwindTo, txUnwindTo, err)
+		}
+		logger.Warn("state3 unwind commitment checkpoint",
+			"target_txnum", txUnwindTo,
+			"target_block", blockUnwindTo,
+			"root", common.BytesToHash(root),
+		)
+		if err := sd.Flush(ctx, tx); err != nil {
+			return err
+		}
 	}
 	return nil
 }

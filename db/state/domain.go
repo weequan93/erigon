@@ -52,11 +52,11 @@ import (
 )
 
 var (
-	asserts          = dbg.EnvBool("AGG_ASSERTS", false)
-	traceFileLife    = dbg.EnvString("AGG_TRACE_FILE_LIFE", "")
-	traceGetAsOf     = dbg.EnvString("AGG_TRACE_GET_AS_OF", "")
-	tracePutWithPrev = dbg.EnvString("AGG_TRACE_PUT_WITH_PREV", "")
-	traceUnwindAddr  = common.HexToAddress(dbg.EnvString("ERIGON_UNWIND_TRACE_ADDR", ""))
+	asserts            = dbg.EnvBool("AGG_ASSERTS", false)
+	traceFileLife      = dbg.EnvString("AGG_TRACE_FILE_LIFE", "")
+	traceGetAsOf       = dbg.EnvString("AGG_TRACE_GET_AS_OF", "")
+	tracePutWithPrev   = dbg.EnvString("AGG_TRACE_PUT_WITH_PREV", "")
+	traceUnwindAddr    = common.HexToAddress(dbg.EnvString("ERIGON_UNWIND_TRACE_ADDR", ""))
 	traceUnwindSlotRaw = dbg.EnvString("ERIGON_UNWIND_TRACE_SLOT", "")
 	traceUnwindSlot    = common.HexToHash(traceUnwindSlotRaw)
 )
@@ -455,12 +455,12 @@ type DomainBufferedWriter struct {
 	valsTable string
 	largeVals bool
 
-	stepBytes [8]byte // current inverted step representation
+	stepBytes  [8]byte // current inverted step representation
 	txNumBytes [8]byte // tx number representation for stable ordering within a step
-	aux       []byte  // auxilary buffer for key1 + key2
-	aux2      []byte  // auxilary buffer for step + val
-	aux3      []byte  // auxilary buffer for on-disk step + val (txNum stripped)
-	diff      *kv.DomainDiff
+	aux        []byte  // auxilary buffer for key1 + key2
+	aux2       []byte  // auxilary buffer for step + val
+	aux3       []byte  // auxilary buffer for on-disk step + val (txNum stripped)
+	diff       *kv.DomainDiff
 
 	h *historyBufferedWriter
 }
@@ -497,6 +497,7 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 	if w.discard {
 		return nil
 	}
+	domainName := w.h.ii.filenameBase
 	if w.h.ii.filenameBase == kv.AccountsDomain.String() {
 		log.Info("escrow trace flush_start",
 			"domain", w.h.ii.filenameBase,
@@ -507,14 +508,30 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 			"vals_table", w.valsTable,
 		)
 	}
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "history_flush_start", "domain", domainName, "large_vals", w.largeVals, "vals_table", w.valsTable)
+	}
+	historyStart := time.Now()
 	if err := w.h.Flush(ctx, tx); err != nil {
 		return err
+	}
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "history_flush_done", "domain", domainName, "elapsed", time.Since(historyStart))
 	}
 
 	if w.largeVals {
 		// For large values, order by txNum within the same step by prefixing txNum in the collector,
 		// then strip it before writing to the table.
+		loadStart := time.Now()
+		loadCount := 0
+		if traceTemporalFlush {
+			log.Warn("domain flush trace", "phase", "values_load_start", "domain", domainName, "large_vals", true, "vals_table", w.valsTable)
+		}
 		if err := w.values.Load(tx, w.valsTable, func(k, v []byte, _ etl.CurrentTableReader, next etl.LoadNextFunc) error {
+			loadCount++
+			if traceTemporalFlush && (loadCount <= 5 || loadCount%1000 == 0) {
+				log.Warn("domain flush trace", "phase", "values_load_progress", "domain", domainName, "large_vals", true, "count", loadCount, "key_len", len(k), "val_len", len(v))
+			}
 			// v = txNum(8) + value
 			if len(v) < 8 {
 				return next(k, k, v)
@@ -524,16 +541,35 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 		}, etl.TransformArgs{Quit: ctx.Done(), EmptyVals: true}); err != nil {
 			return err
 		}
+		if traceTemporalFlush {
+			log.Warn("domain flush trace", "phase", "values_load_done", "domain", domainName, "large_vals", true, "count", loadCount, "elapsed", time.Since(loadStart))
+		}
 		w.Close()
 		return nil
 	}
 
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "cursor_open_start", "domain", domainName, "vals_table", w.valsTable)
+	}
 	valuesCursor, err := tx.RwCursorDupSort(w.valsTable)
 	if err != nil {
 		return err
 	}
 	defer valuesCursor.Close()
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "cursor_open_done", "domain", domainName)
+	}
+	loadStart := time.Now()
+	loadCount := 0
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "values_load_start", "domain", domainName, "large_vals", false, "vals_table", w.valsTable)
+	}
 	if err := w.values.Load(tx, w.valsTable, func(k, v []byte, table etl.CurrentTableReader, next etl.LoadNextFunc) error {
+		loadCount++
+		traceEntry := traceTemporalFlush && (loadCount <= 5 || loadCount%1000 == 0)
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "values_load_progress", "domain", domainName, "large_vals", false, "count", loadCount, "key_len", len(k), "val_len", len(v))
+		}
 		// v = invStep(8) + txNum(8) + value
 		if len(v) < 16 {
 			// Should not happen, but fall back to old format if it does.
@@ -553,51 +589,91 @@ func (w *DomainBufferedWriter) Flush(ctx context.Context, tx kv.RwTx) error {
 				"val_len", len(vOnDisk)-8,
 			)
 		}
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "seek_both_start", "domain", domainName, "count", loadCount, "key_len", len(k), "disk_val_len", len(vOnDisk))
+		}
+		opStart := time.Now()
 		foundVal, err := valuesCursor.SeekBothRange(k, vOnDisk[:8])
 		if err != nil {
 			return err
 		}
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "seek_both_done", "domain", domainName, "count", loadCount, "elapsed", time.Since(opStart), "found_len", len(foundVal))
+		}
 		if len(foundVal) == 0 || !bytes.Equal(foundVal[:8], vOnDisk[:8]) {
+			if traceEntry {
+				log.Warn("domain flush trace", "phase", "put_new_start", "domain", domainName, "count", loadCount)
+			}
+			opStart = time.Now()
 			if err := valuesCursor.Put(k, vOnDisk); err != nil {
 				return err
 			}
+			if traceEntry {
+				log.Warn("domain flush trace", "phase", "put_new_done", "domain", domainName, "count", loadCount, "elapsed", time.Since(opStart))
+			}
 			return nil
 		}
-		kFound, firstDup, err := valuesCursor.SeekExact(k)
-		if err != nil {
-			return err
+		toDelete := make([][]byte, 0, 1)
+		foundExact := bytes.Equal(foundVal, vOnDisk)
+		if !foundExact {
+			toDelete = append(toDelete, common.Copy(foundVal))
 		}
-		if len(kFound) > 0 {
-			var toDelete [][]byte
-			dup := common.Copy(firstDup)
-			if len(dup) >= 8 && bytes.Equal(dup[:8], vOnDisk[:8]) {
-				toDelete = append(toDelete, dup)
+		scanCount := 0
+		scanStart := time.Now()
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "same_step_scan_start", "domain", domainName, "count", loadCount, "found_exact", foundExact)
+		}
+		for {
+			nextK, nextDup, nextErr := valuesCursor.NextDup()
+			if nextErr != nil {
+				return nextErr
 			}
-			for {
-				nextK, nextDup, nextErr := valuesCursor.NextDup()
-				if nextErr != nil {
-					return nextErr
-				}
-				if len(nextK) == 0 {
-					break
-				}
-				dup = common.Copy(nextDup)
-				if len(dup) >= 8 && bytes.Equal(dup[:8], vOnDisk[:8]) {
-					toDelete = append(toDelete, dup)
-				}
+			if len(nextK) == 0 || len(nextDup) < 8 || !bytes.Equal(nextDup[:8], vOnDisk[:8]) {
+				break
 			}
-			for _, dupVal := range toDelete {
-				if err := valuesCursor.DeleteExact(k, dupVal); err != nil {
-					return err
-				}
+			scanCount++
+			if bytes.Equal(nextDup, vOnDisk) {
+				foundExact = true
+				continue
+			}
+			toDelete = append(toDelete, common.Copy(nextDup))
+		}
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "same_step_scan_done", "domain", domainName, "count", loadCount, "scan_count", scanCount, "to_delete", len(toDelete), "found_exact", foundExact, "elapsed", time.Since(scanStart))
+		}
+		if len(toDelete) == 0 && foundExact {
+			if traceEntry {
+				log.Warn("domain flush trace", "phase", "skip_unchanged", "domain", domainName, "count", loadCount)
+			}
+			return nil
+		}
+		deleteStart := time.Now()
+		for _, dupVal := range toDelete {
+			if err := valuesCursor.DeleteExact(k, dupVal); err != nil {
+				return err
 			}
 		}
-		if err := valuesCursor.Put(k, vOnDisk); err != nil {
-			return err
+		if traceEntry {
+			log.Warn("domain flush trace", "phase", "delete_dups_done", "domain", domainName, "count", loadCount, "deleted", len(toDelete), "elapsed", time.Since(deleteStart))
+		}
+		if !foundExact {
+			if traceEntry {
+				log.Warn("domain flush trace", "phase", "put_replace_start", "domain", domainName, "count", loadCount)
+			}
+			opStart = time.Now()
+			if err := valuesCursor.Put(k, vOnDisk); err != nil {
+				return err
+			}
+			if traceEntry {
+				log.Warn("domain flush trace", "phase", "put_replace_done", "domain", domainName, "count", loadCount, "elapsed", time.Since(opStart))
+			}
 		}
 		return nil
 	}, etl.TransformArgs{Quit: ctx.Done(), EmptyVals: true}); err != nil {
 		return err
+	}
+	if traceTemporalFlush {
+		log.Warn("domain flush trace", "phase", "values_load_done", "domain", domainName, "large_vals", false, "count", loadCount, "elapsed", time.Since(loadStart))
 	}
 	if w.h.ii.filenameBase == kv.AccountsDomain.String() && len(escrowTraceAddrBytes) == 20 {
 		_, stepWithVal, err := valuesCursor.SeekExact(escrowTraceAddrBytes)
@@ -1603,60 +1679,60 @@ func (dt *DomainRoTx) unwind(ctx context.Context, rwTx kv.RwTx, step, txNumUnwin
 			continue
 		}
 
-			restoreVal := append(prevStepBytes, value...)
-			if shouldTraceUnwindEntry(dt.name, fullKey) {
-				log.Warn("domain unwind trace before put",
-					"domain", dt.name.String(),
-					"key", fmt.Sprintf("0x%x", fullKey),
-					"restore_step", fmt.Sprintf("0x%x", prevStepBytes),
-					"restore_len", len(value),
-					"restore_preview", badRootValuePreview(value),
-				)
-			}
-			if err := valsCursor.Put(fullKey, restoreVal); err != nil {
-				return err
-			}
-			if shouldTraceUnwindEntry(dt.name, fullKey) {
-				log.Warn("domain unwind trace restored",
-					"domain", dt.name.String(),
-					"key", fmt.Sprintf("0x%x", fullKey),
-					"step", fmt.Sprintf("0x%x", prevStepBytes),
-					"restored_len", len(value),
-					"restored_preview", badRootValuePreview(value),
-				)
-				kNow, firstNow, seekErr := valsCursor.SeekExact(fullKey)
-				if seekErr != nil {
-					return seekErr
-				}
-				var dups []string
-				if len(kNow) > 0 {
-					if len(firstNow) >= 8 {
-						dups = append(dups, fmt.Sprintf("%x[len=%d]", firstNow[:8], len(firstNow)-8))
-					} else {
-						dups = append(dups, fmt.Sprintf("short[len=%d]", len(firstNow)))
-					}
-					for len(dups) < 8 {
-						nextK, nextDup, nextErr := valsCursor.NextDup()
-						if nextErr != nil {
-							return nextErr
-						}
-						if len(nextK) == 0 {
-							break
-						}
-						if len(nextDup) >= 8 {
-							dups = append(dups, fmt.Sprintf("%x[len=%d]", nextDup[:8], len(nextDup)-8))
-						} else {
-							dups = append(dups, fmt.Sprintf("short[len=%d]", len(nextDup)))
-						}
-					}
-				}
-				log.Warn("domain unwind trace post",
-					"domain", dt.name.String(),
-					"key", fmt.Sprintf("0x%x", fullKey),
-					"dups", strings.Join(dups, ","),
-				)
-			}
+		restoreVal := append(prevStepBytes, value...)
+		if shouldTraceUnwindEntry(dt.name, fullKey) {
+			log.Warn("domain unwind trace before put",
+				"domain", dt.name.String(),
+				"key", fmt.Sprintf("0x%x", fullKey),
+				"restore_step", fmt.Sprintf("0x%x", prevStepBytes),
+				"restore_len", len(value),
+				"restore_preview", badRootValuePreview(value),
+			)
 		}
+		if err := valsCursor.Put(fullKey, restoreVal); err != nil {
+			return err
+		}
+		if shouldTraceUnwindEntry(dt.name, fullKey) {
+			log.Warn("domain unwind trace restored",
+				"domain", dt.name.String(),
+				"key", fmt.Sprintf("0x%x", fullKey),
+				"step", fmt.Sprintf("0x%x", prevStepBytes),
+				"restored_len", len(value),
+				"restored_preview", badRootValuePreview(value),
+			)
+			kNow, firstNow, seekErr := valsCursor.SeekExact(fullKey)
+			if seekErr != nil {
+				return seekErr
+			}
+			var dups []string
+			if len(kNow) > 0 {
+				if len(firstNow) >= 8 {
+					dups = append(dups, fmt.Sprintf("%x[len=%d]", firstNow[:8], len(firstNow)-8))
+				} else {
+					dups = append(dups, fmt.Sprintf("short[len=%d]", len(firstNow)))
+				}
+				for len(dups) < 8 {
+					nextK, nextDup, nextErr := valsCursor.NextDup()
+					if nextErr != nil {
+						return nextErr
+					}
+					if len(nextK) == 0 {
+						break
+					}
+					if len(nextDup) >= 8 {
+						dups = append(dups, fmt.Sprintf("%x[len=%d]", nextDup[:8], len(nextDup)-8))
+					} else {
+						dups = append(dups, fmt.Sprintf("short[len=%d]", len(nextDup)))
+					}
+				}
+			}
+			log.Warn("domain unwind trace post",
+				"domain", dt.name.String(),
+				"key", fmt.Sprintf("0x%x", fullKey),
+				"dups", strings.Join(dups, ","),
+			)
+		}
+	}
 	// Compare valsKV with prevSeenKeys
 	if _, err := dt.ht.prune(ctx, rwTx, txNumUnwindTo, math.MaxUint64, math.MaxUint64, true, logEvery); err != nil {
 		return fmt.Errorf("[domain][%s] unwinding, prune history to txNum=%d, step %d: %w", dt.d.FilenameBase, txNumUnwindTo, step, err)

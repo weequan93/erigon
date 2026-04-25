@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/erigontech/erigon-lib/log/v3"
@@ -35,6 +36,10 @@ var (
 	mdbxMigrateDebugTxData                                      = envBoolPrefer("ERIGON_MDBX_MIGRATE_DEBUG_TX_DATA", "MDBX_MIGRATE_DEBUG_TX_DATA")
 	mdbxMigrateDebugWriteSet                                    = envBoolPrefer("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET", "MDBX_MIGRATE_DEBUG_WRITESET")
 	mdbxMigrateDebugWriteSetMax, mdbxMigrateDebugWriteSetMaxSet = parseEnvIntPrefer("ERIGON_MDBX_MIGRATE_DEBUG_WRITESET_MAX", "MDBX_MIGRATE_DEBUG_WRITESET_MAX")
+	mdbxMigrateNonceProbe                                       = envBoolPrefer("ERIGON_MDBX_MIGRATE_NONCE_PROBE", "MDBX_MIGRATE_NONCE_PROBE")
+	mdbxMigrateNonceProbeFatal                                  = envBoolPrefer("ERIGON_MDBX_MIGRATE_NONCE_PROBE_FATAL", "MDBX_MIGRATE_NONCE_PROBE_FATAL")
+	mdbxMigrateNonceProbeBlock, mdbxMigrateNonceProbeBlockSet   = parseEnvUintPrefer("ERIGON_MDBX_MIGRATE_NONCE_PROBE_BLOCK", "MDBX_MIGRATE_NONCE_PROBE_BLOCK")
+	mdbxMigrateNonceProbeMax, mdbxMigrateNonceProbeMaxSet       = parseEnvIntPrefer("ERIGON_MDBX_MIGRATE_NONCE_PROBE_MAX", "MDBX_MIGRATE_NONCE_PROBE_MAX")
 )
 
 func parseEnvUint(name string) (uint64, bool) {
@@ -104,6 +109,16 @@ func mdbxMigrateShouldLog(blockNum uint64, txIndex int) bool {
 		return false
 	}
 	if mdbxMigrateDebugTxSet && txIndex != mdbxMigrateDebugTxIndex {
+		return false
+	}
+	return true
+}
+
+func mdbxMigrateShouldLogNonceProbe(blockNum uint64) bool {
+	if !mdbxMigrateNonceProbe {
+		return false
+	}
+	if mdbxMigrateNonceProbeBlockSet && blockNum != mdbxMigrateNonceProbeBlock {
 		return false
 	}
 	return true
@@ -208,6 +223,182 @@ func logMdbxMigrateWriteSet(txTask *state.TxTask, maxEntries int, maxEntriesSet 
 				break
 			}
 		}
+	}
+}
+
+func logMdbxMigrateNonceFailureProbe(txTask *state.TxTask, err error) {
+	if txTask == nil || !mdbxMigrateShouldLogNonceProbe(txTask.BlockNum) {
+		return
+	}
+	limit := len(txTask.Txs)
+	if mdbxMigrateNonceProbeMaxSet && mdbxMigrateNonceProbeMax >= 0 && limit > mdbxMigrateNonceProbeMax {
+		limit = mdbxMigrateNonceProbeMax
+	}
+	log.Warn("mdbx-migrate nonce failure probe",
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"tx_num", txTask.TxNum,
+		"tx_count", len(txTask.Txs),
+		"limit", limit,
+		"current_tx_nil", txTask.Tx == nil,
+		"err", err,
+	)
+	for i := 0; i < limit; i++ {
+		tx := txTask.Txs[i]
+		if tx == nil {
+			log.Warn("mdbx-migrate nonce failure tx",
+				"block", txTask.BlockNum,
+				"idx", i,
+				"current", i == txTask.TxIndex,
+				"tx_nil", true,
+			)
+			continue
+		}
+		from := "<unknown>"
+		fromErr := ""
+		if sender, ok := tx.GetSender(); ok {
+			from = sender.Hex()
+		} else if txTask.Config != nil && txTask.Header != nil {
+			signer := *types.MakeSigner(txTask.Config, txTask.BlockNum, txTask.Header.Time)
+			sender, err := signer.Sender(tx)
+			if err == nil {
+				from = sender.Hex()
+			} else {
+				fromErr = err.Error()
+			}
+		}
+		to := "<nil>"
+		if toAddr := tx.GetTo(); toAddr != nil {
+			to = toAddr.Hex()
+		}
+		data := tx.GetData()
+		dataSig := ""
+		if len(data) >= 4 {
+			dataSig = fmt.Sprintf("0x%x", data[:4])
+		} else if len(data) > 0 {
+			dataSig = fmt.Sprintf("0x%x", data)
+		}
+		value := "<nil>"
+		if txValue := tx.GetValue(); txValue != nil {
+			value = txValue.ToBig().String()
+		}
+		log.Warn("mdbx-migrate nonce failure tx",
+			"block", txTask.BlockNum,
+			"idx", i,
+			"current", i == txTask.TxIndex,
+			"hash", tx.Hash(),
+			"type", tx.Type(),
+			"from", from,
+			"from_err", fromErr,
+			"to", to,
+			"nonce", tx.GetNonce(),
+			"gas_limit", tx.GetGasLimit(),
+			"value", value,
+			"data_len", len(data),
+			"data_sig", dataSig,
+		)
+	}
+}
+
+func logMdbxMigrateGasMismatchProbe(txTask *state.TxTask, accumulatedGas, accumulatedBlobGas uint64, err error) {
+	if txTask == nil || txTask.Header == nil {
+		return
+	}
+	log.Warn("mdbx-migrate gas mismatch probe",
+		"block", txTask.BlockNum,
+		"tx_index", txTask.TxIndex,
+		"tx_num", txTask.TxNum,
+		"tx_nil", txTask.Tx == nil,
+		"tx_count", len(txTask.Txs),
+		"receipts", len(txTask.BlockReceipts),
+		"header_gas_used", txTask.Header.GasUsed,
+		"accumulated_gas_used", accumulatedGas,
+		"accumulated_blob_gas", accumulatedBlobGas,
+		"err", err,
+	)
+
+	var signer *types.Signer
+	if txTask.Config != nil {
+		signer = types.MakeSigner(txTask.Config, txTask.BlockNum, txTask.Header.Time)
+	}
+	for i, tx := range txTask.Txs {
+		receiptNil := true
+		var receiptGas, receiptCumGas, receiptStatus, receiptBlobGas, receiptGasForL1 uint64
+		if i < len(txTask.BlockReceipts) && txTask.BlockReceipts[i] != nil {
+			receipt := txTask.BlockReceipts[i]
+			receiptNil = false
+			receiptGas = receipt.GasUsed
+			receiptCumGas = receipt.CumulativeGasUsed
+			receiptStatus = receipt.Status
+			receiptBlobGas = receipt.BlobGasUsed
+			receiptGasForL1 = receipt.GasUsedForL1
+		}
+		if tx == nil {
+			log.Warn("mdbx-migrate gas mismatch tx",
+				"block", txTask.BlockNum,
+				"idx", i,
+				"tx_nil", true,
+				"receipt_nil", receiptNil,
+				"receipt_gas", receiptGas,
+				"receipt_cum_gas", receiptCumGas,
+				"receipt_status", receiptStatus,
+				"receipt_blob_gas", receiptBlobGas,
+				"receipt_gas_for_l1", receiptGasForL1,
+			)
+			continue
+		}
+		from := "<unknown>"
+		fromErr := ""
+		if sender, ok := tx.GetSender(); ok {
+			from = sender.Hex()
+		} else if signer != nil {
+			sender, senderErr := signer.Sender(tx)
+			if senderErr == nil {
+				from = sender.Hex()
+			} else {
+				fromErr = senderErr.Error()
+			}
+		}
+		to := "<nil>"
+		if toAddr := tx.GetTo(); toAddr != nil {
+			to = toAddr.Hex()
+		}
+		data := tx.GetData()
+		dataSig := ""
+		if len(data) >= 4 {
+			dataSig = fmt.Sprintf("0x%x", data[:4])
+		} else if len(data) > 0 {
+			dataSig = fmt.Sprintf("0x%x", data)
+		}
+		dataFull := ""
+		if tx.Type() == types.ArbitrumInternalTxType || len(data) <= 200 {
+			dataFull = fmt.Sprintf("0x%x", data)
+		}
+		value := "<nil>"
+		if txValue := tx.GetValue(); txValue != nil {
+			value = txValue.ToBig().String()
+		}
+		log.Warn("mdbx-migrate gas mismatch tx",
+			"block", txTask.BlockNum,
+			"idx", i,
+			"hash", tx.Hash(),
+			"type", tx.Type(),
+			"from", from,
+			"from_err", fromErr,
+			"to", to,
+			"nonce", tx.GetNonce(),
+			"gas_limit", tx.GetGasLimit(),
+			"value", value,
+			"data_len", len(data),
+			"data_sig", dataSig,
+			"data", dataFull,
+			"receipt_nil", receiptNil,
+			"receipt_gas", receiptGas,
+			"receipt_cum_gas", receiptCumGas,
+			"receipt_status", receiptStatus,
+			"receipt_blob_gas", receiptBlobGas,
+			"receipt_gas_for_l1", receiptGasForL1,
+		)
 	}
 }
 
@@ -342,6 +533,12 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 				return txTask.Error
 			}
 			if txTask.Error != nil {
+				if se.cfg.syncCfg.DisableTxNumSkip && strings.Contains(txTask.Error.Error(), "nonce too low") {
+					logMdbxMigrateNonceFailureProbe(txTask, txTask.Error)
+					if mdbxMigrateNonceProbeFatal && mdbxMigrateShouldLogNonceProbe(txTask.BlockNum) {
+						return fmt.Errorf("mdbx-migrate nonce probe halt: block=%d txIdx=%d txNum=%d: %w", txTask.BlockNum, txTask.TxIndex, txTask.TxNum, txTask.Error)
+					}
+				}
 				return fmt.Errorf("%w, txnIdx=%d, %v", consensus.ErrInvalidBlock, txTask.TxIndex, txTask.Error) //same as in stage_exec.go
 			}
 
@@ -368,6 +565,9 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 
 				if txTask.BlockNum > 0 && !se.skipPostEvaluation { //Disable check for genesis. Maybe need somehow improve it in future - to satisfy TestExecutionSpec
 					if err := core.BlockPostValidation(se.gasUsed, se.blobGasUsed, checkReceipts, txTask.BlockReceipts, txTask.Header, se.isMining, txTask.Txs, se.cfg.chainConfig, se.logger); err != nil {
+						if se.cfg.syncCfg.DisableTxNumSkip && strings.Contains(err.Error(), "gas used by execution") {
+							logMdbxMigrateGasMismatchProbe(txTask, se.gasUsed, se.blobGasUsed, err)
+						}
 						return fmt.Errorf("%w, txnIdx=%d, %v", consensus.ErrInvalidBlock, txTask.TxIndex, err) //same as in stage_exec.go
 					}
 				}
@@ -399,6 +599,13 @@ func (se *serialExecutor) execute(ctx context.Context, tasks []*state.TxTask, gp
 					if err := se.u.UnwindTo(txTask.BlockNum-1, BadBlock(txTask.Header.Hash(), err), se.applyTx); err != nil {
 						return false, err
 					}
+				}
+				if se.cfg.syncCfg.DisableTxNumSkip {
+					// Migration must not commit the partially applied failed
+					// block. Returning the error rolls back applyTx; the queued
+					// unwind is then a no-op if stage progress was not advanced,
+					// and the next pass replays from the clean previous state.
+					return false, fmt.Errorf("block=%d: %w", txTask.BlockNum, err)
 				}
 			} else {
 				if se.u != nil {

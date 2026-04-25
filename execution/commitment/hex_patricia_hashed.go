@@ -2776,6 +2776,9 @@ func (hph *HexPatriciaHashed) unfoldBranchNode(row, depth int, deleted bool) (bo
 		}
 		return false, fmt.Errorf("empty branch data read during unfold, compact prefix %x nibbles %x", key, hph.currentKey[:hph.currentKeyLen])
 	}
+	if len(branchData) < 2 {
+		return false, fmt.Errorf("short branch data read during unfold, compact prefix %x nibbles %x len=%d", key, hph.currentKey[:hph.currentKeyLen], len(branchData))
+	}
 	hph.branchBefore[row] = true
 	bitmap := binary.BigEndian.Uint16(branchData[0:])
 	pos := 2
@@ -2793,6 +2796,9 @@ func (hph *HexPatriciaHashed) unfoldBranchNode(row, depth int, deleted bool) (bo
 		bit := bitset & -bitset
 		nibble := bits.TrailingZeros16(bit)
 		cell := &hph.grid[row][nibble]
+		if pos >= len(branchData) {
+			return false, fmt.Errorf("truncated branch data read during unfold, compact prefix %x nibbles %x len=%d pos=%d bitmap=%016b", key, hph.currentKey[:hph.currentKeyLen], len(branchData), pos, bitmap)
+		}
 		fieldBits := branchData[pos]
 		pos++
 		if pos, err = cell.fillFromFields(branchData, pos, cellFields(fieldBits)); err != nil {
@@ -4727,7 +4733,7 @@ func (hph *HexPatriciaHashed) SetState(buf []byte) error {
 	if buf == nil {
 		// reset state to 'empty'
 		hph.currentKeyLen = 0
-		hph.rootChecked = false
+		hph.rootChecked = true
 		hph.rootTouched = false
 		hph.rootPresent = false
 		hph.activeRows = 0
